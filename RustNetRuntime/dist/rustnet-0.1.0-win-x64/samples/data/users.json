@@ -1,0 +1,17 @@
+[
+  { "id": 1,  "username": "kang.fadhil",   "displayName": "Kang Fadhil",        "role": "owner",     "team": "Runtime",  "email": "fadhil@gravicode.example",  "active": true,  "joined": "2024-01-15" },
+  { "id": 2,  "username": "sari.wulandari","displayName": "Sari Wulandari",     "role": "admin",     "team": "Runtime",  "email": "sari@gravicode.example",    "active": true,  "joined": "2024-02-02" },
+  { "id": 3,  "username": "bagus.p",       "displayName": "Bagus Prakoso",      "role": "developer", "team": "Runtime",  "email": "bagus@gravicode.example",   "active": true,  "joined": "2024-03-11" },
+  { "id": 4,  "username": "intan.k",       "displayName": "Intan Kusuma",       "role": "developer", "team": "Tooling",  "email": "intan@gravicode.example",   "active": true,  "joined": "2024-03-28" },
+  { "id": 5,  "username": "rizky.h",       "displayName": "Rizky Hamdani",      "role": "developer", "team": "Tooling",  "email": "rizky@gravicode.example",   "active": true,  "joined": "2024-05-06" },
+  { "id": 6,  "username": "dewi.a",        "displayName": "Dewi Anggraini",     "role": "qa",        "team": "Quality",  "email": "dewi@gravicode.example",    "active": true,  "joined": "2024-06-17" },
+  { "id": 7,  "username": "yoga.s",        "displayName": "Yoga Saputra",       "role": "qa",        "team": "Quality",  "email": "yoga@gravicode.example",    "active": false, "joined": "2024-07-01" },
+  { "id": 8,  "username": "nadia.f",       "displayName": "Nadia Fitriani",     "role": "designer",  "team": "Product",  "email": "nadia@gravicode.example",   "active": true,  "joined": "2024-08-19" },
+  { "id": 9,  "username": "arif.m",        "displayName": "Arif Maulana",       "role": "developer", "team": "Embedded", "email": "arif@gravicode.example",    "active": true,  "joined": "2024-09-30" },
+  { "id": 10, "username": "putri.l",       "displayName": "Putri Lestari",      "role": "developer", "team": "Embedded", "email": "putri@gravicode.example",   "active": true,  "joined": "2024-10-14" },
+  { "id": 11, "username": "hendra.w",      "displayName": "Hendra Wijaya",      "role": "analyst",   "team": "Product",  "email": "hendra@gravicode.example",  "active": true,  "joined": "2025-01-08" },
+  { "id": 12, "username": "citra.n",       "displayName": "Citra Nuraini",      "role": "developer", "team": "Runtime",  "email": "citra@gravicode.example",   "active": true,  "joined": "2025-02-24" },
+  { "id": 13, "username": "gilang.r",      "displayName": "Gilang Ramadhan",    "role": "devops",    "team": "Platform", "email": "gilang@gravicode.example",  "active": true,  "joined": "2025-04-02" },
+  { "id": 14, "username": "maya.s",        "displayName": "Maya Safitri",       "role": "writer",    "team": "Product",  "email": "maya@gravicode.example",    "active": true,  "joined": "2025-05-19" },
+  { "id": 15, "username": "teguh.b",       "displayName": "Teguh Budiman",      "role": "developer", "team": "Tooling",  "email": "teguh@gravicode.example",   "active": false, "joined": "2025-06-30" }
+]

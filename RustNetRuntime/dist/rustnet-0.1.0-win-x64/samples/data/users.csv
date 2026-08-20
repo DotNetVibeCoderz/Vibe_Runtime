@@ -1,0 +1,16 @@
+id,username,displayName,role,team,email,active,joined
+1,kang.fadhil,Kang Fadhil,owner,Runtime,fadhil@gravicode.example,true,2024-01-15
+2,sari.wulandari,Sari Wulandari,admin,Runtime,sari@gravicode.example,true,2024-02-02
+3,bagus.p,Bagus Prakoso,developer,Runtime,bagus@gravicode.example,true,2024-03-11
+4,intan.k,Intan Kusuma,developer,Tooling,intan@gravicode.example,true,2024-03-28
+5,rizky.h,Rizky Hamdani,developer,Tooling,rizky@gravicode.example,true,2024-05-06
+6,dewi.a,Dewi Anggraini,qa,Quality,dewi@gravicode.example,true,2024-06-17
+7,yoga.s,Yoga Saputra,qa,Quality,yoga@gravicode.example,false,2024-07-01
+8,nadia.f,Nadia Fitriani,designer,Product,nadia@gravicode.example,true,2024-08-19
+9,arif.m,Arif Maulana,developer,Embedded,arif@gravicode.example,true,2024-09-30
+10,putri.l,Putri Lestari,developer,Embedded,putri@gravicode.example,true,2024-10-14
+11,hendra.w,Hendra Wijaya,analyst,Product,hendra@gravicode.example,true,2025-01-08
+12,citra.n,Citra Nuraini,developer,Runtime,citra@gravicode.example,true,2025-02-24
+13,gilang.r,Gilang Ramadhan,devops,Platform,gilang@gravicode.example,true,2025-04-02
+14,maya.s,Maya Safitri,writer,Product,maya@gravicode.example,true,2025-05-19
+15,teguh.b,Teguh Budiman,developer,Tooling,teguh@gravicode.example,false,2025-06-30

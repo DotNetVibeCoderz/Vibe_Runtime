@@ -1,0 +1,50 @@
+<ResourceDictionary xmlns="https://github.com/avaloniaui"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+  <!--
+    Forge — CodeGen's theme.
+
+    The palette comes from the subject: a runtime re-forged from C++ into Rust.
+    Iron oxide is the identity accent, copper patina the interactive one, and
+    the ground is cold graphite rather than black, so the two metals read warm
+    against it.
+
+    Chrome is set in a monospaced face and content is not. The machine's voice —
+    panel labels, IL offsets, heap bytes — and the human's voice in chat are
+    genuinely different registers, and the type says so.
+  -->
+
+  <!-- ── Palette ──────────────────────────────────────────────────────── -->
+  <Color x:Key="GraphiteColor">#14181D</Color>
+  <Color x:Key="SlateColor">#1B2129</Color>
+  <Color x:Key="SlateRaisedColor">#222A34</Color>
+  <Color x:Key="RuleColor">#2A323C</Color>
+  <Color x:Key="BoneColor">#DCE3EA</Color>
+  <Color x:Key="MutedColor">#7C8896</Color>
+  <Color x:Key="OxideColor">#C2542B</Color>
+  <Color x:Key="OxideDimColor">#8E3D20</Color>
+  <Color x:Key="PatinaColor">#4FB3A5</Color>
+  <Color x:Key="AmberColor">#D9A441</Color>
+  <Color x:Key="EmberColor">#E2564E</Color>
+
+  <SolidColorBrush x:Key="Graphite" Color="{StaticResource GraphiteColor}" />
+  <SolidColorBrush x:Key="Slate" Color="{StaticResource SlateColor}" />
+  <SolidColorBrush x:Key="SlateRaised" Color="{StaticResource SlateRaisedColor}" />
+  <SolidColorBrush x:Key="Rule" Color="{StaticResource RuleColor}" />
+  <SolidColorBrush x:Key="Bone" Color="{StaticResource BoneColor}" />
+  <SolidColorBrush x:Key="Muted" Color="{StaticResource MutedColor}" />
+  <SolidColorBrush x:Key="Oxide" Color="{StaticResource OxideColor}" />
+  <SolidColorBrush x:Key="OxideDim" Color="{StaticResource OxideDimColor}" />
+  <SolidColorBrush x:Key="Patina" Color="{StaticResource PatinaColor}" />
+  <SolidColorBrush x:Key="Amber" Color="{StaticResource AmberColor}" />
+  <SolidColorBrush x:Key="Ember" Color="{StaticResource EmberColor}" />
+
+  <!-- ── Type ─────────────────────────────────────────────────────────── -->
+  <FontFamily x:Key="MachineFace">Cascadia Mono,Cascadia Code,Consolas,Menlo,DejaVu Sans Mono,monospace</FontFamily>
+  <FontFamily x:Key="HumanFace">Inter,Segoe UI Variable Text,Segoe UI,Helvetica Neue,sans-serif</FontFamily>
+
+  <x:Double x:Key="LabelSize">10.5</x:Double>
+  <x:Double x:Key="BodySize">13</x:Double>
+  <x:Double x:Key="TitleSize">15</x:Double>
+
+</ResourceDictionary>

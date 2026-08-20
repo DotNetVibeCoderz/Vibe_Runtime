@@ -1,0 +1,197 @@
+<Styles xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+  <!--
+    Control styling for the Forge theme.
+
+    Selectors are kept to a single class or element each, so nothing here
+    silently overrides anything else. Spend the boldness in one place: the
+    status bar readout and the Run button carry Oxide; everything else stays
+    quiet.
+  -->
+
+  <!-- Panel header: the machine's voice, small and letterspaced. -->
+  <Style Selector="TextBlock.panel-label">
+    <Setter Property="FontFamily" Value="{StaticResource MachineFace}" />
+    <Setter Property="FontSize" Value="{StaticResource LabelSize}" />
+    <Setter Property="FontWeight" Value="SemiBold" />
+    <Setter Property="Foreground" Value="{StaticResource Muted}" />
+    <Setter Property="LetterSpacing" Value="1.4" />
+  </Style>
+
+  <Style Selector="TextBlock.readout">
+    <Setter Property="FontFamily" Value="{StaticResource MachineFace}" />
+    <Setter Property="FontSize" Value="11" />
+    <Setter Property="Foreground" Value="{StaticResource Muted}" />
+  </Style>
+
+  <Style Selector="TextBlock.readout-value">
+    <Setter Property="FontFamily" Value="{StaticResource MachineFace}" />
+    <Setter Property="FontSize" Value="11" />
+    <Setter Property="Foreground" Value="{StaticResource Patina}" />
+  </Style>
+
+  <!-- Chat prose: the human's voice. -->
+  <Style Selector="TextBlock.prose">
+    <Setter Property="FontFamily" Value="{StaticResource HumanFace}" />
+    <Setter Property="FontSize" Value="{StaticResource BodySize}" />
+    <Setter Property="Foreground" Value="{StaticResource Bone}" />
+    <Setter Property="TextWrapping" Value="Wrap" />
+    <Setter Property="LineHeight" Value="19" />
+  </Style>
+
+  <Style Selector="TextBlock.speaker">
+    <Setter Property="FontFamily" Value="{StaticResource MachineFace}" />
+    <Setter Property="FontSize" Value="10.5" />
+    <Setter Property="FontWeight" Value="SemiBold" />
+    <Setter Property="LetterSpacing" Value="1.2" />
+  </Style>
+
+  <!-- Panels -->
+  <Style Selector="Border.panel">
+    <Setter Property="Background" Value="{StaticResource Slate}" />
+    <Setter Property="BorderBrush" Value="{StaticResource Rule}" />
+    <Setter Property="BorderThickness" Value="1" />
+  </Style>
+
+  <Style Selector="Border.panel-header">
+    <Setter Property="Background" Value="{StaticResource Graphite}" />
+    <Setter Property="BorderBrush" Value="{StaticResource Rule}" />
+    <Setter Property="BorderThickness" Value="0,0,0,1" />
+    <Setter Property="Padding" Value="12,7" />
+  </Style>
+
+  <!-- Buttons: quiet by default. -->
+  <Style Selector="Button">
+    <Setter Property="Background" Value="{StaticResource SlateRaised}" />
+    <Setter Property="Foreground" Value="{StaticResource Bone}" />
+    <Setter Property="BorderBrush" Value="{StaticResource Rule}" />
+    <Setter Property="BorderThickness" Value="1" />
+    <Setter Property="CornerRadius" Value="3" />
+    <Setter Property="Padding" Value="12,6" />
+    <Setter Property="FontFamily" Value="{StaticResource HumanFace}" />
+    <Setter Property="FontSize" Value="12.5" />
+  </Style>
+
+  <Style Selector="Button:pointerover /template/ ContentPresenter">
+    <Setter Property="Background" Value="#2C3742" />
+    <Setter Property="BorderBrush" Value="{StaticResource Patina}" />
+  </Style>
+
+  <Style Selector="Button:disabled /template/ ContentPresenter">
+    <Setter Property="Background" Value="{StaticResource Slate}" />
+    <Setter Property="TextBlock.Foreground" Value="#4C5866" />
+  </Style>
+
+  <!-- The one loud control: Run. -->
+  <Style Selector="Button.accent /template/ ContentPresenter">
+    <Setter Property="Background" Value="{StaticResource Oxide}" />
+    <Setter Property="BorderBrush" Value="{StaticResource Oxide}" />
+    <Setter Property="TextBlock.Foreground" Value="#FFF3EC" />
+  </Style>
+
+  <Style Selector="Button.accent:pointerover /template/ ContentPresenter">
+    <Setter Property="Background" Value="#D75F33" />
+    <Setter Property="BorderBrush" Value="#D75F33" />
+  </Style>
+
+  <!-- A toolbar button is a glyph, not a slab. -->
+  <Style Selector="Button.tool">
+    <Setter Property="Background" Value="Transparent" />
+    <Setter Property="BorderThickness" Value="0" />
+    <Setter Property="Padding" Value="9,5" />
+    <Setter Property="FontFamily" Value="{StaticResource MachineFace}" />
+    <Setter Property="FontSize" Value="11.5" />
+    <Setter Property="Foreground" Value="{StaticResource Muted}" />
+  </Style>
+
+  <Style Selector="Button.tool:pointerover /template/ ContentPresenter">
+    <Setter Property="Background" Value="{StaticResource SlateRaised}" />
+    <Setter Property="TextBlock.Foreground" Value="{StaticResource Bone}" />
+  </Style>
+
+  <!-- Inputs -->
+  <Style Selector="TextBox">
+    <Setter Property="Background" Value="{StaticResource Graphite}" />
+    <Setter Property="Foreground" Value="{StaticResource Bone}" />
+    <Setter Property="BorderBrush" Value="{StaticResource Rule}" />
+    <Setter Property="BorderThickness" Value="1" />
+    <Setter Property="CornerRadius" Value="3" />
+    <Setter Property="Padding" Value="9,7" />
+    <Setter Property="FontFamily" Value="{StaticResource HumanFace}" />
+    <Setter Property="FontSize" Value="12.5" />
+    <Setter Property="SelectionBrush" Value="{StaticResource OxideDim}" />
+    <Setter Property="CaretBrush" Value="{StaticResource Oxide}" />
+  </Style>
+
+  <Style Selector="TextBox:focus /template/ Border#PART_BorderElement">
+    <Setter Property="BorderBrush" Value="{StaticResource Patina}" />
+  </Style>
+
+  <Style Selector="ComboBox">
+    <Setter Property="Background" Value="{StaticResource Graphite}" />
+    <Setter Property="Foreground" Value="{StaticResource Bone}" />
+    <Setter Property="BorderBrush" Value="{StaticResource Rule}" />
+    <Setter Property="CornerRadius" Value="3" />
+    <Setter Property="FontFamily" Value="{StaticResource MachineFace}" />
+    <Setter Property="FontSize" Value="11.5" />
+    <Setter Property="Padding" Value="9,5" />
+  </Style>
+
+  <Style Selector="CheckBox">
+    <Setter Property="Foreground" Value="{StaticResource Bone}" />
+    <Setter Property="FontFamily" Value="{StaticResource HumanFace}" />
+    <Setter Property="FontSize" Value="12.5" />
+  </Style>
+
+  <!-- Trees and lists -->
+  <Style Selector="TreeView">
+    <Setter Property="Background" Value="Transparent" />
+    <Setter Property="Foreground" Value="{StaticResource Bone}" />
+  </Style>
+
+  <Style Selector="TreeViewItem">
+    <Setter Property="FontFamily" Value="{StaticResource MachineFace}" />
+    <Setter Property="FontSize" Value="11.5" />
+  </Style>
+
+  <Style Selector="ListBox">
+    <Setter Property="Background" Value="Transparent" />
+    <Setter Property="BorderThickness" Value="0" />
+  </Style>
+
+  <Style Selector="ListBoxItem">
+    <Setter Property="Padding" Value="0" />
+    <Setter Property="Background" Value="Transparent" />
+  </Style>
+
+  <!-- Menus -->
+  <Style Selector="Menu">
+    <Setter Property="Background" Value="Transparent" />
+  </Style>
+
+  <Style Selector="MenuItem">
+    <Setter Property="FontFamily" Value="{StaticResource HumanFace}" />
+    <Setter Property="FontSize" Value="12.5" />
+    <Setter Property="Foreground" Value="{StaticResource Bone}" />
+  </Style>
+
+  <!-- Splitters read as part of the rule system, not as furniture. -->
+  <Style Selector="GridSplitter">
+    <Setter Property="Background" Value="{StaticResource Rule}" />
+  </Style>
+
+  <Style Selector="GridSplitter:pointerover">
+    <Setter Property="Background" Value="{StaticResource Patina}" />
+  </Style>
+
+  <!-- Keyboard focus must stay visible; this is a quality floor, not a choice. -->
+  <Style Selector=":is(Control):focus-visible">
+    <Setter Property="FocusAdorner">
+      <FocusAdornerTemplate>
+        <Border BorderBrush="{StaticResource Patina}" BorderThickness="1" Margin="-2" CornerRadius="3" />
+      </FocusAdornerTemplate>
+    </Setter>
+  </Style>
+
+</Styles>

@@ -1,0 +1,13 @@
+[package]
+name = "rustclr-bcl"
+description = "RustBCL: native implementations of the .NET base class library for RustCLR"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rustclr-core.workspace = true
+rustclr-gc.workspace = true

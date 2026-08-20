@@ -1,0 +1,16 @@
+<Project>
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <Company>Gravicode Studios</Company>
+    <Authors>Gravicode Studios — led by Kang Fadhil</Authors>
+    <Product>RustNetRuntime</Product>
+    <Version>0.1.0</Version>
+    <!-- Semantic Kernel marks connector and agent APIs experimental; the
+         project targets them deliberately. -->
+    <NoWarn>$(NoWarn);SKEXP0001;SKEXP0010;SKEXP0070;SKEXP0110;CA1416</NoWarn>
+  </PropertyGroup>
+</Project>

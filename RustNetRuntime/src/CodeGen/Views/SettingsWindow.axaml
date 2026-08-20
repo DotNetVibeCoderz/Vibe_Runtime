@@ -1,0 +1,134 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="CodeGen.Views.SettingsWindow"
+        Title="Settings" Width="700" Height="640"
+        WindowStartupLocation="CenterOwner"
+        Background="{StaticResource Graphite}"
+        Foreground="{StaticResource Bone}">
+
+  <Window.Styles>
+    <!-- Avalonia 11.2 has no Grid.ColumnSpacing/RowSpacing; a scoped style on
+         form grids gives the same result without touching other layouts. -->
+    <Style Selector="Grid.form > :is(Control)">
+      <Setter Property="Margin" Value="0,4,0,4" />
+    </Style>
+    <Style Selector="Grid.form > TextBlock">
+      <Setter Property="Margin" Value="0,4,12,4" />
+    </Style>
+  </Window.Styles>
+
+
+  <Grid RowDefinitions="Auto,*,Auto">
+
+    <Border Grid.Row="0" Classes="panel-header" Padding="20,14">
+      <StackPanel Spacing="3">
+        <TextBlock Classes="panel-label" Text="SETTINGS" Foreground="{StaticResource Oxide}" />
+        <TextBlock Name="ConfigPath" Classes="readout" TextTrimming="CharacterEllipsis" />
+      </StackPanel>
+    </Border>
+
+    <ScrollViewer Grid.Row="1" Padding="20,16">
+      <StackPanel Spacing="20">
+
+        <!-- Assistant -->
+        <StackPanel Spacing="10">
+          <TextBlock Classes="panel-label" Text="ASSISTANT" />
+
+          <Grid Classes="form" ColumnDefinitions="150,*" RowDefinitions="Auto,Auto,Auto">
+            <TextBlock Grid.Row="0" Grid.Column="0" Classes="readout" Text="Provider"
+                       VerticalAlignment="Center" />
+            <ComboBox Grid.Row="0" Grid.Column="1" Name="Provider" HorizontalAlignment="Stretch" />
+
+            <TextBlock Grid.Row="1" Grid.Column="0" Classes="readout" Text="Temperature"
+                       VerticalAlignment="Center" />
+            <StackPanel Grid.Row="1" Grid.Column="1" Orientation="Horizontal" Spacing="10">
+              <TextBox Name="Temperature" Width="90" />
+              <TextBlock Classes="readout" VerticalAlignment="Center" TextWrapping="Wrap"
+                         Text="Ignored by Claude — the current API rejects it." />
+            </StackPanel>
+
+            <TextBlock Grid.Row="2" Grid.Column="0" Classes="readout" Text="Max tokens"
+                       VerticalAlignment="Center" />
+            <TextBox Grid.Row="2" Grid.Column="1" Name="MaxTokens" HorizontalAlignment="Left" Width="140" />
+          </Grid>
+
+          <TextBlock Classes="readout" Text="System prompt" Margin="0,4,0,0" />
+          <TextBox Name="SystemPrompt" AcceptsReturn="True" TextWrapping="Wrap"
+                   MinHeight="90" MaxHeight="150" />
+        </StackPanel>
+
+        <!-- Providers -->
+        <StackPanel Spacing="10">
+          <TextBlock Classes="panel-label" Text="PROVIDERS" />
+          <TextBlock Classes="prose" FontSize="12" Foreground="{StaticResource Muted}"
+                     Text="Each provider keeps its own model, key and endpoint. Ollama runs locally and needs no key." />
+          <StackPanel Name="ProviderRows" Spacing="14" />
+        </StackPanel>
+
+        <!-- Tools -->
+        <StackPanel Spacing="10">
+          <TextBlock Classes="panel-label" Text="TOOLS" />
+          <Grid Classes="form" ColumnDefinitions="150,*" RowDefinitions="Auto,Auto,Auto">
+            <TextBlock Grid.Row="0" Grid.Column="0" Classes="readout" Text="Tavily API key"
+                       VerticalAlignment="Center" />
+            <TextBox Grid.Row="0" Grid.Column="1" Name="TavilyKey" PasswordChar="•" />
+
+            <TextBlock Grid.Row="1" Grid.Column="0" Classes="readout" Text="Max file size (KB)"
+                       VerticalAlignment="Center" />
+            <TextBox Grid.Row="1" Grid.Column="1" Name="MaxFileSize" HorizontalAlignment="Left" Width="140" />
+
+            <CheckBox Grid.Row="2" Grid.Column="1" Name="AllowShell"
+                      Content="Let Jack run shell commands" />
+          </Grid>
+        </StackPanel>
+
+        <!-- Toolchain -->
+        <StackPanel Spacing="10">
+          <TextBlock Classes="panel-label" Text="TOOLCHAIN" />
+          <Grid Classes="form" ColumnDefinitions="150,*" RowDefinitions="Auto,Auto">
+            <TextBlock Grid.Row="0" Grid.Column="0" Classes="readout" Text="rustnet path"
+                       VerticalAlignment="Center" />
+            <TextBox Grid.Row="0" Grid.Column="1" Name="RustNetPath"
+                     Watermark="Leave empty to search target/release then PATH" />
+
+            <TextBlock Grid.Row="1" Grid.Column="0" Classes="readout" Text="dotnet path"
+                       VerticalAlignment="Center" />
+            <TextBox Grid.Row="1" Grid.Column="1" Name="DotnetPath" />
+          </Grid>
+        </StackPanel>
+
+        <!-- Editor -->
+        <StackPanel Spacing="10">
+          <TextBlock Classes="panel-label" Text="EDITOR" />
+          <Grid Classes="form" ColumnDefinitions="150,*" RowDefinitions="Auto,Auto,Auto">
+            <TextBlock Grid.Row="0" Grid.Column="0" Classes="readout" Text="Font size"
+                       VerticalAlignment="Center" />
+            <TextBox Grid.Row="0" Grid.Column="1" Name="FontSize" HorizontalAlignment="Left" Width="90" />
+
+            <TextBlock Grid.Row="1" Grid.Column="0" Classes="readout" Text="Tab size"
+                       VerticalAlignment="Center" />
+            <TextBox Grid.Row="1" Grid.Column="1" Name="TabSize" HorizontalAlignment="Left" Width="90" />
+
+            <StackPanel Grid.Row="2" Grid.Column="1" Spacing="6">
+              <CheckBox Name="LineNumbers" Content="Show line numbers" />
+              <CheckBox Name="WordWrap" Content="Wrap long lines" />
+            </StackPanel>
+          </Grid>
+        </StackPanel>
+
+      </StackPanel>
+    </ScrollViewer>
+
+    <Border Grid.Row="2" Background="{StaticResource Slate}"
+            BorderBrush="{StaticResource Rule}" BorderThickness="0,1,0,0" Padding="18,12">
+      <Grid ColumnDefinitions="*,Auto">
+        <TextBlock Grid.Column="0" Classes="readout" VerticalAlignment="Center"
+                   Text="Saved to app.config" />
+        <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8">
+          <Button Content="Cancel" Click="OnCancel" />
+          <Button Classes="accent" Content="Save settings" Click="OnSave" />
+        </StackPanel>
+      </Grid>
+    </Border>
+  </Grid>
+</Window>

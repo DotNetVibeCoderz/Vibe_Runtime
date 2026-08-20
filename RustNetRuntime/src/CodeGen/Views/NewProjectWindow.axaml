@@ -1,0 +1,104 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:models="clr-namespace:CodeGen.Models"
+        x:Class="CodeGen.Views.NewProjectWindow"
+        Title="New Project" Width="760" Height="560"
+        WindowStartupLocation="CenterOwner"
+        Background="{StaticResource Graphite}"
+        Foreground="{StaticResource Bone}">
+
+  <Window.Styles>
+    <!-- Avalonia 11.2 has no Grid.ColumnSpacing/RowSpacing; a scoped style on
+         form grids gives the same result without touching other layouts. -->
+    <Style Selector="Grid.form > :is(Control)">
+      <Setter Property="Margin" Value="0,4,0,4" />
+    </Style>
+    <Style Selector="Grid.form > TextBlock">
+      <Setter Property="Margin" Value="0,4,12,4" />
+    </Style>
+  </Window.Styles>
+
+
+  <Grid RowDefinitions="Auto,*,Auto" Margin="0">
+
+    <Border Grid.Row="0" Classes="panel-header" Padding="20,14">
+      <StackPanel Spacing="3">
+        <TextBlock Classes="panel-label" Text="NEW PROJECT" Foreground="{StaticResource Oxide}" />
+        <TextBlock Classes="prose" Foreground="{StaticResource Muted}"
+                   Text="Start blank, or from a template. Templates marked RustCLR run on both runtimes." />
+      </StackPanel>
+    </Border>
+
+    <Grid Grid.Row="1" ColumnDefinitions="*,1,300">
+
+      <!-- Template list -->
+      <ScrollViewer Grid.Column="0" Padding="14,10">
+        <ListBox Name="Templates" Background="Transparent">
+          <ListBox.ItemTemplate>
+            <DataTemplate x:DataType="models:ProjectTemplate">
+              <Border Padding="12,10" Margin="0,2" CornerRadius="3"
+                      Background="{StaticResource Slate}"
+                      BorderBrush="{StaticResource Rule}" BorderThickness="1">
+                <StackPanel Spacing="4">
+                  <Grid ColumnDefinitions="*,Auto">
+                    <TextBlock Grid.Column="0" Text="{Binding Name}"
+                               FontFamily="{StaticResource HumanFace}" FontSize="13.5"
+                               FontWeight="SemiBold" Foreground="{StaticResource Bone}" />
+                    <TextBlock Grid.Column="1" Classes="readout" Text="{Binding CategoryLabel}"
+                               Foreground="{StaticResource Patina}" />
+                  </Grid>
+                  <TextBlock Classes="prose" FontSize="12" Foreground="{StaticResource Muted}"
+                             Text="{Binding Summary}" />
+                  <StackPanel Orientation="Horizontal" Spacing="10">
+                    <TextBlock Classes="readout" Text="{Binding DomainLabel}" />
+                    <TextBlock Classes="readout" Text="runs on RustCLR"
+                               Foreground="{StaticResource Oxide}"
+                               IsVisible="{Binding RunsOnRustClr}" />
+                  </StackPanel>
+                </StackPanel>
+              </Border>
+            </DataTemplate>
+          </ListBox.ItemTemplate>
+        </ListBox>
+      </ScrollViewer>
+
+      <Border Grid.Column="1" Background="{StaticResource Rule}" />
+
+      <!-- Details -->
+      <StackPanel Grid.Column="2" Margin="18,16" Spacing="14">
+        <StackPanel Spacing="6">
+          <TextBlock Classes="panel-label" Text="PROJECT NAME" />
+          <TextBox Name="ProjectName" Text="MyApp" Watermark="MyApp" />
+        </StackPanel>
+
+        <StackPanel Spacing="6">
+          <TextBlock Classes="panel-label" Text="LOCATION" />
+          <Grid Classes="form" ColumnDefinitions="*,Auto">
+            <TextBox Grid.Column="0" Name="Location" Watermark="Choose a folder" />
+            <Button Grid.Column="1" Content="…" Click="OnBrowse" />
+          </Grid>
+        </StackPanel>
+
+        <Border Background="{StaticResource Slate}" BorderBrush="{StaticResource Rule}"
+                BorderThickness="1" CornerRadius="3" Padding="12">
+          <StackPanel Spacing="6">
+            <TextBlock Classes="panel-label" Text="WILL CREATE" />
+            <TextBlock Name="Preview" Classes="readout" TextWrapping="Wrap"
+                       Foreground="{StaticResource Bone}" />
+          </StackPanel>
+        </Border>
+
+        <TextBlock Name="Problem" Classes="prose" FontSize="12"
+                   Foreground="{StaticResource Ember}" TextWrapping="Wrap" IsVisible="False" />
+      </StackPanel>
+    </Grid>
+
+    <Border Grid.Row="2" Background="{StaticResource Slate}"
+            BorderBrush="{StaticResource Rule}" BorderThickness="0,1,0,0" Padding="18,12">
+      <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8">
+        <Button Content="Cancel" Click="OnCancel" />
+        <Button Classes="accent" Content="Create project" Click="OnCreate" />
+      </StackPanel>
+    </Border>
+  </Grid>
+</Window>

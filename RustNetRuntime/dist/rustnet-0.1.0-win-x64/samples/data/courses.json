@@ -1,0 +1,7 @@
+[
+  { "code": "RT101", "title": "Runtime Internals",        "capacity": 30, "enrolled": ["bagus.p", "citra.n", "intan.k"] },
+  { "code": "RS201", "title": "Systems Rust",             "capacity": 24, "enrolled": ["arif.m", "putri.l"] },
+  { "code": "IL301", "title": "Reading IL",               "capacity": 18, "enrolled": ["rizky.h", "dewi.a", "teguh.b"] },
+  { "code": "EM110", "title": "Embedded .NET on RustCLR", "capacity": 16, "enrolled": ["arif.m", "putri.l", "gilang.r"] },
+  { "code": "QA150", "title": "Conformance Testing",      "capacity": 20, "enrolled": ["dewi.a", "yoga.s"] }
+]

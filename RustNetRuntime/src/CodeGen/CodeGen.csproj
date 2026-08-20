@@ -1,0 +1,47 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <BuiltInComInteropSupport>true</BuiltInComInteropSupport>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
+    <AssemblyName>CodeGen</AssemblyName>
+    <RootNamespace>CodeGen</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- `app.config` is transformed into CodeGen.dll.config on build, which is
+         what ConfigurationManager reads and writes at run time. -->
+    <None Update="app.config" CopyToOutputDirectory="PreserveNewest" />
+    <AvaloniaResource Include="Assets\**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Avalonia" Version="11.2.3" />
+    <PackageReference Include="Avalonia.Desktop" Version="11.2.3" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="11.2.3" />
+    <PackageReference Include="Avalonia.Fonts.Inter" Version="11.2.3" />
+    <PackageReference Include="Avalonia.Diagnostics" Version="11.2.3" Condition="'$(Configuration)' == 'Debug'" />
+    <!-- Renders the UI to PNG without a display, so the screenshots in the
+         README and docs are regenerated from the real windows. -->
+    <PackageReference Include="Avalonia.Headless" Version="11.2.3" />
+    <PackageReference Include="Avalonia.Skia" Version="11.2.3" />
+    <PackageReference Include="Avalonia.AvaloniaEdit" Version="11.2.0" />
+    <PackageReference Include="AvaloniaEdit.TextMate" Version="11.2.0" />
+    <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.0" />
+
+    <!-- Semantic Kernel drives the assistant: plugins, function calling, chat. -->
+    <PackageReference Include="Microsoft.SemanticKernel" Version="1.80.0" />
+    <PackageReference Include="Microsoft.SemanticKernel.Connectors.OpenAI" Version="1.80.0" />
+    <!-- Claude goes through the official Anthropic SDK behind a custom
+         IChatCompletionService, so Semantic Kernel drives it like any other. -->
+    <PackageReference Include="Anthropic" Version="12.42.0" />
+
+    <PackageReference Include="System.Configuration.ConfigurationManager" Version="10.0.0" />
+
+    <!-- Avalonia pulls in an older Tmds.DBus.Protocol with a published
+         advisory; pin the fixed version rather than shipping the warning. -->
+    <PackageReference Include="Tmds.DBus.Protocol" Version="0.94.2" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,19 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="CodeGen.Views.GoToLineWindow"
+        Title="Go To Line" Width="360" Height="190"
+        WindowStartupLocation="CenterOwner"
+        CanResize="False"
+        Background="{StaticResource Graphite}"
+        Foreground="{StaticResource Bone}">
+  <StackPanel Margin="20" Spacing="14">
+    <TextBlock Classes="panel-label" Text="GO TO LINE" Foreground="{StaticResource Oxide}" />
+    <TextBlock Name="Range" Classes="readout" />
+    <TextBox Name="LineNumber" Watermark="Line number" />
+    <TextBlock Name="Problem" Classes="readout" Foreground="{StaticResource Ember}" IsVisible="False" />
+    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8">
+      <Button Content="Cancel" Click="OnCancel" />
+      <Button Classes="accent" Content="Go" Click="OnGo" IsDefault="True" />
+    </StackPanel>
+  </StackPanel>
+</Window>

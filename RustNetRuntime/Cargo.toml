@@ -1,0 +1,43 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/rustclr-metadata",
+    "crates/rustclr-gc",
+    "crates/rustclr-sched",
+    "crates/rustclr-interop",
+    "crates/rustclr-core",
+    "crates/rustclr-bcl",
+    "crates/rustclr-jit",
+    "crates/rustnet-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Gravicode Studios <studio@gravicode.com>"]
+repository = "https://github.com/gravicode/RustNetRuntime"
+rust-version = "1.85"
+
+[workspace.dependencies]
+rustclr-metadata = { path = "crates/rustclr-metadata", version = "0.1.0" }
+rustclr-gc       = { path = "crates/rustclr-gc",       version = "0.1.0" }
+rustclr-sched    = { path = "crates/rustclr-sched",    version = "0.1.0" }
+rustclr-interop  = { path = "crates/rustclr-interop",  version = "0.1.0" }
+rustclr-core     = { path = "crates/rustclr-core",     version = "0.1.0" }
+rustclr-bcl      = { path = "crates/rustclr-bcl",      version = "0.1.0" }
+rustclr-jit      = { path = "crates/rustclr-jit",      version = "0.1.0" }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Size-optimised profile for microcontroller targets (ESP32 / STM32 / RISC-V).
+[profile.embedded]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+panic = "abort"

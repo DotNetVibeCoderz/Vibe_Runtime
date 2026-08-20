@@ -1,0 +1,19 @@
+# Rust
+/target/
+
+# .NET
+bin/
+obj/
+*.user
+
+# The build copies app.config here; it holds API keys once configured.
+src/CodeGen/bin/*/net*/CodeGen.dll.config
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Credential-looking files kept out of version control.
+testkey.txt
+*.key
+*.pem

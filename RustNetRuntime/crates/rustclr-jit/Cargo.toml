@@ -1,0 +1,13 @@
+[package]
+name = "rustclr-jit"
+description = "JIT/AOT compilation interface and IL verifier for RustCLR"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rustclr-core.workspace = true
+rustclr-metadata.workspace = true

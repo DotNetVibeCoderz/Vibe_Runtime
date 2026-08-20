@@ -1,0 +1,369 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="clr-namespace:CodeGen.ViewModels"
+        xmlns:svc="clr-namespace:CodeGen.Services"
+        xmlns:edit="clr-namespace:AvaloniaEdit;assembly=AvaloniaEdit"
+        x:Class="CodeGen.Views.MainWindow"
+        x:DataType="vm:MainWindowViewModel"
+        Title="CodeGen · RustCLR"
+        Width="1440" Height="900"
+        MinWidth="900" MinHeight="600"
+        Background="{StaticResource Graphite}"
+        Foreground="{StaticResource Bone}">
+
+  <Window.KeyBindings>
+    <KeyBinding Gesture="Ctrl+S" Command="{Binding SaveCommand}" />
+    <KeyBinding Gesture="Ctrl+Shift+S" Command="{Binding SaveAllCommand}" />
+    <KeyBinding Gesture="Ctrl+G" Command="{Binding GoToLineCommand}" />
+    <KeyBinding Gesture="Ctrl+B" Command="{Binding BuildCommand}" />
+    <KeyBinding Gesture="F5" Command="{Binding RunCommand}" />
+    <KeyBinding Gesture="Ctrl+F5" Command="{Binding RunOnRustClrCommand}" />
+    <KeyBinding Gesture="Ctrl+K" Command="{Binding FormatCodeCommand}" />
+    <KeyBinding Gesture="Ctrl+J" Command="{Binding ToggleChatCommand}" />
+  </Window.KeyBindings>
+
+  <Grid RowDefinitions="Auto,Auto,*,Auto,Auto">
+
+    <!-- ═══ Menu ═══════════════════════════════════════════════════════ -->
+    <Border Grid.Row="0" Background="{StaticResource Graphite}"
+            BorderBrush="{StaticResource Rule}" BorderThickness="0,0,0,1">
+      <Grid ColumnDefinitions="Auto,*,Auto">
+        <Menu Grid.Column="0">
+          <MenuItem Header="_File">
+            <MenuItem Header="New Project…" Command="{Binding NewProjectCommand}" />
+            <MenuItem Header="Open Project…" Command="{Binding OpenProjectCommand}" />
+            <MenuItem Header="Open File…" Command="{Binding OpenFileCommand}" />
+            <Separator />
+            <MenuItem Header="Save" InputGesture="Ctrl+S" Command="{Binding SaveCommand}" />
+            <MenuItem Header="Save All" InputGesture="Ctrl+Shift+S" Command="{Binding SaveAllCommand}" />
+            <Separator />
+            <MenuItem Header="Close Project" Command="{Binding CloseProjectCommand}" />
+            <MenuItem Header="Exit" Click="OnExit" />
+          </MenuItem>
+
+          <MenuItem Header="_Edit">
+            <MenuItem Header="Go To Line…" InputGesture="Ctrl+G" Command="{Binding GoToLineCommand}" />
+            <MenuItem Header="Format Code" InputGesture="Ctrl+K" Command="{Binding FormatCodeCommand}" />
+            <Separator />
+            <MenuItem Header="Settings…" Command="{Binding OpenSettingsCommand}" />
+          </MenuItem>
+
+          <MenuItem Header="_Build">
+            <MenuItem Header="Build" InputGesture="Ctrl+B" Command="{Binding BuildCommand}" />
+            <MenuItem Header="Run on .NET" InputGesture="F5" Command="{Binding RunCommand}" />
+            <MenuItem Header="Run on RustCLR" InputGesture="Ctrl+F5" Command="{Binding RunOnRustClrCommand}" />
+            <Separator />
+            <MenuItem Header="Verify on RustCLR" Command="{Binding VerifyCommand}" />
+            <MenuItem Header="Deploy…" Command="{Binding DeployCommand}" />
+          </MenuItem>
+
+          <MenuItem Header="_View">
+            <MenuItem Header="Explorer" Command="{Binding ToggleExplorerCommand}" />
+            <MenuItem Header="Chat Panel" InputGesture="Ctrl+J" Command="{Binding ToggleChatCommand}" />
+            <MenuItem Header="Logs" Command="{Binding ToggleLogsCommand}" />
+            <Separator />
+            <MenuItem Header="Line Numbers" Command="{Binding ToggleLineNumbersCommand}" />
+            <MenuItem Header="Refresh Tree" Command="{Binding RefreshTreeCommand}" />
+          </MenuItem>
+
+          <MenuItem Header="_Help">
+            <MenuItem Header="About CodeGen" Click="OnAbout" />
+          </MenuItem>
+        </Menu>
+
+        <TextBlock Grid.Column="2" VerticalAlignment="Center" Margin="0,0,14,0"
+                   Classes="panel-label" Text="CODEGEN · RUSTCLR" />
+      </Grid>
+    </Border>
+
+    <!-- ═══ Toolbar ════════════════════════════════════════════════════ -->
+    <Border Grid.Row="1" Background="{StaticResource Slate}"
+            BorderBrush="{StaticResource Rule}" BorderThickness="0,0,0,1" Padding="8,5">
+      <Grid ColumnDefinitions="Auto,*,Auto">
+        <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="2">
+          <Button Classes="tool" Content="＋ NEW" Command="{Binding NewProjectCommand}" ToolTip.Tip="New project" />
+          <Button Classes="tool" Content="▸ OPEN" Command="{Binding OpenProjectCommand}" ToolTip.Tip="Open project" />
+          <Border Width="1" Background="{StaticResource Rule}" Margin="6,3" />
+          <Button Classes="tool" Content="⌸ SAVE" Command="{Binding SaveCommand}" ToolTip.Tip="Save (Ctrl+S)" />
+          <Button Classes="tool" Content="≣ FORMAT" Command="{Binding FormatCodeCommand}" ToolTip.Tip="Format code (Ctrl+K)" />
+          <Button Classes="tool" Content="⇥ GOTO" Command="{Binding GoToLineCommand}" ToolTip.Tip="Go to line (Ctrl+G)" />
+          <Border Width="1" Background="{StaticResource Rule}" Margin="6,3" />
+          <Button Classes="tool" Content="⚒ BUILD" Command="{Binding BuildCommand}" ToolTip.Tip="Build (Ctrl+B)" />
+        </StackPanel>
+
+        <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="6">
+          <Button Classes="tool" Content="✓ VERIFY" Command="{Binding VerifyCommand}"
+                  ToolTip.Tip="Check what RustCLR cannot resolve" />
+          <Button Classes="tool" Content="⇪ DEPLOY" Command="{Binding DeployCommand}" ToolTip.Tip="Publish self-contained" />
+          <Button Content="Run on .NET" Command="{Binding RunCommand}" ToolTip.Tip="F5" />
+          <Button Classes="accent" Content="▶ Run on RustCLR" Command="{Binding RunOnRustClrCommand}"
+                  ToolTip.Tip="Ctrl+F5 — execute on the Rust runtime" />
+          <Button Classes="tool" Content="■" Command="{Binding CancelCommand}"
+                  IsVisible="{Binding IsBusy}" ToolTip.Tip="Cancel" />
+        </StackPanel>
+      </Grid>
+    </Border>
+
+    <!-- ═══ Workspace ══════════════════════════════════════════════════ -->
+    <Grid Grid.Row="2" ColumnDefinitions="Auto,Auto,*,Auto,Auto">
+
+      <!-- ── Explorer ─────────────────────────────────────────────── -->
+      <Border Grid.Column="0" Classes="panel" BorderThickness="0,0,1,0"
+              Width="{Binding ExplorerWidth}" IsVisible="{Binding ExplorerVisible}">
+        <Grid RowDefinitions="Auto,*">
+          <Border Grid.Row="0" Classes="panel-header">
+            <Grid ColumnDefinitions="*,Auto">
+              <TextBlock Grid.Column="0" Classes="panel-label" Text="EXPLORER" VerticalAlignment="Center" />
+              <TextBlock Grid.Column="1" Classes="readout" VerticalAlignment="Center"
+                         Text="{Binding ProjectLabel}" />
+            </Grid>
+          </Border>
+
+          <TreeView Grid.Row="1" ItemsSource="{Binding ExplorerRoots}" Padding="4,6"
+                    DoubleTapped="OnTreeDoubleTapped">
+            <TreeView.Styles>
+              <!-- Let the view model decide what starts expanded. -->
+              <Style Selector="TreeViewItem" x:DataType="vm:FileNodeViewModel">
+                <Setter Property="IsExpanded" Value="{Binding IsExpanded, Mode=TwoWay}" />
+              </Style>
+            </TreeView.Styles>
+            <TreeView.ItemTemplate>
+              <TreeDataTemplate x:DataType="vm:FileNodeViewModel" ItemsSource="{Binding Children}">
+                <StackPanel Orientation="Horizontal" Spacing="7" Opacity="{Binding Opacity}">
+                  <TextBlock Text="{Binding Glyph}" Foreground="{StaticResource Oxide}"
+                             FontFamily="{StaticResource MachineFace}" FontSize="11" VerticalAlignment="Center" />
+                  <TextBlock Text="{Binding Name}" VerticalAlignment="Center" />
+                </StackPanel>
+              </TreeDataTemplate>
+            </TreeView.ItemTemplate>
+          </TreeView>
+        </Grid>
+      </Border>
+
+      <GridSplitter Grid.Column="1" Width="1" IsVisible="{Binding ExplorerVisible}"
+                    ResizeDirection="Columns" />
+
+      <!-- ── Editor ───────────────────────────────────────────────── -->
+      <Grid Grid.Column="2" RowDefinitions="Auto,*">
+
+        <!-- Tab strip -->
+        <Border Grid.Row="0" Background="{StaticResource Graphite}"
+                BorderBrush="{StaticResource Rule}" BorderThickness="0,0,0,1" MinHeight="33">
+          <ScrollViewer HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled">
+            <ListBox ItemsSource="{Binding Tabs}" SelectedItem="{Binding SelectedTab}"
+                     Background="Transparent" Padding="0">
+              <ListBox.ItemsPanel>
+                <ItemsPanelTemplate>
+                  <StackPanel Orientation="Horizontal" />
+                </ItemsPanelTemplate>
+              </ListBox.ItemsPanel>
+              <ListBox.ItemTemplate>
+                <DataTemplate x:DataType="vm:EditorTabViewModel">
+                  <Border Padding="13,7" BorderBrush="{StaticResource Rule}" BorderThickness="0,0,1,0">
+                    <StackPanel Orientation="Horizontal" Spacing="9">
+                      <TextBlock Text="{Binding Caption}" FontFamily="{StaticResource MachineFace}"
+                                 FontSize="11.5" VerticalAlignment="Center" />
+                      <Button Classes="tool" Content="✕" Padding="3,0" FontSize="10"
+                              Click="OnCloseTab" Tag="{Binding}" />
+                    </StackPanel>
+                  </Border>
+                </DataTemplate>
+              </ListBox.ItemTemplate>
+            </ListBox>
+          </ScrollViewer>
+        </Border>
+
+        <!-- Code -->
+        <Panel Grid.Row="1">
+          <edit:TextEditor x:Name="Editor"
+                           Document="{Binding SelectedTab.Document}"
+                           ShowLineNumbers="{Binding ShowLineNumbers}"
+                           IsVisible="{Binding SelectedTab, Converter={x:Static ObjectConverters.IsNotNull}}"
+                           Background="{StaticResource Graphite}"
+                           Foreground="{StaticResource Bone}"
+                           FontFamily="{StaticResource MachineFace}"
+                           FontSize="13"
+                           Padding="10,8"
+                           HorizontalScrollBarVisibility="Auto"
+                           VerticalScrollBarVisibility="Auto" />
+
+          <!-- Empty state: an invitation to act, not a shrug. -->
+          <StackPanel IsVisible="{Binding SelectedTab, Converter={x:Static ObjectConverters.IsNull}}"
+                      HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="12" MaxWidth="440">
+            <TextBlock Classes="panel-label" Text="NO FILE OPEN" HorizontalAlignment="Center" />
+            <TextBlock Classes="prose" TextAlignment="Center" Foreground="{StaticResource Muted}"
+                       Text="Open a file from the explorer, or ask Jack to build something. He can scaffold a project, write the code and run it on RustCLR without leaving this window." />
+            <Button Content="New project" HorizontalAlignment="Center"
+                    Command="{Binding NewProjectCommand}" />
+          </StackPanel>
+        </Panel>
+      </Grid>
+
+      <GridSplitter Grid.Column="3" Width="1" IsVisible="{Binding ChatPanelVisible}"
+                    ResizeDirection="Columns" />
+
+      <!-- ── Chat ─────────────────────────────────────────────────── -->
+      <Border Grid.Column="4" Classes="panel" BorderThickness="1,0,0,0"
+              Width="{Binding ChatPanelWidth}" IsVisible="{Binding ChatPanelVisible}">
+        <Grid RowDefinitions="Auto,Auto,*,Auto,Auto">
+
+          <!-- Identity -->
+          <Border Grid.Row="0" Classes="panel-header">
+            <Grid ColumnDefinitions="*,Auto">
+              <StackPanel Grid.Column="0">
+                <TextBlock Classes="panel-label" Foreground="{StaticResource Oxide}" Text="JACK" />
+                <TextBlock Classes="readout" Text="the code bender" />
+              </StackPanel>
+              <Button Grid.Column="1" Classes="tool" Content="CLEAR" VerticalAlignment="Center"
+                      Command="{Binding ClearChatCommand}" ToolTip.Tip="Clear this thread" />
+            </Grid>
+          </Border>
+
+          <!-- Model picker -->
+          <Border Grid.Row="1" Background="{StaticResource Graphite}" Padding="10,7"
+                  BorderBrush="{StaticResource Rule}" BorderThickness="0,0,0,1">
+            <Grid ColumnDefinitions="*,8,*">
+              <ComboBox Grid.Column="0" ItemsSource="{Binding Providers}"
+                        SelectedItem="{Binding SelectedProvider}" HorizontalAlignment="Stretch"
+                        ToolTip.Tip="LLM provider" />
+              <ComboBox Grid.Column="2" ItemsSource="{Binding ModelChoices}"
+                        SelectedItem="{Binding SelectedModel}" HorizontalAlignment="Stretch"
+                        ToolTip.Tip="Model" />
+            </Grid>
+          </Border>
+
+          <!-- Thread -->
+          <ScrollViewer Grid.Row="2" Name="ChatScroll"
+                        HorizontalScrollBarVisibility="Disabled"
+                        VerticalScrollBarVisibility="Auto">
+            <!-- Inset with a margin rather than ScrollViewer.Padding: padding
+                 does not narrow the measure width, so prose ran under the
+                 scrollbar and off the panel edge. -->
+            <StackPanel Spacing="14" Margin="12,10,18,10">
+              <ItemsControl ItemsSource="{Binding ChatEntries}">
+                <ItemsControl.ItemTemplate>
+                  <DataTemplate x:DataType="svc:ChatEntry">
+                    <StackPanel Spacing="4" Margin="0,0,0,10">
+                      <Grid ColumnDefinitions="Auto,*,Auto">
+                        <TextBlock Grid.Column="0" Classes="speaker" Text="{Binding Speaker}"
+                                   Foreground="{StaticResource Oxide}" IsVisible="{Binding IsAssistant}" />
+                        <TextBlock Grid.Column="0" Classes="speaker" Text="{Binding Speaker}"
+                                   Foreground="{StaticResource Patina}" IsVisible="{Binding IsUser}" />
+                        <TextBlock Grid.Column="0" Classes="speaker" Text="{Binding Speaker}"
+                                   Foreground="{StaticResource Amber}" IsVisible="{Binding IsSystemNote}" />
+                        <TextBlock Grid.Column="2" Classes="readout" Text="{Binding Timestamp}" />
+                      </Grid>
+
+                      <TextBlock Classes="prose" Text="{Binding Display}" />
+
+                      <ItemsControl ItemsSource="{Binding Attachments}" Margin="0,2,0,0">
+                        <ItemsControl.ItemTemplate>
+                          <DataTemplate x:DataType="x:String">
+                            <TextBlock Classes="readout" Text="{Binding}"
+                                       Foreground="{StaticResource Patina}" TextTrimming="CharacterEllipsis" />
+                          </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                      </ItemsControl>
+
+                      <TextBlock Classes="readout" IsVisible="{Binding HasTools}"
+                                 Text="{Binding ToolSummary}" TextWrapping="Wrap"
+                                 Foreground="{StaticResource Muted}" />
+                    </StackPanel>
+                  </DataTemplate>
+                </ItemsControl.ItemTemplate>
+              </ItemsControl>
+
+              <!-- Empty state -->
+              <StackPanel Spacing="8" IsVisible="{Binding !ChatEntries.Count}">
+                <TextBlock Classes="prose" Foreground="{StaticResource Muted}"
+                           Text="Ask Jack to scaffold a project, explain a method's IL, or fix a build error. He reads and writes files in the open project, runs the toolchain, and can search the web." />
+                <TextBlock Classes="readout" Text="Ctrl+Enter sends" />
+              </StackPanel>
+
+              <TextBlock Classes="readout" IsVisible="{Binding ChatBusy}"
+                         Foreground="{StaticResource Oxide}" Text="working…" />
+            </StackPanel>
+          </ScrollViewer>
+
+          <!-- Attachments -->
+          <ItemsControl Grid.Row="3" ItemsSource="{Binding Attachments}" Margin="12,0,12,6">
+            <ItemsControl.ItemTemplate>
+              <DataTemplate x:DataType="x:String">
+                <Border Background="{StaticResource SlateRaised}" CornerRadius="3" Padding="7,3" Margin="0,2">
+                  <TextBlock Classes="readout" Text="{Binding}" TextTrimming="CharacterEllipsis" />
+                </Border>
+              </DataTemplate>
+            </ItemsControl.ItemTemplate>
+          </ItemsControl>
+
+          <!-- Composer -->
+          <Border Grid.Row="4" Background="{StaticResource Graphite}" Padding="10"
+                  BorderBrush="{StaticResource Rule}" BorderThickness="0,1,0,0">
+            <Grid RowDefinitions="Auto,Auto">
+              <TextBox Grid.Row="0" Name="ChatBox" Text="{Binding ChatInput}"
+                       Watermark="Ask Jack to build, change or explain something"
+                       AcceptsReturn="True" TextWrapping="Wrap"
+                       MinHeight="66" MaxHeight="180" />
+              <Grid Grid.Row="1" ColumnDefinitions="Auto,*,Auto" Margin="0,8,0,0">
+                <Button Grid.Column="0" Classes="tool" Content="📎 ATTACH"
+                        Command="{Binding AttachImageCommand}" ToolTip.Tip="Attach images" />
+                <Button Grid.Column="2" Classes="accent" Content="Send"
+                        Command="{Binding SendChatCommand}" IsEnabled="{Binding !ChatBusy}" />
+              </Grid>
+            </Grid>
+          </Border>
+        </Grid>
+      </Border>
+    </Grid>
+
+    <!-- ═══ Logs ═══════════════════════════════════════════════════════ -->
+    <Border Grid.Row="3" Classes="panel" BorderThickness="0,1,0,0"
+            Height="{Binding LogPanelHeight}" IsVisible="{Binding LogPanelVisible}">
+      <Grid RowDefinitions="Auto,*">
+        <Border Grid.Row="0" Classes="panel-header">
+          <Grid ColumnDefinitions="Auto,*,Auto">
+            <TextBlock Grid.Column="0" Classes="panel-label" Text="OUTPUT" VerticalAlignment="Center" />
+            <Button Grid.Column="2" Classes="tool" Content="CLEAR" Command="{Binding ClearLogCommand}" />
+          </Grid>
+        </Border>
+        <ScrollViewer Grid.Row="1" Name="LogScroll" Padding="12,6">
+          <ItemsControl ItemsSource="{Binding LogLines}">
+            <ItemsControl.ItemTemplate>
+              <DataTemplate x:DataType="x:String">
+                <TextBlock Text="{Binding}" FontFamily="{StaticResource MachineFace}"
+                           FontSize="11.5" Foreground="{StaticResource Bone}"
+                           TextWrapping="NoWrap" />
+              </DataTemplate>
+            </ItemsControl.ItemTemplate>
+          </ItemsControl>
+        </ScrollViewer>
+      </Grid>
+    </Border>
+
+    <!-- ═══ Status bar ═════════════════════════════════════════════════
+         The signature element. An IDE whose whole subject is a runtime
+         should show the runtime's own numbers, so the right-hand readout
+         carries what the last RustCLR run actually did.
+    ═══════════════════════════════════════════════════════════════════ -->
+    <Border Grid.Row="4" Background="{StaticResource Slate}"
+            BorderBrush="{StaticResource Rule}" BorderThickness="0,1,0,0" Padding="12,5">
+      <Grid ColumnDefinitions="Auto,Auto,*,Auto,Auto,Auto">
+        <Ellipse Grid.Column="0" Width="7" Height="7" VerticalAlignment="Center" Margin="0,0,8,0"
+                 Fill="{StaticResource Patina}" IsVisible="{Binding !IsBusy}" />
+        <Ellipse Grid.Column="0" Width="7" Height="7" VerticalAlignment="Center" Margin="0,0,8,0"
+                 Fill="{StaticResource Oxide}" IsVisible="{Binding IsBusy}" />
+
+        <TextBlock Grid.Column="1" Classes="readout" Foreground="{StaticResource Bone}"
+                   Text="{Binding Status}" VerticalAlignment="Center" />
+
+        <TextBlock Grid.Column="3" Classes="readout" Text="{Binding CursorPosition}"
+                   VerticalAlignment="Center" Margin="0,0,18,0" />
+
+        <Border Grid.Column="4" Width="1" Background="{StaticResource Rule}" Margin="0,1,18,1" />
+
+        <TextBlock Grid.Column="5" Classes="readout-value" Text="{Binding Telemetry}"
+                   VerticalAlignment="Center" ToolTip.Tip="Counters from the last RustCLR run" />
+      </Grid>
+    </Border>
+  </Grid>
+</Window>

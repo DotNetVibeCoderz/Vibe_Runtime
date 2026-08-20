@@ -1,0 +1,13 @@
+sku,name,category,onHand,reorderAt,unitPrice
+SKU-1001,RustCLR Runtime License,License,24,10,2500000
+SKU-1002,RustCLR Runtime License (5-pack),License,8,4,11000000
+SKU-2001,Support Hours,Service,180,40,150000
+SKU-2002,On-site Training Day,Service,6,2,4500000
+SKU-3001,ESP32 Devkit C,Hardware,142,50,85000
+SKU-3002,STM32 Nucleo-F401RE,Hardware,63,25,210000
+SKU-3003,RISC-V HiFive1 Rev B,Hardware,17,10,1150000
+SKU-3004,Sensor Bundle (temp + humidity),Hardware,95,30,145000
+SKU-4001,CodeGen Seat (annual),Subscription,310,100,1200000
+SKU-4002,CodeGen Team (10 seats),Subscription,22,10,9600000
+SKU-5001,Migration Assessment,Service,3,1,7500000
+SKU-5002,Priority Support (annual),Subscription,41,15,3200000

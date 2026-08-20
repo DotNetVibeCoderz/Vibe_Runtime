@@ -1,0 +1,21 @@
+[package]
+name = "rustnet-cli"
+description = "RustNet Toolchain: build, run, inspect and disassemble assemblies on RustCLR"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "rustnet"
+path = "src/main.rs"
+
+[dependencies]
+rustclr-core.workspace = true
+rustclr-bcl.workspace = true
+rustclr-gc.workspace = true
+rustclr-metadata.workspace = true
+rustclr-interop.workspace = true
+rustclr-jit.workspace = true
