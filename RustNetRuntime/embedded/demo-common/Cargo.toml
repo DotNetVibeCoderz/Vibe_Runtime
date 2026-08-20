@@ -9,3 +9,7 @@ publish = false
 [dependencies]
 rustclr-metadata = { path = "../../crates/rustclr-metadata", default-features = false }
 rustclr-gc = { path = "../../crates/rustclr-gc", default-features = false }
+rustclr-core = { path = "../../crates/rustclr-core", default-features = false }
+rustclr-bcl = { path = "../../crates/rustclr-bcl", default-features = false, features = [
+    "libm-math",
+] }

@@ -6,6 +6,9 @@ use rustclr_core::{
 };
 use rustclr_gc::Handle;
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 /// Reads argument `i`, dereferencing a managed pointer if one was passed.
 ///
 /// C# calls instance methods on value types through `ldloca`, so `this` for
@@ -169,7 +172,7 @@ pub fn format_double(f: f64) -> String {
     if f.is_infinite() {
         return if f > 0.0 { "∞".into() } else { "-∞".into() };
     }
-    if f == f.trunc() && f.abs() < 1e15 {
+    if f == crate::fmath::trunc(f) && crate::fmath::abs(f) < 1e15 {
         return format!("{}", f as i64);
     }
     let s = format!("{f}");
@@ -184,7 +187,7 @@ pub fn format_single(f: f32) -> String {
     if f.is_infinite() {
         return if f > 0.0 { "∞".into() } else { "-∞".into() };
     }
-    if f == f.trunc() && f.abs() < 1e7 {
+    if f == crate::fmath::trunc_f32(f) && crate::fmath::abs_f32(f) < 1e7 {
         return format!("{}", f as i64);
     }
     format!("{f}")
@@ -256,4 +259,27 @@ pub fn read_string(interp: &Interpreter, h: Handle) -> String {
         .get_as::<ClrString>(h)
         .map(|s| s.to_rust_string())
         .unwrap_or_default()
+}
+
+/// Blocks for `ms` milliseconds.
+///
+/// With `std` this parks the thread. Without it there is no scheduler to park
+/// in, so it spins on the host's monotonic clock — which is what a board with
+/// one core and no OS actually does, and why [`Host::monotonic_millis`] is part
+/// of the trait rather than an `std` detail.
+///
+/// [`Host::monotonic_millis`]: rustclr_core::Host::monotonic_millis
+pub fn sleep_millis(interp: &mut Interpreter, ms: u64) {
+    #[cfg(feature = "std")]
+    {
+        let _ = interp;
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let start = interp.host.monotonic_millis();
+        while interp.host.monotonic_millis().wrapping_sub(start) < ms {
+            core::hint::spin_loop();
+        }
+    }
 }

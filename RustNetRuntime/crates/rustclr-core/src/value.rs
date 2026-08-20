@@ -9,6 +9,9 @@
 use crate::types::TypeId;
 use rustclr_gc::Handle;
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 /// Where a managed pointer (`&`) points.
 ///
 /// Interior pointers are represented structurally rather than as raw addresses.

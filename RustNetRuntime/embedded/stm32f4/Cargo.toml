@@ -1,0 +1,40 @@
+[package]
+name = "rustclr-stm32f4"
+version = "0.1.0"
+edition = "2021"
+description = "Runs RustCLR on STM32F4 boards: Nucleo-F401RE and Netduino 3 WiFi (STM32F427VI)"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Its own workspace, like every other board firmware: the runtime crates carry
+# no external dependencies and this one needs a HAL and a linker script.
+[workspace]
+
+[features]
+default = ["nucleo-f401re"]
+
+# Nucleo-F401RE: STM32F401RET6, HSI-derived 84 MHz, LD2 on PA5, console on
+# USART2 (PA2/PA3) which the on-board ST-Link exposes as a virtual COM port.
+# 512 KB flash / 96 KB RAM — the smallest RAM of any board here, and the only
+# one that cannot run the interpreter at all.
+nucleo-f401re = ["stm32f4xx-hal/stm32f401"]
+
+# Netduino 3 WiFi: STM32F427VIT6, 25 MHz HSE to 168 MHz, USR_LED on PA10,
+# console on UART7 (PE7/PE8, the goPort2 header). 2 MB flash / 256 KB RAM.
+netduino3-f427vi = ["stm32f4xx-hal/stm32f427"]
+
+[dependencies]
+rustclr-demo-common = { path = "../demo-common" }
+
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7"
+embedded-alloc = "0.6"
+# Used for the clock tree and the console. Which part it targets comes from the
+# board feature above, never from a version pin here.
+stm32f4xx-hal = { version = "0.22", default-features = false }
+
+[profile.release]
+codegen-units = 1
+debug = true
+lto = true
+opt-level = "s"

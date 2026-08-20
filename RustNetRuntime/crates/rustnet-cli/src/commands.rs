@@ -26,6 +26,7 @@ pub fn run(
     max_instructions: Option<u64>,
     jit: bool,
     jit_threshold: Option<u32>,
+    inline: bool,
 ) -> Result<i32> {
     let mut interp = runtime(args);
     if let Some(budget) = max_instructions {
@@ -35,10 +36,14 @@ pub fn run(
         // Methods the backend declines keep running in the interpreter, so
         // enabling this can only change how fast a program runs, never what it
         // prints. `--no-jit` exists to make that checkable.
-        let tier = match jit_threshold {
+        let mut tier = match jit_threshold {
             Some(t) => rustclr_jit::JitTier::with_threshold(t),
             None => rustclr_jit::JitTier::new(),
         };
+        // Same reasoning as above one level down: inlining widens what the
+        // backend accepts without changing any answer, and `--no-inline` is how
+        // that claim gets checked rather than asserted.
+        tier.set_inline(inline);
         interp.native_tier = Some(Box::new(tier));
     }
 
@@ -522,7 +527,7 @@ pub fn build(project: &str, configuration: &str, then_run: bool) -> Result<i32> 
         .ok_or("build succeeded but no output assembly was found under bin/")?;
 
     println!("Running {} on RustCLR…\n", assembly.display());
-    run(&assembly.to_string_lossy(), Vec::new(), false, false, None, true, None)
+    run(&assembly.to_string_lossy(), Vec::new(), false, false, None, true, None, true)
 }
 
 /// Finds the first `.dll` under a build output directory.
@@ -546,16 +551,21 @@ pub fn capabilities() -> Result<i32> {
     println!("RustCLR runtime capabilities\n");
     println!("Execution");
     println!("  IL interpreter               yes");
-    println!("  native JIT backend           x86-64, LEAF INTEGER METHODS ONLY:");
+    println!("  native JIT backend           x86-64, INTEGER METHODS ONLY:");
     println!("                               integer arithmetic, comparison, branching,");
-    println!("                               arguments and locals. No calls, allocation,");
-    println!("                               exception handling, floating point or object");
-    println!("                               access. Everything else is interpreted, and");
+    println!("                               arguments and locals. No allocation, exception");
+    println!("                               handling, floating point or object access.");
+    println!("                               Everything else is interpreted, and");
     println!("                               `rustnet jit <assembly>` says which is which.");
     println!("  code memory                  write-xor-execute; never both at once");
     println!("  tiering                      compile after 32 calls; --no-jit disables");
-    println!("  AArch64, RISC-V backends     no - x86-64 only");
-    println!("  inlining                     no - the analysis exists, the backend does not");
+    println!("  inlining                     yes - branch-free static callees, one level");
+    println!("                               deep; --no-inline disables");
+    println!("  AArch64, RISC-V backends     EMIT ONLY, NEVER EXECUTED. Both encode the");
+    println!("                               same IL the x86-64 backend does and are");
+    println!("                               checked by disassembly, but no compiled");
+    println!("                               method has ever run on either architecture.");
+    println!("                               Only x86-64 is dispatched to at runtime.");
     println!("  managed call depth limit     {}", interp.limits.max_frames);
     println!("\nMemory");
     println!("  collector                    {}", interp.heap.collector_name());
@@ -644,19 +654,38 @@ Collections and LINQ");
     println!("  native bindings registered   {}", interp.native_count());
 
     println!("\nEmbedded targets");
-    println!("  metadata + GC without std    yes - thumbv7em, thumbv6m, riscv32imc,");
-    println!("                               riscv64gc, and xtensa-esp32 via the esp fork");
+    println!("  whole runtime without std    yes - metadata, gc, core AND bcl, for");
+    println!("                               thumbv7em, thumbv6m, riscv32imc, riscv64gc,");
+    println!("                               and xtensa-esp32 via the esp fork.");
+    println!("                               tests/embedded.sh checks all of them.");
+    println!("  what changed to get there    maps become BTreeMap (every key is Ord),");
+    println!("                               Arc becomes Rc (riscv32imc has no atomics),");
+    println!("                               float maths comes from libm (core has none).");
+    println!("                               Only the filesystem stayed std-only, so");
+    println!("                               load_from_file is gated and bytes are not.");
     println!("  fixed-size heap              yes - Heap::embedded(n) is a hard ceiling");
-    println!("  interpreter without std      no - needs a hash map, a clock and file IO");
-    println!("  ahead-of-time compilation    no - needs Arm and RISC-V backends");
-    println!("  run on real hardware         yes - three architectures, byte-identical:");
-    println!("                               ESP32-WROOM-32 (Xtensa LX6), ESP32-C3");
-    println!("                               (RISC-V), Meadow F7 (Arm Cortex-M7).");
-    println!("                               the metadata reader parsed a Roslyn assembly");
-    println!("                               out of flash and the collector reclaimed a");
-    println!("                               cycle, on each chip. IL execution did NOT run");
-    println!("                               there - that needs the interpreter, which");
-    println!("                               still requires std. See docs/logs/.");
+    println!("  IL EXECUTION ON A CHIP       yes - verified on an ESP32-C3 (RISC-V,");
+    println!("                               400 KB SRAM, no OS). Loader, interpreter and");
+    println!("                               all {} native bindings; HelloWorld.Main", interp.native_count());
+    println!("                               printed the same bytes dotnet prints, with");
+    println!("                               the same instruction and call counts.");
+    println!("  memory needed to do it       260,702 bytes with every binding, or");
+    println!("                               192,045 with console, strings and maths");
+    println!("                               only. Measured, not estimated. A firmware");
+    println!("                               picks a tier from its heap budget and says");
+    println!("                               plainly when neither fits.");
+    println!("  ahead-of-time compilation    no - needs Arm and RISC-V backends, which");
+    println!("                               emit code but have never executed any");
+    println!("  board firmwares              five, one shared demonstration:");
+    println!("                               ESP32-WROOM-32 (Xtensa), ESP32-C3 (RV32),");
+    println!("                               Meadow F7 (Cortex-M7), Pico (Cortex-M0+),");
+    println!("                               Maix Go K210 (RV64). tests/firmware.sh");
+    println!("  run on real hardware         ESP32-C3 executes IL. The Xtensa and");
+    println!("                               Cortex-M7 boards were last flashed before");
+    println!("                               the interpreter landed, so their captures");
+    println!("                               show metadata and GC only. The Pico and");
+    println!("                               K210 images build but were never flashed -");
+    println!("                               no board was connected. Runs: docs/logs/.");
 
     println!("\nArchitectures recognised in PE headers");
     for m in [

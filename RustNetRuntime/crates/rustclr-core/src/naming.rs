@@ -6,6 +6,9 @@
 
 use rustclr_metadata::{MethodSig, TypeSig};
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 /// Renders a signature type the way the key format expects.
 pub fn type_sig_name(sig: &TypeSig) -> String {
     match sig {

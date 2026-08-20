@@ -102,26 +102,47 @@ Still open, and the reason this milestone is not the end of the story:
 
 ## Milestone 4 — Native code generation ◐
 
-Half done, and useful now. The x86-64 emitter and the tiering policy exist; the
-other two architectures and inlining do not.
+Every listed item is built. It stays marked partial for one reason, stated
+plainly: two of the three backends have never executed a single instruction.
 
 | | |
 | --- | --- |
-| x86-64 emitter for leaf integer methods | ✅ |
+| x86-64 emitter for integer methods | ✅ executed, and differentially tested |
 | W^X code pages | ✅ mapped RW, filled, then flipped to RX — never both |
 | Tiering: interpret, then compile on call count | ✅ default 32 calls |
-| AArch64, then RISC-V | ❌ |
-| Inlining, using `is_inline_candidate` | ❌ the analysis exists; nothing consumes it |
+| AArch64, then RISC-V | ◐ **emit only** — encoded and disassembly-checked, never run |
+| Inlining, using `is_inline_candidate` | ✅ branch-free static callees, one level deep |
+
+**Why the backends are shared.** The IL walk lives in `translate.rs` behind a
+`Backend` trait; only the encoding differs per architecture. So the x86-64
+backend — the one this host can execute, and therefore the one the differential
+test proves — exercises the same translation the other two use. That is worth
+something, and it is not worth what running them would be.
 
 **What it compiles.** Integer arithmetic, comparison, branching, arguments and
-locals, in methods that make no calls, allocate nothing and have no exception
-handling. `rustnet jit <assembly>` lists what is taken and why the rest is not.
+locals, in methods that allocate nothing and have no exception handling. Calls
+are no longer disqualifying when the callee is small enough to inline.
+`rustnet jit <assembly>` lists what is taken and why the rest is not.
 
-**What it is worth.** On the `kernels` benchmark — the shape the backend covers
-— 2484 ms interpreted, 232 ms compiled: **10.7× faster**, and 1.6× .NET rather
-than 17.5×. On the other benchmark workloads it changes nothing, because they
-use arrays and calls and are declined; measuring that was the point of adding
-`kernels` beside them rather than instead of them.
+**What it is worth.** Two benchmark workloads, because one number would hide
+the shape of the result:
+
+| Workload | interpreted | compiled | speedup | vs .NET |
+| --- | ---: | ---: | ---: | ---: |
+| `kernels` — arithmetic written out longhand | 2971 ms | 269 ms | **11.0×** | 1.8× |
+| `inlined` — the same arithmetic, factored into helpers | 1629 ms | 400 ms | **4.1×** | 3.6× |
+
+Of the `inlined` figure, **2.9× is the inliner alone**: with `--no-inline` the
+same run takes 1148 ms, because the backend declines the calling method
+outright. `kernels` is unchanged by inlining at 1.0×, since its callees all
+contain loops and none are eligible. That contrast is the honest summary —
+inlining is worth a great deal on code that factors its arithmetic, and nothing
+on code already written to suit the backend's limits.
+
+**What inlining does not do.** One level only, and only callees with no
+branches at all: a helper containing an `if` is not spliced, and a helper that
+itself calls another is not either. Both restrictions are about keeping the
+transformation obviously correct rather than about difficulty.
 
 **The next step is arrays**, and it is a real one. Handles are not pointers, so
 reading `a[i]` from machine code means resolving a handle through the handle
@@ -164,21 +185,31 @@ and `Module` enumeration, and constructing generic types at run time.
 
 ## Milestone 6 — Embedded targets ◐
 
-**It runs on real hardware, on three architectures.** Verified on an
-ESP32-WROOM-32 (Xtensa LX6), an ESP32-C3 (RISC-V) and a Meadow F7 Micro
-(STM32F777, Arm Cortex-M7). The metadata and collector output is
-**byte-identical** on all three:
-[Xtensa](docs/logs/esp32-wroom32.log) · [RISC-V](docs/logs/esp32c3.log) ·
-[Arm](docs/logs/meadow-f7.log).
+**C# runs on a microcontroller.** On an ESP32-C3 — RISC-V, 400 KB of SRAM, no
+operating system — the loader, the interpreter and all 766 of RustBCL's native
+bindings execute `HelloWorld.Main`, and it prints the same three lines
+`dotnet` does, CRLF included, with the same instruction and call counts:
+[ESP32-C3, executing](docs/logs/esp32c3-interpreter.log).
+
+Getting there needed `rustclr-core` and `rustclr-bcl` to build without `std`,
+which had been written off as needing "a hash map, a clock and file IO". Two of
+the three were shallow — the maps are keyed by types that are all `Ord`, and
+the clock was already behind the `Host` trait. Only the filesystem was real.
+
+The metadata reader and collector had already run on three architectures, with
+**byte-identical** output: [Xtensa](docs/logs/esp32-wroom32.log) ·
+[RISC-V](docs/logs/esp32c3.log) · [Arm](docs/logs/meadow-f7.log).
 
 | | |
 | --- | --- |
-| Core crates build without `std` | ✅ `rustclr-metadata` and `rustclr-gc`, four upstream targets plus Xtensa |
+| Core crates build without `std` | ✅ all four — metadata, gc, **core and bcl** — on four upstream targets plus Xtensa |
 | A fixed-size heap | ✅ `Heap::embedded(n)` is a hard ceiling, not a hint |
 | Flash and run on an ESP32 | ✅ Xtensa **and** RISC-V |
 | Flash and run on an STM32 | ✅ Meadow F7 Micro, over USB DFU |
-| `rustclr-core` without `std` | ❌ needs a hash map, a clock and file IO |
-| Ahead-of-time compilation | ❌ blocked on Arm and RISC-V backends, which do not exist |
+| Firmware for RP2040 and K210 | ◐ **built, not yet flashed** — no board was connected |
+| `rustclr-core` without `std` | ✅ maps became `BTreeMap`, `Arc` became `Rc`, only the filesystem stayed gated |
+| **Execute IL on a microcontroller** | ✅ **ESP32-C3, full RustBCL, output byte-identical to `dotnet`** |
+| Ahead-of-time compilation | ❌ blocked on Arm and RISC-V backends, which emit but have never run |
 
 On each chip, `rustclr-metadata` read a Roslyn-built `HelloWorld.dll` out of
 flash — PE header, CLI header, metadata tables, string heap — and reported its
@@ -195,6 +226,22 @@ cycle unrooted   live=0
 refused past it  true
 ```
 
+**Five boards now, from one demo.** `embedded/demo-common` holds the report and
+each firmware supplies a `core::fmt::Write` to receive it — because "they all
+print the same thing" only stays true if there is one copy of it.
+
+| Board | Core | Target | State |
+| --- | --- | --- | --- |
+| ESP32-WROOM-32 | Xtensa LX6 | `xtensa-esp32-none-elf` | run on hardware |
+| ESP32-C3 | RISC-V 32 | `riscv32imc-unknown-none-elf` | run on hardware |
+| Meadow F7 Micro | Arm Cortex-M7 | `thumbv7em-none-eabihf` | run on hardware |
+| Raspberry Pi Pico | Arm Cortex-M0+ | `thumbv6m-none-eabi` | **builds; not yet flashed** |
+| Sipeed Maix Go | RISC-V 64 | `riscv64gc-unknown-none-elf` | **builds; not yet flashed** |
+
+`tests/firmware.sh` builds all five, so a change to a shared type cannot break a
+board silently — that failure otherwise surfaces only when someone reaches for
+the hardware.
+
 **Difficulty was inversely related to how upstream the target is.** RISC-V and
 Arm are both upstream Rust targets: stable toolchain, prebuilt `core` and
 `alloc`, no `build-std`. Xtensa needed the forked toolchain from `espup`. The
@@ -206,7 +253,8 @@ letting a host adjudicate; this firmware uses that answer and prints what it
 actually locked to, so the claim stays checkable.
 
 ```bash
-bash tests/embedded.sh                 # four upstream targets, build only
+bash tests/embedded.sh                 # the crates, four upstream targets
+bash tests/firmware.sh                 # all five board firmwares
 cd embedded/meadow-f7 && cargo build --release      # STM32, stable
 cd embedded/esp32-demo
 # ESP32-C3, stable Rust:

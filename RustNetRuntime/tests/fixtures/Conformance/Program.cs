@@ -258,6 +258,30 @@ static class Program
         return (a + b) * (c - a) + (-b) + (~c) + (a + b + c + a + b + c);
     }
 
+    // Inlining. Without it the backend declines anything containing a `call`,
+    // so `Blend` below would be interpreted no matter how hot it got. `Scale`
+    // and `Clamp` are branch-free static leaves, which is exactly what the
+    // inliner splices, and `Blend` is then compiled as if it had been written
+    // out longhand. The answer must not change either way.
+
+    static int Scale(int v, int by) { return v * by + (v >> 1); }
+
+    static int Clamp(int v) { return v & 0xFFFF; }
+
+    static int Blend(int a, int b)
+    {
+        return Clamp(Scale(a, 3)) + Clamp(Scale(b, 5)) - Clamp(a ^ b);
+    }
+
+    /// A loop around an inlined call, so the compiled body is entered many
+    /// times rather than once.
+    static int BlendLoop(int n)
+    {
+        int total = 0;
+        for (int i = 0; i < n; i++) { total = total + Blend(i, n - i); }
+        return total;
+    }
+
     // -- reflection ----------------------------------------------------------
     // Milestone 5. `System.Type` is a real object here, interned one per
     // runtime type, so identity comparisons work as .NET guarantees.
@@ -604,6 +628,8 @@ static class Program
         Check("jit fib beyond 32 bits", FibIterative(92) == 7540113804746346429L);
         CheckEq("jit deep stack", DeepStack(3, 4, 5), 14 + (-4) + (-6) + 24);
         CheckEq("jit division truncates toward zero", Arithmetic(-7, 2), -3);
+        CheckEq("jit inlined leaf call", Blend(9, 4), 40);
+        CheckEq("jit inlined call in a loop", BlendLoop(64), 14752);
 
         // reflection
         CheckStr("typeof name", typeof(Tag).Name, "Tag");

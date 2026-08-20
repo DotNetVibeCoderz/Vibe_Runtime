@@ -33,8 +33,9 @@ use core::fmt::Write as _;
 
 use cortex_m_rt::entry;
 use embedded_alloc::LlffHeap;
-use rp2040_hal as hal;
 use hal::pac;
+use hal::Clock as _;
+use rp2040_hal as hal;
 use usb_device::class_prelude::UsbBusAllocator;
 use usb_device::prelude::*;
 use usbd_serial::SerialPort;
@@ -54,7 +55,12 @@ const BOARD: &str = "Raspberry Pi RP2040 (Cortex-M0+)";
 const XTAL_HZ: u32 = 12_000_000;
 
 /// How much of the chip's 264 KB of SRAM the allocator gets.
-const HEAP_BYTES: usize = 96 * 1024;
+// 192 KB of the RP2040's 256 KB. Code and read-only data are executed from
+// flash, so RAM carries only `.data`, `.bss` and the stack — but this chip is
+// still the tightest of the five: 192 KB clears the reduced binding set
+// (192,045 bytes) by under 5 KB and does not come close to the full one.
+// `Tier::for_budget` makes that call from the number rather than from a guess.
+const HEAP_BYTES: usize = 192 * 1024;
 
 #[global_allocator]
 static ALLOCATOR: LlffHeap = LlffHeap::empty();
@@ -184,7 +190,7 @@ fn main() -> ! {
                 clocks.system_clock.freq().to_MHz(),
                 XTAL_HZ / 1_000_000
             );
-            rustclr_demo_common::run(&mut console, BOARD, detail.as_str(), HELLO_WORLD);
+            rustclr_demo_common::run(&mut console, BOARD, detail.as_str(), HELLO_WORLD, HEAP_BYTES);
         }
         was_open = open;
     }

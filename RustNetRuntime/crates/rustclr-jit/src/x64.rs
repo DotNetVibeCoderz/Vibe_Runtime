@@ -41,11 +41,11 @@
 //! The result is returned in `rax` by both.
 
 use crate::codepage::{CodePage, CodePageError};
+use crate::translate::{translate, Backend, BinOp, Cond, UnOp};
 use crate::verify::MethodAnalysis;
 use crate::{analyse, CompileError, CompiledCode, Compiler, Tier};
-use rustclr_core::opcode::{decode_all, Instruction, Op, Operand};
+use rustclr_core::opcode::{decode_all, Instruction, Op};
 use rustclr_core::{Loader, MethodId, MethodKind, TypeRegistry};
-use rustclr_metadata::TypeSig;
 use std::collections::HashMap;
 
 /// The register holding the argument-array pointer for the life of the body.
@@ -112,10 +112,20 @@ impl core::fmt::Debug for NativeMethod {
 }
 
 /// The x86-64 baseline backend.
-#[derive(Default)]
 pub struct X64Backend {
     pub methods_compiled: usize,
     pub bytes_emitted: usize,
+    /// Whether small static callees are spliced into their callers.
+    ///
+    /// Settable so a test can compile the same corpus both ways and compare;
+    /// that is the only way to show the inliner is doing anything.
+    pub inline: bool,
+}
+
+impl Default for X64Backend {
+    fn default() -> Self {
+        Self { methods_compiled: 0, bytes_emitted: 0, inline: true }
+    }
 }
 
 impl X64Backend {
@@ -153,30 +163,18 @@ impl Compiler for X64Backend {
     }
 
     fn can_compile(&self, registry: &TypeRegistry, method: MethodId) -> bool {
+        // Never on a host that cannot execute what this emits.
         if !cfg!(target_arch = "x86_64") {
             return false;
         }
-        let info = registry.method(method);
-        let MethodKind::Il(body) = &info.kind else { return false };
-        if !body.exception_clauses.is_empty() {
-            return false;
+        if self.inline {
+            // With the inliner on, a `call` is no longer disqualifying on its
+            // own. This screen still rejects the wrong signatures and any
+            // other unsupported opcode; `compile` makes the final decision
+            // once it can see the rewritten body.
+            return crate::translate::shape_might_compile_after_inlining(registry, method);
         }
-        // Only integer-shaped signatures: every argument, local and the result
-        // must fit an `i64` register.
-        if !integer_shaped(&info.signature.return_type) && !info.returns_void() {
-            return false;
-        }
-        if !info.signature.params.iter().all(integer_shaped) {
-            return false;
-        }
-        if info.signature.has_this {
-            return false;
-        }
-        if !body.locals.iter().all(integer_shaped) {
-            return false;
-        }
-        let Ok(instructions) = decode_all(&body.il) else { return false };
-        instructions.iter().all(|i| is_supported(i.op))
+        crate::translate::shape_is_compilable(registry, method)
     }
 
     fn compile(
@@ -188,16 +186,37 @@ impl Compiler for X64Backend {
         let MethodKind::Il(body) = &info.kind else {
             return Err(CompileError::NoBody);
         };
-        if !self.can_compile(&loader.registry, method) {
+        let mut instructions = decode_all(&body.il)
+            .map_err(|e| CompileError::Unsupported(format!("undecodable IL: {e}")))?;
+        let mut locals = body.locals.len();
+
+        // Inline before deciding: a method whose only disqualification is a
+        // call to a small helper becomes a leaf once that helper is spliced in,
+        // and is then compilable like any other.
+        if self.inline {
+            if let Some(inlined) = crate::inline::inline_calls(loader, method, &instructions) {
+                instructions = inlined.instructions;
+                locals += inlined.extra_locals.len();
+            }
+        }
+
+        // The shape check runs against the *rewritten* body, so an inlined
+        // caller is judged on what it actually became.
+        if !crate::translate::shape_is_compilable_after_inlining(
+            &loader.registry,
+            method,
+            &instructions,
+        ) {
             return Err(CompileError::Unsupported(
                 "this method's shape is outside the baseline backend".into(),
             ));
         }
 
-        let instructions = decode_all(&body.il)
-            .map_err(|e| CompileError::Unsupported(format!("undecodable IL: {e}")))?;
         let returns_value = !info.returns_void();
-        let analysis = analyse(&instructions, body.max_stack, &body.exception_clauses, |ins| {
+        // `max_stack` is the declared figure for the original body; splicing
+        // can only add to the depth, so the inlined arguments are allowed for.
+        let max_stack = body.max_stack.saturating_add(8);
+        let analysis = analyse(&instructions, max_stack, &body.exception_clauses, |ins| {
             if ins.op == Op::Ret && returns_value {
                 -1
             } else {
@@ -206,122 +225,18 @@ impl Compiler for X64Backend {
         })
         .map_err(CompileError::Invalid)?;
 
-        let bytes = emit(&instructions, &analysis, body.locals.len(), returns_value)?;
+        let bytes = emit(&instructions, &analysis, locals, returns_value)?;
         self.methods_compiled += 1;
         self.bytes_emitted += bytes.len();
         Ok(CompiledCode { method, tier: Tier::Jit, bytes, analysis })
     }
 }
 
-/// Whether a signature type occupies one integer register.
-fn integer_shaped(sig: &TypeSig) -> bool {
-    matches!(
-        sig.unwrap_modifiers(),
-        TypeSig::Boolean
-            | TypeSig::Char
-            | TypeSig::I1
-            | TypeSig::U1
-            | TypeSig::I2
-            | TypeSig::U2
-            | TypeSig::I4
-            | TypeSig::U4
-            | TypeSig::I8
-            | TypeSig::U8
-    )
-}
-
-/// Opcodes the baseline backend emits code for.
+/// Opcodes this backend emits code for.
 ///
-/// Public so `rustnet jit` can say which instruction turned a method down.
-pub fn is_supported(op: Op) -> bool {
-    use Op::*;
-    matches!(
-        op,
-        Nop | Ldarg0
-            | Ldarg1
-            | Ldarg2
-            | Ldarg3
-            | LdargS
-            | Ldarg
-            | StargS
-            | Starg
-            | Ldloc0
-            | Ldloc1
-            | Ldloc2
-            | Ldloc3
-            | LdlocS
-            | Ldloc
-            | Stloc0
-            | Stloc1
-            | Stloc2
-            | Stloc3
-            | StlocS
-            | Stloc
-            | LdcI4M1
-            | LdcI40
-            | LdcI41
-            | LdcI42
-            | LdcI43
-            | LdcI44
-            | LdcI45
-            | LdcI46
-            | LdcI47
-            | LdcI48
-            | LdcI4S
-            | LdcI4
-            | LdcI8
-            | Add
-            | Sub
-            | Mul
-            | Div
-            | Rem
-            | And
-            | Or
-            | Xor
-            | Shl
-            | Shr
-            | ShrUn
-            | Neg
-            | Not
-            | Dup
-            | Pop
-            | Ceq
-            | Cgt
-            | CgtUn
-            | Clt
-            | CltUn
-            | Br
-            | BrS
-            | Brtrue
-            | BrtrueS
-            | Brfalse
-            | BrfalseS
-            | Beq
-            | BeqS
-            | BneUn
-            | BneUnS
-            | Bge
-            | BgeS
-            | Bgt
-            | BgtS
-            | Ble
-            | BleS
-            | Blt
-            | BltS
-            | BgeUn
-            | BgeUnS
-            | BgtUn
-            | BgtUnS
-            | BleUn
-            | BleUnS
-            | BltUn
-            | BltUnS
-            | ConvI4
-            | ConvI8
-            | ConvI
-            | Ret
-    )
-}
+/// The list lives with the translation, not here: every backend accepts the
+/// same IL subset, and duplicating it per architecture is how they drift.
+pub use crate::translate::is_supported;
 
 // -- the assembler ------------------------------------------------------------
 
@@ -528,54 +443,55 @@ const CC_A: u8 = 0x7;
 
 // -- code generation ----------------------------------------------------------
 
-/// Where an evaluation-stack slot lives.
-enum Slot {
-    Register(u8),
-    /// Frame offset from `rbp`.
-    Spilled(i32),
-}
-
-struct Emitter<'a> {
+/// The x86-64 side of [`translate`]: register allocation is fixed, so all this
+/// does is encode.
+///
+/// `rax`, `rcx` and `rdx` are the scratch registers, chosen to suit the two
+/// instructions that dictate register use on this architecture: `idiv` divides
+/// `rdx:rax` and leaves the quotient in `rax`, and a variable shift takes its
+/// count in `cl`. Handing the walk `t0 = rax` and `t1 = rcx` makes both fall
+/// out without a move.
+pub struct X64Emitter {
     asm: Assembler,
-    analysis: &'a MethodAnalysis,
     locals: usize,
-    returns_value: bool,
     /// Bytes of frame reserved below `rbp`.
     frame: i32,
 }
 
-impl<'a> Emitter<'a> {
+impl X64Emitter {
+    fn new() -> Self {
+        Self { asm: Assembler::new(), locals: 0, frame: 0 }
+    }
+
+    fn finish(self) -> Result<Vec<u8>, CompileError> {
+        self.asm.finish()
+    }
+}
+
+impl Backend for X64Emitter {
+    fn temp(&self, which: usize) -> u8 {
+        match which {
+            0 => RAX,
+            1 => RCX,
+            _ => RDX,
+        }
+    }
+
+    fn cached_slot_register(&self, depth: usize) -> Option<u8> {
+        CACHED.get(depth).copied()
+    }
+
     fn local_offset(&self, index: usize) -> i32 {
         -SAVED_BYTES - 8 * (1 + index as i32)
     }
 
-    fn slot(&self, depth: usize) -> Slot {
-        match CACHED.get(depth) {
-            Some(&r) => Slot::Register(r),
-            None => Slot::Spilled(
-                -SAVED_BYTES - 8 * (1 + self.locals as i32 + depth as i32),
-            ),
-        }
+    fn spill_offset(&self, depth: usize) -> i32 {
+        -SAVED_BYTES - 8 * (1 + self.locals as i32 + depth as i32)
     }
 
-    /// Loads evaluation-stack slot `depth` into `dst`.
-    fn load_slot(&mut self, dst: u8, depth: usize) {
-        match self.slot(depth) {
-            Slot::Register(r) => self.asm.mov_rr(dst, r),
-            Slot::Spilled(off) => self.asm.mov_r_mem(dst, RBP, off),
-        }
-    }
+    fn prologue(&mut self, locals: usize, max_stack: usize) {
+        self.locals = locals;
 
-    /// Stores `src` into evaluation-stack slot `depth`.
-    fn store_slot(&mut self, depth: usize, src: u8) {
-        match self.slot(depth) {
-            Slot::Register(r) => self.asm.mov_rr(r, src),
-            Slot::Spilled(off) => self.asm.mov_mem_r(RBP, off, src),
-        }
-    }
-
-    /// The prologue: standard frame, callee-saved registers, argument pointer.
-    fn prologue(&mut self) {
         self.asm.push(RBP);
         self.asm.mov_rr(RBP, RSP);
         self.asm.push(RBX);
@@ -585,7 +501,7 @@ impl<'a> Emitter<'a> {
         // Reserve locals and spill slots, keeping rsp 16-byte aligned. The
         // return address plus `push rbp` and three more pushes leave the stack
         // misaligned by 8, so an odd number of reserved words restores it.
-        let words = self.locals + self.analysis.max_stack_observed as usize + 2;
+        let words = locals + max_stack + 2;
         let words = if words % 2 == 0 { words + 1 } else { words };
         self.frame = (words * 8) as i32;
         // sub rsp, imm32
@@ -599,10 +515,10 @@ impl<'a> Emitter<'a> {
         self.asm.mov_rr(ARGS, incoming);
 
         // `init_locals` semantics: every local starts at zero.
-        if self.locals > 0 {
+        if locals > 0 {
             self.asm.mov_ri(RAX, 0);
-            for i in 0..self.locals {
-                let off = self.local_offset(i);
+            for i in 0..locals {
+                let off = Backend::local_offset(self, i);
                 self.asm.mov_mem_r(RBP, off, RAX);
             }
         }
@@ -621,303 +537,171 @@ impl<'a> Emitter<'a> {
         self.asm.ret();
     }
 
-    /// Materialises a comparison as 0 or 1 in `rax`.
-    fn compare(&mut self, condition: u8, depth: usize) {
-        // The operands are at depth-2 and depth-1.
-        self.load_slot(RAX, depth - 2);
-        self.load_slot(RCX, depth - 1);
-        // cmp rax, rcx
-        self.asm.alu_rr(0x39, RAX, RCX);
-        // setcc al — REX is forced so the byte register is `al`, not `ah`.
-        self.asm.byte(0x0F);
-        self.asm.byte(0x90 | condition);
-        self.asm.modrm(0b11, 0, RAX);
-        // movzx rax, al
-        self.asm.rex_forced(true, RAX, RAX);
-        self.asm.byte(0x0F);
-        self.asm.byte(0xB6);
-        self.asm.modrm(0b11, RAX, RAX);
-        self.store_slot(depth - 2, RAX);
+    fn mov_reg(&mut self, dst: u8, src: u8) {
+        self.asm.mov_rr(dst, src);
     }
 
-    /// Signed division or remainder, which on x86 both come from `idiv`.
-    fn divide(&mut self, want_remainder: bool, depth: usize) {
-        self.load_slot(RAX, depth - 2);
-        self.load_slot(RCX, depth - 1);
-        // cqo — sign-extend rax into rdx, which idiv divides as rdx:rax.
-        self.asm.byte(0x48);
-        self.asm.byte(0x99);
-        // idiv rcx
-        self.asm.rex(true, 0, RCX);
-        self.asm.byte(0xF7);
-        self.asm.modrm(0b11, 7, RCX);
-        self.store_slot(depth - 2, if want_remainder { RDX } else { RAX });
+    fn load_imm(&mut self, dst: u8, value: i64) {
+        self.asm.mov_ri(dst, value);
+    }
+
+    fn load_frame(&mut self, dst: u8, offset: i32) {
+        self.asm.mov_r_mem(dst, RBP, offset);
+    }
+
+    fn store_frame(&mut self, offset: i32, src: u8) {
+        self.asm.mov_mem_r(RBP, offset, src);
+    }
+
+    fn load_arg(&mut self, dst: u8, index: usize) {
+        self.asm.mov_r_mem(dst, ARGS, (index * 8) as i32);
+    }
+
+    fn store_arg(&mut self, index: usize, src: u8) {
+        self.asm.mov_mem_r(ARGS, (index * 8) as i32, src);
+    }
+
+    fn binop(&mut self, op: BinOp, dst: u8, lhs: u8, rhs: u8) {
+        // The walk always asks for `dst == lhs`, which is what a two-address
+        // architecture wants; anything else would need a move first.
+        debug_assert_eq!(dst, lhs, "x86-64 computes in place");
+
+        match op {
+            BinOp::Add => self.asm.alu_rr(0x01, dst, rhs),
+            BinOp::Sub => self.asm.alu_rr(0x29, dst, rhs),
+            BinOp::And => self.asm.alu_rr(0x21, dst, rhs),
+            BinOp::Or => self.asm.alu_rr(0x09, dst, rhs),
+            BinOp::Xor => self.asm.alu_rr(0x31, dst, rhs),
+            BinOp::Mul => {
+                // imul dst, rhs
+                self.asm.rex(true, dst, rhs);
+                self.asm.byte(0x0F);
+                self.asm.byte(0xAF);
+                self.asm.modrm(0b11, dst, rhs);
+            }
+            BinOp::Div | BinOp::Rem => {
+                // idiv divides rdx:rax, so the dividend has to be in rax and
+                // rdx has to hold its sign extension.
+                self.asm.mov_rr(RAX, dst);
+                // cqo
+                self.asm.byte(0x48);
+                self.asm.byte(0x99);
+                // idiv rhs
+                self.asm.rex(true, 0, rhs);
+                self.asm.byte(0xF7);
+                self.asm.modrm(0b11, 7, rhs);
+                let result = if op == BinOp::Rem { RDX } else { RAX };
+                self.asm.mov_rr(dst, result);
+            }
+            BinOp::Shl | BinOp::Shr | BinOp::ShrUn => {
+                // A variable shift takes its count in cl and nowhere else.
+                self.asm.mov_rr(RCX, rhs);
+                let extension = match op {
+                    BinOp::Shl => 4,
+                    BinOp::Shr => 7, // sar, arithmetic
+                    _ => 5,          // shr, logical
+                };
+                self.asm.rex(true, 0, dst);
+                self.asm.byte(0xD3);
+                self.asm.modrm(0b11, extension, dst);
+            }
+        }
+    }
+
+    fn unop(&mut self, op: UnOp, dst: u8, src: u8) {
+        self.asm.mov_rr(dst, src);
+        match op {
+            UnOp::Neg => {
+                self.asm.rex(true, 0, dst);
+                self.asm.byte(0xF7);
+                self.asm.modrm(0b11, 3, dst);
+            }
+            UnOp::Not => {
+                self.asm.rex(true, 0, dst);
+                self.asm.byte(0xF7);
+                self.asm.modrm(0b11, 2, dst);
+            }
+            UnOp::SignExtend32 => {
+                // movsxd dst, dst32
+                self.asm.rex(true, dst, dst);
+                self.asm.byte(0x63);
+                self.asm.modrm(0b11, dst, dst);
+            }
+        }
+    }
+
+    fn compare(&mut self, cond: Cond, dst: u8, lhs: u8, rhs: u8) {
+        // cmp lhs, rhs
+        self.asm.alu_rr(0x39, lhs, rhs);
+        // setcc dst8 — REX is forced so the byte register is the low byte and
+        // not `ah`/`ch`/`dh`.
+        self.asm.rex_forced(false, 0, dst);
+        self.asm.byte(0x0F);
+        self.asm.byte(0x90 | condition_code(cond));
+        self.asm.modrm(0b11, 0, dst);
+        // movzx dst, dst8
+        self.asm.rex_forced(true, dst, dst);
+        self.asm.byte(0x0F);
+        self.asm.byte(0xB6);
+        self.asm.modrm(0b11, dst, dst);
+    }
+
+    fn branch(&mut self, target: u32) {
+        self.asm.jmp(target);
+    }
+
+    fn branch_compare(&mut self, cond: Cond, lhs: u8, rhs: u8, target: u32) {
+        self.asm.alu_rr(0x39, lhs, rhs);
+        self.asm.jcc(condition_code(cond), target);
+    }
+
+    fn branch_zero(&mut self, src: u8, non_zero: bool, target: u32) {
+        // test src, src
+        self.asm.alu_rr(0x85, src, src);
+        self.asm.jcc(if non_zero { CC_NE } else { CC_E }, target);
+    }
+
+    fn ret(&mut self, src: u8) {
+        self.asm.mov_rr(RAX, src);
+        self.epilogue();
+    }
+
+    fn ret_void(&mut self) {
+        self.asm.mov_ri(RAX, 0);
+        self.epilogue();
+    }
+
+    fn label(&mut self, il_offset: u32) {
+        self.asm.label(il_offset);
     }
 }
 
-/// Translates a verified method body into machine code.
+/// The low nibble of a `jcc`/`setcc` opcode for a condition.
+fn condition_code(cond: Cond) -> u8 {
+    match cond {
+        Cond::Equal => CC_E,
+        Cond::NotEqual => CC_NE,
+        Cond::Less => CC_L,
+        Cond::LessOrEqual => CC_LE,
+        Cond::Greater => CC_G,
+        Cond::GreaterOrEqual => CC_GE,
+        Cond::Below => CC_B,
+        Cond::BelowOrEqual => CC_BE,
+        Cond::Above => CC_A,
+        Cond::AboveOrEqual => CC_AE,
+    }
+}
+
+/// Translates a verified method body into x86-64 machine code.
 fn emit(
     instructions: &[Instruction],
     analysis: &MethodAnalysis,
     locals: usize,
     returns_value: bool,
 ) -> Result<Vec<u8>, CompileError> {
-    let mut e = Emitter {
-        asm: Assembler::new(),
-        analysis,
-        locals,
-        returns_value,
-        frame: 0,
-    };
-    e.prologue();
-
-    for ins in instructions {
-        e.asm.label(ins.offset);
-        let depth = *analysis.depth_at.get(&ins.offset).unwrap_or(&0);
-        if depth < 0 {
-            return Err(CompileError::Unsupported(
-                "negative evaluation-stack depth".into(),
-            ));
-        }
-        let depth = depth as usize;
-        emit_one(&mut e, ins, depth)?;
-    }
-
-    // A body that falls off the end without `ret` is invalid IL, but emitting a
-    // return keeps the page well-formed rather than running into whatever
-    // follows it in memory.
-    e.asm.mov_ri(RAX, 0);
-    e.epilogue();
-    e.asm.finish()
-}
-
-fn emit_one(e: &mut Emitter, ins: &Instruction, depth: usize) -> Result<(), CompileError> {
-    use Op::*;
-
-    /// The ALU opcode for a two-operand integer instruction.
-    fn alu_opcode(op: Op) -> Option<u8> {
-        Some(match op {
-            Add => 0x01,
-            Sub => 0x29,
-            And => 0x21,
-            Or => 0x09,
-            Xor => 0x31,
-            _ => return None,
-        })
-    }
-
-    match ins.op {
-        Nop => {}
-
-        Ldarg0 | Ldarg1 | Ldarg2 | Ldarg3 | LdargS | Ldarg => {
-            let index = match ins.op {
-                Ldarg0 => 0,
-                Ldarg1 => 1,
-                Ldarg2 => 2,
-                Ldarg3 => 3,
-                _ => ins.operand.as_var().unwrap_or(0) as usize,
-            };
-            e.asm.mov_r_mem(RAX, ARGS, (index * 8) as i32);
-            e.store_slot(depth, RAX);
-        }
-
-        Ldloc0 | Ldloc1 | Ldloc2 | Ldloc3 | LdlocS | Ldloc => {
-            let index = match ins.op {
-                Ldloc0 => 0,
-                Ldloc1 => 1,
-                Ldloc2 => 2,
-                Ldloc3 => 3,
-                _ => ins.operand.as_var().unwrap_or(0) as usize,
-            };
-            let off = e.local_offset(index);
-            e.asm.mov_r_mem(RAX, RBP, off);
-            e.store_slot(depth, RAX);
-        }
-
-        // `starg` assigns to a parameter. The argument array is the callee's
-        // own copy — the caller marshalled it for this call — so writing to it
-        // has exactly the local effect C# gives an assignment to a parameter.
-        StargS | Starg => {
-            let index = ins.operand.as_var().unwrap_or(0) as usize;
-            e.load_slot(RAX, depth - 1);
-            e.asm.mov_mem_r(ARGS, (index * 8) as i32, RAX);
-        }
-
-        Stloc0 | Stloc1 | Stloc2 | Stloc3 | StlocS | Stloc => {
-            let index = match ins.op {
-                Stloc0 => 0,
-                Stloc1 => 1,
-                Stloc2 => 2,
-                Stloc3 => 3,
-                _ => ins.operand.as_var().unwrap_or(0) as usize,
-            };
-            e.load_slot(RAX, depth - 1);
-            let off = e.local_offset(index);
-            e.asm.mov_mem_r(RBP, off, RAX);
-        }
-
-        LdcI4M1 | LdcI40 | LdcI41 | LdcI42 | LdcI43 | LdcI44 | LdcI45 | LdcI46 | LdcI47
-        | LdcI48 | LdcI4S | LdcI4 => {
-            let value = match ins.op {
-                LdcI4M1 => -1,
-                LdcI40 => 0,
-                LdcI41 => 1,
-                LdcI42 => 2,
-                LdcI43 => 3,
-                LdcI44 => 4,
-                LdcI45 => 5,
-                LdcI46 => 6,
-                LdcI47 => 7,
-                LdcI48 => 8,
-                _ => ins.operand.as_i32().unwrap_or(0),
-            };
-            e.asm.mov_ri(RAX, value as i64);
-            e.store_slot(depth, RAX);
-        }
-
-        LdcI8 => {
-            let Operand::I64(v) = ins.operand else {
-                return Err(CompileError::Unsupported("ldc.i8 without an operand".into()));
-            };
-            e.asm.mov_ri(RAX, v);
-            e.store_slot(depth, RAX);
-        }
-
-        Add | Sub | And | Or | Xor => {
-            let opcode = alu_opcode(ins.op).expect("matched above");
-            e.load_slot(RAX, depth - 2);
-            e.load_slot(RCX, depth - 1);
-            e.asm.alu_rr(opcode, RAX, RCX);
-            e.store_slot(depth - 2, RAX);
-        }
-
-        Mul => {
-            e.load_slot(RAX, depth - 2);
-            e.load_slot(RCX, depth - 1);
-            // imul rax, rcx
-            e.asm.rex(true, RAX, RCX);
-            e.asm.byte(0x0F);
-            e.asm.byte(0xAF);
-            e.asm.modrm(0b11, RAX, RCX);
-            e.store_slot(depth - 2, RAX);
-        }
-
-        Div => e.divide(false, depth),
-        Rem => e.divide(true, depth),
-
-        Shl | Shr | ShrUn => {
-            e.load_slot(RAX, depth - 2);
-            e.load_slot(RCX, depth - 1);
-            // The shift count must be in cl.
-            let extension = match ins.op {
-                Shl => 4,
-                Shr => 7,  // sar, arithmetic
-                _ => 5,    // shr, logical
-            };
-            e.asm.rex(true, 0, RAX);
-            e.asm.byte(0xD3);
-            e.asm.modrm(0b11, extension, RAX);
-            e.store_slot(depth - 2, RAX);
-        }
-
-        Neg => {
-            e.load_slot(RAX, depth - 1);
-            e.asm.rex(true, 0, RAX);
-            e.asm.byte(0xF7);
-            e.asm.modrm(0b11, 3, RAX);
-            e.store_slot(depth - 1, RAX);
-        }
-
-        Not => {
-            e.load_slot(RAX, depth - 1);
-            e.asm.rex(true, 0, RAX);
-            e.asm.byte(0xF7);
-            e.asm.modrm(0b11, 2, RAX);
-            e.store_slot(depth - 1, RAX);
-        }
-
-        Dup => {
-            e.load_slot(RAX, depth - 1);
-            e.store_slot(depth, RAX);
-        }
-
-        Pop => {}
-
-        // `conv.i4` truncates to 32 bits and sign-extends back, which is what
-        // the evaluation stack's int32 type means here.
-        ConvI4 => {
-            e.load_slot(RAX, depth - 1);
-            // movsxd rax, eax
-            e.asm.rex(true, RAX, RAX);
-            e.asm.byte(0x63);
-            e.asm.modrm(0b11, RAX, RAX);
-            e.store_slot(depth - 1, RAX);
-        }
-        ConvI8 | ConvI => {}
-
-        Ceq => e.compare(CC_E, depth),
-        Cgt => e.compare(CC_G, depth),
-        CgtUn => e.compare(CC_A, depth),
-        Clt => e.compare(CC_L, depth),
-        CltUn => e.compare(CC_B, depth),
-
-        Br | BrS => {
-            let target = branch_target(ins)?;
-            e.asm.jmp(target);
-        }
-
-        Brtrue | BrtrueS | Brfalse | BrfalseS => {
-            let target = branch_target(ins)?;
-            e.load_slot(RAX, depth - 1);
-            // test rax, rax
-            e.asm.alu_rr(0x85, RAX, RAX);
-            let condition = if matches!(ins.op, Brtrue | BrtrueS) { CC_NE } else { CC_E };
-            e.asm.jcc(condition, target);
-        }
-
-        Beq | BeqS | BneUn | BneUnS | Bge | BgeS | Bgt | BgtS | Ble | BleS | Blt | BltS
-        | BgeUn | BgeUnS | BgtUn | BgtUnS | BleUn | BleUnS | BltUn | BltUnS => {
-            let target = branch_target(ins)?;
-            e.load_slot(RAX, depth - 2);
-            e.load_slot(RCX, depth - 1);
-            e.asm.alu_rr(0x39, RAX, RCX);
-            // The `.un` forms are unsigned comparisons, except `bne.un`, which
-            // is plain inequality — there is no ordering to interpret.
-            let condition = match ins.op {
-                Beq | BeqS => CC_E,
-                BneUn | BneUnS => CC_NE,
-                Bge | BgeS => CC_GE,
-                Bgt | BgtS => CC_G,
-                Ble | BleS => CC_LE,
-                Blt | BltS => CC_L,
-                BgeUn | BgeUnS => CC_AE,
-                BgtUn | BgtUnS => CC_A,
-                BleUn | BleUnS => CC_BE,
-                _ => CC_B,
-            };
-            e.asm.jcc(condition, target);
-        }
-
-        Ret => {
-            if e.returns_value {
-                e.load_slot(RAX, depth - 1);
-            } else {
-                e.asm.mov_ri(RAX, 0);
-            }
-            e.epilogue();
-        }
-
-        other => {
-            return Err(CompileError::Unsupported(format!("{other:?}")));
-        }
-    }
-    Ok(())
-}
-
-fn branch_target(ins: &Instruction) -> Result<u32, CompileError> {
-    ins.operand
-        .as_target()
-        .ok_or_else(|| CompileError::Unsupported("branch without a target".into()))
+    let mut e = X64Emitter::new();
+    translate(&mut e, instructions, analysis, locals, returns_value)?;
+    e.finish()
 }
 
 #[cfg(test)]
@@ -938,26 +722,22 @@ mod tests {
 
     #[test]
     fn frame_slots_never_overlap_the_saved_registers() {
-        let analysis = MethodAnalysis { max_stack_observed: 4, ..Default::default() };
-        let e = Emitter {
-            asm: Assembler::new(),
-            analysis: &analysis,
-            locals: 3,
-            returns_value: true,
-            frame: 0,
-        };
+        let mut e = X64Emitter::new();
+        e.prologue(3, 4);
+
         // Three registers are pushed after `rbp`, occupying [rbp-8..rbp-24].
         // Anything the body writes must sit strictly below them, or a compiled
-        // method returns having destroyed its caller's registers.
+        // method returns having destroyed its caller's registers — which is a
+        // bug that shows up in the *caller*, far from its cause.
         for i in 0..3 {
-            assert!(
-                e.local_offset(i) <= -SAVED_BYTES - 8,
-                "local {i} at {} overlaps the saved registers",
-                e.local_offset(i)
-            );
+            let off = Backend::local_offset(&e, i);
+            assert!(off <= -SAVED_BYTES - 8, "local {i} at {off} overlaps the saved registers");
         }
         for depth in CACHED.len()..6 {
-            let Slot::Spilled(off) = e.slot(depth) else { continue };
+            if e.cached_slot_register(depth).is_some() {
+                continue;
+            }
+            let off = e.spill_offset(depth);
             assert!(off <= -SAVED_BYTES - 8, "spill slot {depth} at {off} overlaps");
         }
     }

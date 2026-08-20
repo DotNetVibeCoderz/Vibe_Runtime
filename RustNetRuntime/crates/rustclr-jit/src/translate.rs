@@ -206,6 +206,104 @@ pub fn is_supported(op: Op) -> bool {
     )
 }
 
+/// Whether a signature type occupies one integer register.
+fn integer_shaped(sig: &rustclr_metadata::TypeSig) -> bool {
+    use rustclr_metadata::TypeSig as T;
+    matches!(
+        sig.unwrap_modifiers(),
+        T::Boolean | T::Char | T::I1 | T::U1 | T::I2 | T::U2 | T::I4 | T::U4 | T::I8 | T::U8
+    )
+}
+
+/// Whether a method is the shape every baseline backend accepts.
+///
+/// Shared rather than per-architecture: the backends differ in how they encode,
+/// not in what they take. Duplicating this is how one of them quietly starts
+/// accepting a method the others refuse.
+pub fn shape_is_compilable(
+    registry: &rustclr_core::TypeRegistry,
+    method: rustclr_core::MethodId,
+) -> bool {
+    let info = registry.method(method);
+    let rustclr_core::MethodKind::Il(body) = &info.kind else { return false };
+    if !body.exception_clauses.is_empty() {
+        return false;
+    }
+    // Only integer-shaped signatures: every argument, local and the result must
+    // fit one register.
+    if !integer_shaped(&info.signature.return_type) && !info.returns_void() {
+        return false;
+    }
+    if !info.signature.params.iter().all(integer_shaped) {
+        return false;
+    }
+    if info.signature.has_this {
+        return false;
+    }
+    if !body.locals.iter().all(integer_shaped) {
+        return false;
+    }
+    let Ok(instructions) = rustclr_core::opcode::decode_all(&body.il) else { return false };
+    instructions.iter().all(|i| is_supported(i.op))
+}
+
+/// The same check, but tolerating `call` — a method that is otherwise in shape
+/// and whose only unsupported opcode is a call *might* become compilable once
+/// the inliner has run.
+///
+/// This is deliberately a maybe. It is the cheap screen the tier uses to avoid
+/// decoding twice; the binding answer is
+/// [`shape_is_compilable_after_inlining`], applied to the rewritten stream.
+pub fn shape_might_compile_after_inlining(
+    registry: &rustclr_core::TypeRegistry,
+    method: rustclr_core::MethodId,
+) -> bool {
+    let info = registry.method(method);
+    let rustclr_core::MethodKind::Il(body) = &info.kind else { return false };
+    if !body.exception_clauses.is_empty() || info.signature.has_this {
+        return false;
+    }
+    if !integer_shaped(&info.signature.return_type) && !info.returns_void() {
+        return false;
+    }
+    if !info.signature.params.iter().all(integer_shaped) {
+        return false;
+    }
+    if !body.locals.iter().all(integer_shaped) {
+        return false;
+    }
+    let Ok(instructions) = rustclr_core::opcode::decode_all(&body.il) else { return false };
+    instructions.iter().all(|i| is_supported(i.op) || i.op == Op::Call)
+}
+
+/// The shape check, judged against an already-rewritten instruction stream.
+///
+/// Separate from [`shape_is_compilable`] because that one decodes the method's
+/// own IL, and after inlining the stream no longer matches what is in the
+/// image. The signature and local checks are the same; only the opcode source
+/// differs.
+pub fn shape_is_compilable_after_inlining(
+    registry: &rustclr_core::TypeRegistry,
+    method: rustclr_core::MethodId,
+    instructions: &[Instruction],
+) -> bool {
+    let info = registry.method(method);
+    let rustclr_core::MethodKind::Il(body) = &info.kind else { return false };
+    if !body.exception_clauses.is_empty() || info.signature.has_this {
+        return false;
+    }
+    if !integer_shaped(&info.signature.return_type) && !info.returns_void() {
+        return false;
+    }
+    if !info.signature.params.iter().all(integer_shaped) {
+        return false;
+    }
+    if !body.locals.iter().all(integer_shaped) {
+        return false;
+    }
+    instructions.iter().all(|i| is_supported(i.op))
+}
+
 /// Reads evaluation-stack slot `depth` into `dst`.
 fn read_slot<B: Backend>(b: &mut B, dst: u8, depth: usize) {
     match b.cached_slot_register(depth) {

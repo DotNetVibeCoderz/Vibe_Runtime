@@ -24,10 +24,10 @@ handling — produces identical output on both runtimes:
 
 ```console
 $ dotnet Conformance.dll
-checks=134 failures=0
+checks=136 failures=0
 
 $ rustnet run Conformance.dll --stats
-checks=134 failures=0
+checks=136 failures=0
 
 ─── execution ──────────────────────────────
   wall clock                  10.505 ms
@@ -49,7 +49,7 @@ divide-by-zero, delegates, and allocation under collection pressure. A second
 suite, `tests/fixtures/ModernSyntax/`, does the same for 35 modern C# features.
 Both are normal C# projects you can read and extend.
 
-`cargo test --workspace` runs 141 tests across the eight crates.
+`cargo test --workspace` runs 163 tests across the eight crates.
 
 ---
 
@@ -96,27 +96,31 @@ speed.
 
 | Workload | .NET | RustCLR | Ratio |
 | --- | ---: | ---: | ---: |
-| Process start | 126 ms | **65 ms** | **0.5x** |
-| Exceptions (50k throws) | 125 ms | **128 ms** | **1.0x** |
-| Strings (20k concats) | 134 ms | **176 ms** | **1.3x** |
-| Recursion (fib 27) | 119 ms | 427 ms | 3.6x |
-| Allocation (300k objects) | 119 ms | 992 ms | 8.3x |
-| Sieve (1M) | 114 ms | 1,187 ms | 10.4x |
-| Matrix multiply (120 squared) | 110 ms | 1,305 ms | 11.9x |
-| Virtual calls (2M) | 110 ms | 1,632 ms | 14.8x |
-| Quicksort (200k) | 120 ms | 2,242 ms | 18.7x |
-| Field access (3M) | 144 ms | 2,764 ms | 19.2x |
+| Process start | 108 ms | **62 ms** | **0.6x** |
+| Exceptions (50k throws) | 130 ms | **111 ms** | **0.9x** |
+| Integer kernels — *compiled* | 149 ms | **268 ms** | **1.8x** |
+| Strings (20k concats) | 96 ms | **190 ms** | **2.0x** |
+| The same kernels via helpers — *compiled, inlined* | 106 ms | **310 ms** | **2.9x** |
+| Recursion (fib 27) | 108 ms | 442 ms | 4.1x |
+| Allocation (300k objects) | 112 ms | 1,014 ms | 9.1x |
+| Sieve (1M) | 107 ms | 1,287 ms | 12.0x |
+| Matrix multiply (120 squared) | 110 ms | 1,470 ms | 13.4x |
+| Virtual calls (2M) | 115 ms | 1,788 ms | 15.5x |
+| Quicksort (200k) | 122 ms | 2,460 ms | 20.2x |
+| Field access (3M) | 111 ms | 2,943 ms | 26.5x |
 
 Subtract the process-start row before drawing conclusions: it is most of .NET's
 figure on the shorter workloads, so the *compute* ratio is worse than the wall
 clock suggests, closer to 100x on the tightest loops. That is the cost of
 interpreting rather than compiling, and it is what [Milestone 4](Plan.md) is for.
 
-Two rows go the other way, and both for real reasons. **RustCLR starts in half
-the time** (no JIT, no warm-up), which matters for short-lived CLI tools and for
-microcontrollers with no room for a code cache. **Exceptions and strings are near
-parity** because that work happens in native Rust inside RustBCL, not in
-interpreted IL.
+Several rows go the other way, for three different reasons. **RustCLR starts in
+little over half the time** (no JIT, no warm-up), which matters for short-lived
+CLI tools and for microcontrollers with no room for a code cache. **Exceptions
+and strings stay close** because that work happens in native Rust inside
+RustBCL, not in interpreted IL. And the two **kernel rows are compiled to
+machine code** rather than interpreted at all — the second of them only because
+the inliner splices its helpers in first.
 
 Every row's checksum is compared between the runtimes before it is timed; a
 mismatch prints `MISMATCH` instead of a number.
@@ -286,15 +290,28 @@ properties. `typeof(T)` on an *erased* generic parameter throws rather than
 answering `System.Object`.
 
 **Some methods are compiled to machine code.** `rustclr-jit` emits x86-64 into
-write-xor-execute pages for leaf methods doing integer arithmetic, after 32
-calls have shown them to be worth compiling. On the `kernels` benchmark that is
-**10.7× faster** than interpreting — 232 ms against 2,484 ms, which is 1.6× .NET
-rather than 17.5×.
+write-xor-execute pages for methods doing integer arithmetic, after 32 calls
+have shown them to be worth compiling. On the `kernels` benchmark that is
+**11.0× faster** than interpreting — 269 ms against 2,971 ms, which is 1.8× .NET
+rather than 20×.
 
-The reach is narrow and `rustnet jit <assembly>` says exactly how narrow:
-anything using arrays, calls, allocation or exception handling is interpreted.
-`rustnet run --no-jit` interprets everything, and must print the same bytes —
-there is a differential test that asserts it.
+**Small callees are inlined**, so a `call` no longer disqualifies a method. The
+`inlined` benchmark is the same arithmetic as `kernels` but factored into
+helpers, the way real code is written: 1,629 ms interpreted, 400 ms compiled,
+of which **2.9× is the inliner alone** — with `--no-inline` the same run takes
+1,148 ms because the method around the helpers stays interpreted. Only
+branch-free static callees are spliced, one level deep.
+
+The reach is still narrow and `rustnet jit <assembly>` says exactly how narrow:
+anything using arrays, allocation or exception handling is interpreted.
+`rustnet run --no-jit` interprets everything and `rustnet run --no-inline`
+compiles without splicing; both must print the same bytes — there are
+differential tests that assert it.
+
+**AArch64 and RISC-V backends exist and have never been executed.** They encode
+the same IL through the same shared translation as x86-64 and are checked by
+disassembling their output, but no compiled method has ever run on either. Only
+x86-64 is dispatched to at runtime.
 
 **Advanced C# features.** 13 of 21 probed features produce identical output on
 both runtimes: garbage collection, `IDisposable`/`using`, `async`/`await`,
@@ -318,8 +335,9 @@ Generic type *arguments* are erased, so user generic code that reads `T` at run
 time — `typeof(T)`, `is T`, a static field per instantiation — does not behave
 correctly, and custom comparers are ignored. Exception filters (`catch when`)
 are not evaluated. The native code generator takes only
-leaf integer methods — 10.7× faster where it applies, and it declines anything
-using arrays or calls, which is most of a real program.
+integer methods — 11.0× faster where it applies, and inlining lets it accept
+calls to small helpers, but it declines anything using arrays, which is most of
+a real program.
 
 `rustnet capabilities` prints this list from the runtime itself, so it cannot
 drift from reality. Detail: [docs/limitations.md](docs/limitations.md).
@@ -329,31 +347,63 @@ drift from reality. Detail: [docs/limitations.md](docs/limitations.md).
 ## Targets
 
 The metadata reader recognises x86, x64, Arm, Arm64, RISC-V 32 and RISC-V 64.
-`rustclr-metadata` and `rustclr-gc` **build without `std`** for
-`thumbv7em-none-eabihf`, `thumbv6m-none-eabi`, `riscv32imc-unknown-none-elf` and
-`riscv64gc-unknown-none-elf` — `bash tests/embedded.sh` checks all four.
+The **whole runtime builds without `std`** — `rustclr-metadata`, `rustclr-gc`,
+`rustclr-core` and `rustclr-bcl` — for `thumbv7em-none-eabihf`,
+`thumbv6m-none-eabi`, `riscv32imc-unknown-none-elf` and
+`riscv64gc-unknown-none-elf`. `bash tests/embedded.sh` checks all sixteen
+combinations.
 
-**And they run on real hardware — on three architectures.** An ESP32-WROOM-32
-(Xtensa LX6), an ESP32-C3 (RISC-V) and a Meadow F7 Micro (STM32F777, Arm
-Cortex-M7), with byte-identical output. On each chip the metadata reader parsed
-a Roslyn-built assembly straight out of flash and the collector reclaimed a
-reference cycle:
+**C# runs on a microcontroller.** On an ESP32-C3 — RISC-V, 400 KB of SRAM, no
+operating system — the loader builds a type registry, RustBCL registers all 766
+of its native bindings, and the interpreter executes `HelloWorld.Main`:
 
 ```
-assembly         HelloWorld
-metadata version v4.0.30319
-entry point      Main
-cycle unrooted   live=0
-refused past it  true
+-- il interpreter --
+heap budget      294912 bytes
+bcl tier         full (260702 bytes needed)
+native bindings  766
+
+--- program output ---
+Hello from RustCLR
+42
+120
+--- end ---
+il executed      68
+calls            6
 ```
 
-Firmware: [ESP32](embedded/esp32-demo) · [Meadow F7](embedded/meadow-f7). Full
-captures: [Xtensa](docs/logs/esp32-wroom32.log) ·
-[RISC-V](docs/logs/esp32c3.log) · [Arm](docs/logs/meadow-f7.log).
+Those three lines are byte-identical to what `dotnet HelloWorld.dll` prints on
+a desktop, CRLF included, and so are the counters — 68 IL instructions and 6
+calls on x86-64 and on RISC-V alike. Capture:
+[ESP32-C3, executing](docs/logs/esp32c3-interpreter.log).
 
-**IL does not execute on the chip.** That needs the interpreter, and
-`rustclr-core` still requires `std` — a hash map, a clock and file access. The
-board can read a .NET assembly and manage a heap; it cannot yet run a method.
+Three things had to change, and each is a real difference rather than a
+polyfill: maps become `BTreeMap` (every key the runtime uses is already `Ord`),
+`Arc` becomes `Rc` (RISC-V `imc` has no atomics extension, and the interpreter
+is single-threaded on a chip anyway), and float maths comes from `libm` —
+the only external dependency anywhere in the runtime, optional, and absent from
+a default build. Only the filesystem was irreducible: `load_from_file` is gated
+on `std`, and an assembly on a chip arrives as bytes.
+
+**How much of RustBCL fits depends on the board.** Peak allocation is 260,702
+bytes with every binding, or 192,045 with console, strings and maths only —
+measured, not estimated. Each firmware picks from its heap budget, and a board
+that clears neither says so in a line of text instead of dying inside the
+allocator.
+
+| Board | Core | RAM | Tier | State |
+| --- | --- | ---: | --- | --- |
+| [ESP32-C3](embedded/esp32-demo) | RISC-V 32 | 400 K | full | **executes IL on hardware** |
+| [ESP32-WROOM-32](embedded/esp32-demo) | Xtensa LX6 | 520 K | full | builds; last flashed pre-interpreter |
+| [Meadow F7](embedded/meadow-f7) | Cortex-M7 | 384 K | full | builds; last flashed pre-interpreter |
+| [Maix Go K210](embedded/k210) | RISC-V 64 | 6 M | full | builds; never flashed — no board |
+| [Pico](embedded/rp2040) | Cortex-M0+ | 256 K | minimal | builds; never flashed — no board |
+
+All five share one demonstration ([embedded/demo-common](embedded/demo-common))
+and `bash tests/firmware.sh` builds them. Only the first row has run on
+hardware since the interpreter landed; earlier metadata-and-GC captures:
+[Xtensa](docs/logs/esp32-wroom32.log) · [RISC-V](docs/logs/esp32c3.log) ·
+[Arm](docs/logs/meadow-f7.log).
 
 `Heap::embedded(n)` is a hard ceiling rather than a hint: allocation past it
 fails instead of growing, which is the only kind of bound worth having on a

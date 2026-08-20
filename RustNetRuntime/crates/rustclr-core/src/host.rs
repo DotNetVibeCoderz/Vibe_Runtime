@@ -4,7 +4,11 @@
 //! that a hosting application — the CodeGen IDE, a test harness, an embedded
 //! target with no OS console — can redirect them.
 
+#[cfg(feature = "std")]
 use std::io::Write;
+
+#[allow(unused_imports)]
+use crate::prelude::*;
 
 /// Services the runtime needs from its host.
 pub trait Host: Send {
@@ -41,12 +45,18 @@ pub trait Host: Send {
 }
 
 /// The default host: real stdio and the system clock.
+///
+/// Absent without `std`, which is the whole reason [`Host`] is a trait: a board
+/// supplies its own, writing to a UART and reading a hardware timer. Nothing in
+/// the interpreter knows the difference.
+#[cfg(feature = "std")]
 pub struct SystemHost {
     args: Vec<String>,
     start: std::time::Instant,
     pub exit_code: Option<i32>,
 }
 
+#[cfg(feature = "std")]
 impl SystemHost {
     pub fn new() -> Self {
         Self {
@@ -61,12 +71,14 @@ impl SystemHost {
     }
 }
 
+#[cfg(feature = "std")]
 impl Default for SystemHost {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "std")]
 impl Host for SystemHost {
     fn write_out(&mut self, text: &str) {
         let mut out = std::io::stdout().lock();
@@ -114,7 +126,7 @@ impl Host for SystemHost {
 pub struct CaptureHost {
     pub out: String,
     pub err: String,
-    pub input: std::collections::VecDeque<String>,
+    pub input: VecDeque<String>,
     pub args: Vec<String>,
     pub exit_code: Option<i32>,
     clock: u64,

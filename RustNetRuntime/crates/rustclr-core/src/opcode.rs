@@ -5,6 +5,9 @@
 
 use rustclr_metadata::Token;
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 /// The shape of an instruction's inline operand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperandKind {
@@ -390,6 +393,7 @@ impl core::fmt::Display for DecodeError {
     }
 }
 
+#[cfg(feature = "std")]
 impl std::error::Error for DecodeError {}
 
 /// Decodes the instruction starting at `offset` in `il`.

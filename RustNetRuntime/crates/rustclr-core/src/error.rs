@@ -3,7 +3,10 @@
 use crate::opcode::DecodeError;
 use rustclr_gc::Handle;
 use rustclr_metadata::{MetadataError, Token};
-use std::fmt;
+use core::fmt;
+
+#[allow(unused_imports)]
+use crate::prelude::*;
 
 /// A CLR-visible exception kind. Native code raises these; the interpreter
 /// turns them into managed exception objects that `catch` blocks can see.
@@ -176,6 +179,7 @@ impl fmt::Display for ExecutionError {
     }
 }
 
+#[cfg(feature = "std")]
 impl std::error::Error for ExecutionError {}
 
 impl From<MetadataError> for ExecutionError {

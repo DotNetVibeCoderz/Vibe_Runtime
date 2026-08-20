@@ -11,6 +11,9 @@
 use crate::support::*;
 use rustclr_core::{ExecResult, Interpreter, Value};
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 
 /// Renders argument 0 the way `Object.ToString` would.
 fn render_display(i: &mut Interpreter, a: &[Value]) -> ExecResult<String> {

@@ -24,6 +24,57 @@
 //! functions registered with [`Interpreter::register_native`] — which is how a
 //! C# program runs unchanged on a Rust runtime.
 
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
+
+/// The owned types every module here needs, from whichever crate provides them.
+///
+/// Same pattern as `rustclr-metadata`: a `use alloc::…` reaches only the file
+/// it is written in, so every module imports this instead and the same source
+/// compiles for a host and for a microcontroller.
+///
+/// Two of these are not simple re-exports, and the differences are real:
+///
+/// * `HashMap` is a `BTreeMap` without `std`. The runtime's maps are keyed by
+///   small integer ids, tuples of them, or names — all `Ord` — so this costs
+///   nothing but a different iteration order. Nothing in the runtime depends
+///   on map order, and a microcontroller has no business pulling in a hasher.
+/// * `Arc` is an `Rc` without `std`. RISC-V `imc` has no atomics, so `Arc`
+///   does not exist there; the interpreter is single-threaded on a chip, which
+///   is exactly when `Rc` is the right type anyway.
+pub(crate) mod prelude {
+    #[cfg(not(feature = "std"))]
+    #[allow(unused_imports)]
+    pub(crate) use alloc::{
+        borrow::ToOwned,
+        boxed::Box,
+        collections::BTreeMap as HashMap,
+        collections::VecDeque,
+        format,
+        rc::Rc as Arc,
+        string::{String, ToString},
+        vec,
+        vec::Vec,
+    };
+    #[cfg(feature = "std")]
+    #[allow(unused_imports)]
+    pub(crate) use std::{
+        borrow::ToOwned,
+        boxed::Box,
+        collections::HashMap,
+        collections::VecDeque,
+        format,
+        string::{String, ToString},
+        sync::Arc,
+        vec,
+        vec::Vec,
+    };
+}
+
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 pub mod error;
 pub mod host;
 pub mod interp;
@@ -35,7 +86,9 @@ pub mod types;
 pub mod value;
 
 pub use error::{ClrExceptionKind, ExecResult, ExecutionError};
-pub use host::{CaptureHost, Host, SystemHost};
+pub use host::{CaptureHost, Host};
+#[cfg(feature = "std")]
+pub use host::SystemHost;
 pub use interp::{
     CompiledMethod, ExecutionStats, Frame, Interpreter, Limits, NativeFn, NativeTier,
 };

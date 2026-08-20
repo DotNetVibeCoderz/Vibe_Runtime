@@ -4,6 +4,9 @@ use crate::support::*;
 use rustclr_core::{ClrObject, ClrString, ExecResult, Interpreter, Value};
 use rustclr_gc::Handle;
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 pub fn register(interp: &mut Interpreter) {
     // -- String --------------------------------------------------------------
     interp.register_native("System.String::get_Length()", |i, a| {
@@ -226,9 +229,9 @@ pub fn register(interp: &mut Interpreter) {
         let x = arg_string_or_empty(i, a, 0)?;
         let y = arg_string_or_empty(i, a, 1)?;
         Ok(Some(Value::I32(match x.cmp(&y) {
-            std::cmp::Ordering::Less => -1,
-            std::cmp::Ordering::Equal => 0,
-            std::cmp::Ordering::Greater => 1,
+            core::cmp::Ordering::Less => -1,
+            core::cmp::Ordering::Equal => 0,
+            core::cmp::Ordering::Greater => 1,
         })))
     });
     interp.register_native("System.String::GetHashCode()", |i, a| {

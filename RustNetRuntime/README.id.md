@@ -24,10 +24,10 @@ menghasilkan keluaran yang identik di kedua runtime:
 
 ```console
 $ dotnet Conformance.dll
-checks=134 failures=0
+checks=136 failures=0
 
 $ rustnet run Conformance.dll --stats
-checks=134 failures=0
+checks=136 failures=0
 
 ─── execution ──────────────────────────────
   wall clock                  10.505 ms
@@ -96,16 +96,18 @@ agar JIT-nya berjalan penuh.
 
 | Beban kerja | .NET | RustCLR | Rasio |
 | --- | ---: | ---: | ---: |
-| Start proses | 126 ms | **65 ms** | **0,5x** |
-| Exception (50rb throw) | 125 ms | **128 ms** | **1,0x** |
-| String (20rb concat) | 134 ms | **176 ms** | **1,3x** |
-| Rekursi (fib 27) | 119 ms | 427 ms | 3,6x |
-| Alokasi (300rb objek) | 119 ms | 992 ms | 8,3x |
-| Sieve (1 juta) | 114 ms | 1.187 ms | 10,4x |
-| Perkalian matriks (120 kuadrat) | 110 ms | 1.305 ms | 11,9x |
-| Panggilan virtual (2 juta) | 110 ms | 1.632 ms | 14,8x |
-| Quicksort (200rb) | 120 ms | 2.242 ms | 18,7x |
-| Akses field (3 juta) | 144 ms | 2.764 ms | 19,2x |
+| Start proses | 108 ms | **62 ms** | **0,6x** |
+| Exception (50rb throw) | 130 ms | **111 ms** | **0,9x** |
+| Kernel bilangan bulat — *dikompilasi* | 149 ms | **268 ms** | **1,8x** |
+| String (20rb concat) | 96 ms | **190 ms** | **2,0x** |
+| Kernel yang sama lewat metode pembantu — *dikompilasi, di-inline* | 106 ms | **310 ms** | **2,9x** |
+| Rekursi (fib 27) | 108 ms | 442 ms | 4,1x |
+| Alokasi (300rb objek) | 112 ms | 1.014 ms | 9,1x |
+| Sieve (1 juta) | 107 ms | 1.287 ms | 12,0x |
+| Perkalian matriks (120 kuadrat) | 110 ms | 1.470 ms | 13,4x |
+| Panggilan virtual (2 juta) | 115 ms | 1.788 ms | 15,5x |
+| Quicksort (200rb) | 122 ms | 2.460 ms | 20,2x |
+| Akses field (3 juta) | 111 ms | 2.943 ms | 26,5x |
 
 Kurangi dulu baris start proses sebelum menyimpulkan: baris itu adalah sebagian
 besar angka .NET pada beban kerja pendek, sehingga rasio *komputasi* sebenarnya
@@ -113,11 +115,13 @@ lebih buruk daripada yang ditunjukkan wall clock, sekitar 100x pada perulangan
 paling ketat. Itulah ongkos menafsirkan alih-alih mengompilasi, dan itulah yang
 dituju [Milestone 4](Plan.md).
 
-Dua baris justru berbalik, dan keduanya karena alasan nyata. **RustCLR start dua
-kali lebih cepat** (tanpa JIT, tanpa pemanasan), yang penting untuk perkakas CLI
-berumur pendek dan untuk mikrokontroler yang tak punya ruang bagi cache kode.
-**Exception dan string nyaris setara** karena pekerjaannya terjadi di Rust native
-di dalam RustBCL, bukan di IL yang ditafsirkan.
+Beberapa baris justru berbalik, karena tiga alasan berbeda. **RustCLR start
+hampir dua kali lebih cepat** (tanpa JIT, tanpa pemanasan), yang penting untuk
+perkakas CLI berumur pendek dan untuk mikrokontroler yang tak punya ruang bagi
+cache kode. **Exception dan string tetap berdekatan** karena pekerjaannya
+terjadi di Rust native di dalam RustBCL, bukan di IL yang ditafsirkan. Dan dua
+baris **kernel dikompilasi menjadi kode mesin**, bukan ditafsirkan sama sekali —
+yang kedua hanya karena inliner menyisipkan metode pembantunya lebih dulu.
 
 Checksum setiap baris dibandingkan antar-runtime sebelum diukur; kalau berbeda,
 yang dicetak `MISMATCH`, bukan angka.
@@ -291,10 +295,17 @@ generic yang sudah di-*erase* melempar exception alih-alih menjawab
 `System.Object`.
 
 **Sebagian metode dikompilasi menjadi kode mesin.** `rustclr-jit` menghasilkan
-x86-64 ke dalam halaman write-xor-execute untuk metode *leaf* yang mengerjakan
+x86-64 ke dalam halaman write-xor-execute untuk metode yang mengerjakan
 aritmetika bilangan bulat, setelah 32 panggilan membuktikan metode itu layak
-dikompilasi. Pada benchmark `kernels` hasilnya **10,7× lebih cepat** daripada
-interpretasi — 232 ms berbanding 2.484 ms, yaitu 1,6× .NET, bukan 17,5×.
+dikompilasi. Pada benchmark `kernels` hasilnya **11,0× lebih cepat** daripada
+interpretasi — 269 ms berbanding 2.971 ms, yaitu 1,8× .NET, bukan 20×.
+
+**Callee kecil di-*inline***, sehingga sebuah `call` tidak lagi membuat metode
+ditolak. Benchmark `inlined` memakai aritmetika yang sama dengan `kernels`
+tetapi dipecah menjadi metode pembantu, sebagaimana kode nyata ditulis: 1.629 ms
+diinterpretasi, 400 ms dikompilasi — **2,9× di antaranya murni dari inliner**,
+karena dengan `--no-inline` run yang sama memakan 1.148 ms. Hanya callee statik
+tanpa percabangan yang disisipkan, dan hanya satu tingkat.
 
 Jangkauannya sempit, dan `rustnet jit <assembly>` menyebutkan persis seberapa
 sempit: apa pun yang memakai array, pemanggilan, alokasi, atau exception
@@ -326,9 +337,10 @@ paralelisme. *Argumen* tipe generic di-*erase*, sehingga kode generic buatan
 pengguna yang membaca `T` saat runtime — `typeof(T)`, `is T`, static field per
 instansiasi — tidak berperilaku benar, dan comparer kustom diabaikan.
 Exception filter (`catch when`) belum dievaluasi.
-Penghasil kode native hanya menangani metode *leaf* bilangan bulat — 10,7× lebih
-cepat di tempat ia berlaku, tetapi menolak apa pun yang memakai array atau
-pemanggilan, yang mencakup sebagian besar program nyata.
+Penghasil kode native hanya menangani metode bilangan bulat — 11,0× lebih cepat
+di tempat ia berlaku, dan kini juga menerima pemanggilan ke metode pembantu
+kecil lewat *inlining*, tetapi tetap menolak apa pun yang memakai array, yang
+mencakup sebagian besar program nyata.
 
 `rustnet capabilities` mencetak daftar ini langsung dari runtime, jadi tidak
 bisa melenceng dari kenyataan. Rincian: [docs/limitations.md](docs/limitations.md).
@@ -338,31 +350,66 @@ bisa melenceng dari kenyataan. Rincian: [docs/limitations.md](docs/limitations.m
 ## Target
 
 Pembaca metadata mengenali x86, x64, Arm, Arm64, RISC-V 32, dan RISC-V 64.
-`rustclr-metadata` dan `rustclr-gc` **bisa dibangun tanpa `std`** untuk
+**Seluruh runtime bisa dibangun tanpa `std`** — `rustclr-metadata`,
+`rustclr-gc`, `rustclr-core`, dan `rustclr-bcl` — untuk
 `thumbv7em-none-eabihf`, `thumbv6m-none-eabi`, `riscv32imc-unknown-none-elf`,
-dan `riscv64gc-unknown-none-elf` — `bash tests/embedded.sh` memeriksa keempatnya.
+dan `riscv64gc-unknown-none-elf`. `bash tests/embedded.sh` memeriksa keenam
+belas kombinasinya.
 
-**Dan keduanya berjalan di perangkat keras sungguhan — di tiga arsitektur.**
-Sebuah ESP32-WROOM-32 (Xtensa LX6), sebuah ESP32-C3 (RISC-V), dan sebuah
-Meadow F7 Micro (STM32F777, Arm Cortex-M7), dengan keluaran yang identik byte
-demi byte. Di tiap chip, pembaca metadata mengurai assembly hasil Roslyn
-langsung dari flash, dan collector-nya mereklamasi sebuah siklus referensi:
+**C# berjalan di mikrokontroler.** Di sebuah ESP32-C3 — RISC-V, SRAM 400 KB,
+tanpa sistem operasi — loader membangun type registry, RustBCL mendaftarkan
+seluruh 766 native binding-nya, dan interpreter mengeksekusi
+`HelloWorld.Main`:
 
 ```
-assembly         HelloWorld
-metadata version v4.0.30319
-entry point      Main
-cycle unrooted   live=0
-refused past it  true
+-- il interpreter --
+heap budget      294912 bytes
+bcl tier         full (260702 bytes needed)
+native bindings  766
+
+--- program output ---
+Hello from RustCLR
+42
+120
+--- end ---
+il executed      68
+calls            6
 ```
 
-Firmware: [ESP32](embedded/esp32-demo) · [Meadow F7](embedded/meadow-f7).
-Rekaman lengkap: [Xtensa](docs/logs/esp32-wroom32.log) ·
-[RISC-V](docs/logs/esp32c3.log) · [Arm](docs/logs/meadow-f7.log).
+Ketiga baris itu identik byte demi byte dengan keluaran
+`dotnet HelloWorld.dll` di desktop, termasuk CRLF-nya, begitu pula
+penghitungnya — 68 instruksi IL dan 6 pemanggilan, baik di x86-64 maupun di
+RISC-V. Rekaman: [ESP32-C3, mengeksekusi](docs/logs/esp32c3-interpreter.log).
 
-**IL belum dieksekusi di chip.** Itu butuh interpreter, dan `rustclr-core` masih
-memerlukan `std` — hash map, jam, dan akses berkas. Papan itu bisa membaca
-assembly .NET dan mengelola heap, tetapi belum bisa menjalankan sebuah metode.
+Ada tiga hal yang harus berubah, dan masing-masing adalah perbedaan nyata,
+bukan tambalan: map menjadi `BTreeMap` (setiap kunci yang dipakai runtime sudah
+`Ord`), `Arc` menjadi `Rc` (RISC-V `imc` tidak punya ekstensi atomic, dan
+interpreter memang berjalan satu utas di chip), dan matematika float diambil
+dari `libm` — satu-satunya dependensi eksternal di seluruh runtime, bersifat
+opsional, dan tidak ikut terbawa pada build default. Hanya berkas yang tidak
+bisa dihindari: `load_from_file` dipagari `std`, dan di chip sebuah assembly
+datang sebagai byte.
+
+**Seberapa banyak RustBCL yang muat bergantung pada papannya.** Puncak alokasi
+adalah 260.702 byte dengan seluruh binding, atau 192.045 byte dengan console,
+string, dan matematika saja — diukur, bukan ditaksir. Tiap firmware memilih
+berdasarkan anggaran heap-nya, dan papan yang tidak memenuhi keduanya
+menyatakannya dalam satu baris teks alih-alih mati di dalam allocator.
+
+| Papan | Inti | RAM | Tier | Status |
+| --- | --- | ---: | --- | --- |
+| [ESP32-C3](embedded/esp32-demo) | RISC-V 32 | 400 K | penuh | **mengeksekusi IL di perangkat keras** |
+| [ESP32-WROOM-32](embedded/esp32-demo) | Xtensa LX6 | 520 K | penuh | terbangun; flash terakhir sebelum interpreter |
+| [Meadow F7](embedded/meadow-f7) | Cortex-M7 | 384 K | penuh | terbangun; flash terakhir sebelum interpreter |
+| [Maix Go K210](embedded/k210) | RISC-V 64 | 6 M | penuh | terbangun; belum pernah di-flash — tidak ada papan |
+| [Pico](embedded/rp2040) | Cortex-M0+ | 256 K | minimal | terbangun; belum pernah di-flash — tidak ada papan |
+
+Kelimanya berbagi satu demonstrasi
+([embedded/demo-common](embedded/demo-common)) dan `bash tests/firmware.sh`
+membangun semuanya. Hanya baris pertama yang sudah berjalan di perangkat keras
+sejak interpreter mendarat; rekaman metadata-dan-GC sebelumnya:
+[Xtensa](docs/logs/esp32-wroom32.log) · [RISC-V](docs/logs/esp32c3.log) ·
+[Arm](docs/logs/meadow-f7.log).
 
 `Heap::embedded(n)` adalah batas keras, bukan sekadar petunjuk: alokasi
 melampauinya gagal alih-alih tumbuh — satu-satunya jenis batas yang berarti di
@@ -444,13 +491,20 @@ generic yang sudah di-*erase* melempar exception alih-alih menjawab
 `System.Object`.
 
 **Sebagian metode dikompilasi menjadi kode mesin.** `rustclr-jit` menghasilkan
-x86-64 ke dalam halaman write-xor-execute untuk metode *leaf* yang mengerjakan
+x86-64 ke dalam halaman write-xor-execute untuk metode yang mengerjakan
 aritmetika bilangan bulat, setelah 32 panggilan membuktikan metode itu layak
-dikompilasi. Pada benchmark `kernels` hasilnya **10,7× lebih cepat** daripada
-interpretasi — 232 ms berbanding 2.484 ms, yaitu 1,6× .NET, bukan 17,5×.
+dikompilasi. Pada benchmark `kernels` hasilnya **11,0× lebih cepat** daripada
+interpretasi — 269 ms berbanding 2.971 ms, yaitu 1,8× .NET, bukan 20×. Callee
+kecil di-*inline*, sehingga sebuah `call` tidak lagi membuat metode ditolak.
 
-Jangkauannya sempit, dan `rustnet jit <assembly>` menyebutkan persis seberapa
-sempit: apa pun yang memakai array, pemanggilan, alokasi, atau exception
+**Backend AArch64 dan RISC-V ada, tetapi belum pernah dieksekusi.** Keduanya
+meng-*encode* IL yang sama melalui translasi bersama yang sama seperti x86-64
+dan diperiksa dengan cara membongkar (disassemble) keluarannya, tetapi belum
+ada satu pun metode terkompilasi yang pernah berjalan di sana. Hanya x86-64
+yang dipakai saat runtime.
+
+Jangkauannya masih sempit, dan `rustnet jit <assembly>` menyebutkan persis
+seberapa sempit: apa pun yang memakai array, alokasi, atau exception
 handling tetap diinterpretasi. `rustnet run --no-jit` menginterpretasi
 semuanya, dan harus mencetak byte yang sama — ada differential test yang
 menjaminnya.

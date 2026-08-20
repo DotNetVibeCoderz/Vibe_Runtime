@@ -136,13 +136,17 @@ That is narrow on purpose: a partial backend that is honest about its reach is
 useful immediately, and everything it declines runs exactly as it did before.
 
 ```bash
-rustnet jit <assembly>     # what compiles, and why the rest does not
-rustnet run --no-jit …     # interpret everything; output must be identical
+rustnet jit <assembly>       # what compiles, and why the rest does not
+rustnet run --no-jit …       # interpret everything; output must be identical
+rustnet run --no-inline …    # compile, but splice nothing; output must match too
 ```
 
 **What it is worth where it applies.** The `kernels` benchmark — integer
-arithmetic in leaf methods — runs in 2484 ms interpreted and 232 ms compiled:
-**10.7× faster**, which moves it from 17.5× slower than .NET to 1.6×.
+arithmetic written out longhand — runs in 2971 ms interpreted and 269 ms
+compiled: **11.0× faster**, which moves it from 20× slower than .NET to 1.8×.
+The `inlined` benchmark is the same arithmetic factored into small helpers:
+1629 ms interpreted, 400 ms compiled, **4.1×** — of which **2.9× is the inliner
+alone**, since with `--no-inline` the same run takes 1148 ms.
 
 **What it does not reach.** Every other workload in the benchmark suite. They
 use arrays and calls, so `rustnet jit` compiles none of them and the figures are
@@ -151,8 +155,21 @@ reading `a[i]` from machine code means resolving a handle through the handle
 table, which needs a call back into the runtime and therefore a calling
 convention the backend does not have yet.
 
-**Not implemented at all:** AArch64 and RISC-V backends, and inlining — the
-`is_inline_candidate` analysis exists and nothing consumes it.
+**Inlining is one level deep and branch-free.** A `call` no longer disqualifies
+a method: a small static callee is spliced into its caller, which is often the
+difference between a real method compiling and being declined. But the callee
+must contain no branches at all — a helper with an `if` in it is not inlined —
+and the splice is not applied recursively, so a helper that itself calls another
+helper is left alone. Instance methods are never inlined. `--no-inline` turns
+the whole thing off, and the output must be identical either way.
+
+**The AArch64 and RISC-V backends emit code that has never been executed.**
+Both encode the same IL the x86-64 backend does, through the same shared
+translation, and both are checked by disassembling their output and reading it.
+Neither has ever run a compiled method: this host is x86-64, and only the
+x86-64 backend is dispatched to at runtime. Treat them as reviewed encoders,
+not as working backends — an unexecuted backend that claims to work is worse
+than no backend at all.
 
 **Code memory is write-xor-execute.** A page is mapped readable and writable,
 filled, and only then flipped to readable and executable. It is never both at
@@ -236,29 +253,89 @@ so it is refused rather than mis-encoded.
 
 ---
 
-## Embedded: the reader and collector run on hardware, the interpreter does not
+## Embedded: the interpreter runs on hardware, within a memory budget
 
-**Verified on three architectures** — an ESP32-WROOM-32 (Xtensa LX6), an
-ESP32-C3 (RISC-V) and a Meadow F7 Micro (STM32F777, Arm Cortex-M7) — with
-byte-identical output. On each chip, `rustclr-metadata` parsed a Roslyn-built
-assembly out of flash and `rustclr-gc` reclaimed a reference cycle:
+**C# executes on a microcontroller.** On an ESP32-C3 (RISC-V, 400 KB SRAM,
+no operating system) the loader builds a type registry, RustBCL registers all
+766 of its native bindings, and the interpreter runs `HelloWorld.Main`:
 
 ```
-assembly         HelloWorld
-metadata version v4.0.30319
-entry point      Main
-cycle unrooted   live=0
-refused past it  true
+-- il interpreter --
+heap budget      294912 bytes
+bcl tier         full (260702 bytes needed)
+native bindings  766
+types registered 204
+
+--- program output ---
+Hello from RustCLR
+42
+120
+--- end ---
+exit code        0
+il executed      68
+calls            6
 ```
 
-Full captures: [Xtensa](logs/esp32-wroom32.log) · [RISC-V](logs/esp32c3.log) ·
-[Arm](logs/meadow-f7.log). Firmware:
-[embedded/esp32-demo](../embedded/esp32-demo) and
-[embedded/meadow-f7](../embedded/meadow-f7).
+Those three lines are byte-identical to `dotnet HelloWorld.dll` on a desktop,
+CRLF included, and so are the counters: 68 IL instructions and 6 calls on
+x86-64 and on RISC-V alike. Full capture:
+[ESP32-C3, executing](logs/esp32c3-interpreter.log). Earlier metadata-and-GC
+captures: [Xtensa](logs/esp32-wroom32.log) · [RISC-V](logs/esp32c3.log) ·
+[Arm](logs/meadow-f7.log).
 
-Both crates also build without `std` for `thumbv7em-none-eabihf`,
+**The whole runtime builds without `std`** — `rustclr-metadata`, `rustclr-gc`,
+`rustclr-core` and `rustclr-bcl`, for `thumbv7em-none-eabihf`,
 `thumbv6m-none-eabi`, `riscv32imc-unknown-none-elf` and
-`riscv64gc-unknown-none-elf` — `bash tests/embedded.sh` checks all of them.
+`riscv64gc-unknown-none-elf`. `bash tests/embedded.sh` checks all sixteen
+combinations. Three things had to change and each is a real difference, not a
+polyfill:
+
+* **Maps.** `HashMap` becomes `BTreeMap` without `std`. Every key the runtime
+  uses — integer ids, tuples of them, names — is already `Ord`, so this costs
+  an iteration order that nothing depends on, and avoids pulling a hasher onto
+  a microcontroller.
+* **`Arc` becomes `Rc`.** RISC-V `imc` — the ESP32-C3's core — has no atomics
+  extension, so `Arc` does not exist on that target. The interpreter is
+  single-threaded on a chip, which is exactly when `Rc` is correct anyway.
+* **Float maths comes from `libm`.** `core` has no `sqrt`, no `sin`, not even
+  `abs` for `f64`, and `System.Math` is largely a libm. This is the only
+  external dependency anywhere in the runtime, it is optional, and a default
+  (`std`) build does not pull it in.
+
+Only the filesystem was irreducible: `Loader::load_from_file` is gated on
+`std`, and without it an assembly arrives as bytes.
+
+**How much of RustBCL fits depends on the board**, and the firmware decides
+from a measured number rather than a guess. Peak allocation to load the runtime
+and run a program is **260,702 bytes** with every binding, or **192,045** with
+console, strings and maths only. `Tier::for_budget` compares those against the
+board's heap and picks; a board that clears neither says so in a line of text
+instead of dying inside the allocator.
+
+| Board | Core | RAM | Heap given | Tier | State |
+| --- | --- | ---: | ---: | --- | --- |
+| ESP32-C3 | RISC-V 32 | 400 K | 288 K | full | **executes IL on hardware** |
+| ESP32-WROOM-32 | Xtensa LX6 | 520 K | 176 K + 96 K | full | builds; last flashed pre-interpreter |
+| Meadow F7 Micro | Arm Cortex-M7 | 384 K | 288 K | full | builds; last flashed pre-interpreter |
+| Sipeed Maix Go K210 | RISC-V 64 | 6 M | 1 M | full | **builds; never flashed** — no board |
+| Raspberry Pi Pico | Arm Cortex-M0+ | 256 K | 192 K | minimal | **builds; never flashed** — no board |
+
+Only the first row has been run on hardware since the interpreter landed. The
+rest are builds, and are worth reading as exactly that.
+
+**The WROOM-32 needs two heap regions to get there**, which is the most
+instructive thing in that table. Its main `dram_seg` tops out at 176 KB — found
+by bisecting until the link succeeded — which is below even the reduced binding
+set. The ESP32 has a second bank of 98,768 bytes past the ROM's data and stacks
+that the linker will not place ordinary statics in; `esp-alloc` accepts regions
+rather than one arena, so the firmware adds both. A single allocation still
+cannot span them, and the largest the runtime makes is 67,584 bytes, which
+clears either.
+
+**The heap is a static array, so the linker enforces the budget.** Asking the
+C3 for 320 KB produces `.bss will not fit in region DRAM, overflowed by 13844
+bytes` at link time rather than a hard fault at run time. That is the argument
+for sizing it statically.
 
 `Heap::embedded(n)` is a **hard ceiling**: `try_alloc` returns `None` when full
 rather than growing past the budget. On a device whose RAM was allocated up
@@ -270,6 +347,7 @@ front, a heap that quietly grows has not been bounded at all.
 | --- | --- |
 | IL execution | `rustclr-core` needs a hash map, a clock and a way to read an assembly |
 | Ahead-of-time compilation | Needs Arm and RISC-V code generators; only x86-64 exists |
+| The Pico and K210 | Their images build; neither has been flashed |
 
 That first row is the honest boundary: the chip can *read* a .NET assembly and
 manage a heap, but it cannot execute a method. This is

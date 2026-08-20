@@ -1,0 +1,11 @@
+[build]
+target = "thumbv7em-none-eabihf"
+
+[target.thumbv7em-none-eabihf]
+rustflags = ["-C", "link-arg=-Tlink.x"]
+
+# Both parts are Cortex-M4F, so both take the hard-float target. Flashing needs
+# a probe rather than a bootloader — the Nucleo has an ST-Link on board, the
+# Netduino needs one wired to SWD:
+#   probe-rs run --chip STM32F401RETx
+#   probe-rs run --chip STM32F427VITx

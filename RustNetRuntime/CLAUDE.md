@@ -4,11 +4,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status: milestones 1-3 and 5 complete, 4 and 6 partly done, and it works
 
-The runtime executes real Roslyn-compiled assemblies. `cargo test --workspace` runs 141 tests;
-the conformance fixture prints `checks=134 failures=0` on RustCLR, byte-identical to `dotnet`,
+The runtime executes real Roslyn-compiled assemblies. `cargo test --workspace` runs 163 tests;
+the conformance fixture prints `checks=136 failures=0` on RustCLR, byte-identical to `dotnet`,
 and `ModernSyntax` prints `checks=35 failures=0`. Generic collections, LINQ and
-`async`/`await` all run, hot integer methods compile to x86-64 machine code, and reflection works on real
-`System.Type` objects.
+`async`/`await` all run, hot integer methods compile to x86-64 machine code (with small
+callees inlined), and reflection works on real `System.Type` objects.
+
+**The whole runtime builds without `std`, and the interpreter runs on a microcontroller** —
+an ESP32-C3 executes `HelloWorld.Main` with all 766 RustBCL bindings, printing bytes
+identical to `dotnet`. `bash tests/embedded.sh` checks metadata, gc, core and bcl on four
+bare-metal targets. Memory is the binding constraint there: 260,702 bytes peak with every
+binding, 192,045 with a console-only subset, and each firmware picks from its heap budget.
+
 CodeGen builds and runs. Not a git repository.
 
 `requirements.md` is the single source of truth for scope. Read it before starting any work —
@@ -91,8 +98,9 @@ the C# side is one project built by path.
 ```bash
 # Runtime
 cargo build --release                      # produces target/release/rustnet
-cargo test --workspace                     # 141 tests; must stay green
-bash tests/embedded.sh                     # bare-metal builds; must stay green
+cargo test --workspace                     # 163 tests; must stay green
+bash tests/embedded.sh                     # 4 crates x 4 bare-metal targets; must stay green
+bash tests/firmware.sh                     # five board firmwares; must stay green
 cargo test -p rustclr-core                 # one crate
 cargo test -p rustclr-gc a_cycle_is        # one test by substring
 
@@ -110,7 +118,7 @@ Before claiming a runtime change works, run a real assembly through both runtime
 
 ```bash
 cd tests/fixtures/Conformance && dotnet build -c Release
-dotnet bin/Release/net10.0/Conformance.dll                    # expect: checks=134 failures=0
+dotnet bin/Release/net10.0/Conformance.dll                    # expect: checks=136 failures=0
 ../../../target/debug/rustnet.exe run bin/Release/net10.0/Conformance.dll
 ```
 

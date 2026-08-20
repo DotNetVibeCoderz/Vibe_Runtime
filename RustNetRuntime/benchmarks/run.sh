@@ -14,7 +14,7 @@ PROJECT="$HERE/Benchmarks"
 ASSEMBLY="$PROJECT/bin/Release/net10.0/Benchmarks.dll"
 
 RUNS="${RUNS:-3}"
-WORKLOADS="${WORKLOADS:-noop fib sieve strings matrix sort alloc virtual exceptions fields kernels}"
+WORKLOADS="${WORKLOADS:-noop fib sieve strings matrix sort alloc virtual exceptions fields kernels inlined}"
 
 # Prefer a release build of the toolchain; fall back to debug with a warning.
 RUSTNET="$ROOT/target/release/rustnet"

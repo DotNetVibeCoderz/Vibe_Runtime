@@ -8,6 +8,9 @@
 use super::*;
 use rustclr_metadata::TableId;
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 impl Interpreter {
     pub(super) fn execute(&mut self, ins: &Instruction) -> ExecResult<StepOutcome> {
         // The `constrained.` prefix applies to the next call only.
@@ -190,7 +193,7 @@ impl Interpreter {
             }
             Op::Cgt => {
                 let (a, b) = self.pop2()?;
-                let r = self.compare_ordered(&a, &b, false)? == Some(std::cmp::Ordering::Greater);
+                let r = self.compare_ordered(&a, &b, false)? == Some(core::cmp::Ordering::Greater);
                 self.push(Value::I32(r as i32));
             }
             Op::CgtUn => {
@@ -198,7 +201,7 @@ impl Interpreter {
                 // `cgt.un` on floats is true when unordered, which is how
                 // `!(a <= b)` is compiled.
                 let r = match self.compare_ordered(&a, &b, true)? {
-                    Some(std::cmp::Ordering::Greater) => true,
+                    Some(core::cmp::Ordering::Greater) => true,
                     None => true,
                     _ => false,
                 };
@@ -206,13 +209,13 @@ impl Interpreter {
             }
             Op::Clt => {
                 let (a, b) = self.pop2()?;
-                let r = self.compare_ordered(&a, &b, false)? == Some(std::cmp::Ordering::Less);
+                let r = self.compare_ordered(&a, &b, false)? == Some(core::cmp::Ordering::Less);
                 self.push(Value::I32(r as i32));
             }
             Op::CltUn => {
                 let (a, b) = self.pop2()?;
                 let r = match self.compare_ordered(&a, &b, true)? {
-                    Some(std::cmp::Ordering::Less) => true,
+                    Some(core::cmp::Ordering::Less) => true,
                     None => true,
                     _ => false,
                 };

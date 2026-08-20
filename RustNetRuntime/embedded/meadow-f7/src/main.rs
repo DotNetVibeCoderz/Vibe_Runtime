@@ -41,15 +41,11 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
-use core::any::Any;
 use core::fmt::Write as _;
 
 use cortex_m_rt::entry;
 use embedded_alloc::LlffHeap;
 
-use rustclr_gc::{GcObject, Handle, Heap, RootSet, Tracer};
-use rustclr_metadata::{Image, TableId};
 
 mod usb;
 
@@ -61,11 +57,12 @@ static HELLO_WORLD: &[u8] = include_bytes!("HelloWorld.dll");
 const BOARD: &str = "Meadow F7 Micro v1.0 (STM32F777, Cortex-M7)";
 
 /// How much of the part's 384 KB of DMA-reachable RAM the allocator gets.
-const HEAP_BYTES: usize = 64 * 1024;
+// 288 KB of the F7's 384 KB of SRAM, which is what the interpreter needs to
+// hold the loader's type registry and RustBCL's binding table at once
+// (260,702 bytes peak, measured). The remaining 96 KB covers `.data`, `.bss`
+// and the stack.
+const HEAP_BYTES: usize = 288 * 1024;
 
-/// Slots the managed heap may use. A *ceiling*, not a hint: allocation past it
-/// fails rather than growing into memory budgeted for something else.
-const MANAGED_SLOTS: usize = 128;
 
 #[global_allocator]
 static ALLOCATOR: LlffHeap = LlffHeap::empty();
@@ -221,45 +218,6 @@ mod led {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The demonstration
-// ---------------------------------------------------------------------------
-
-/// A node in the demonstration object graph.
-struct Node {
-    /// Kept so the graph is more than pointers.
-    #[allow(dead_code)]
-    id: u32,
-    next: Handle,
-}
-
-impl GcObject for Node {
-    fn trace(&self, tracer: &mut Tracer) {
-        tracer.edge(self.next);
-    }
-    fn size_hint(&self) -> usize {
-        core::mem::size_of::<Node>()
-    }
-    fn type_name(&self) -> &str {
-        "Node"
-    }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-}
-
-/// A root set backed by a fixed list of handles.
-struct Roots(Vec<Handle>);
-
-impl RootSet for Roots {
-    fn collect_roots(&self, out: &mut Vec<Handle>) {
-        out.extend_from_slice(&self.0);
-    }
-}
-
 #[entry]
 fn main() -> ! {
     let on_crystal = {
@@ -307,140 +265,50 @@ fn main() -> ! {
             for _ in 0..2_000_000u32 {
                 console.service();
             }
-            report(&mut console, on_crystal);
+            let mut detail = Detail::new();
+            let _ = write!(
+                detail,
+                "clock            {} MHz from {} ({})",
+                SYSCLK_HZ / 1_000_000,
+                if on_crystal { "HSE" } else { "HSI" },
+                if on_crystal {
+                    "25 MHz crystal"
+                } else {
+                    "no crystal - USB may be out of spec"
+                }
+            );
+            rustclr_demo_common::run(&mut console, BOARD, detail.as_str(), HELLO_WORLD, HEAP_BYTES);
         }
         was_open = open;
     }
 }
 
-/// The whole report, printed once per terminal session.
-fn report(console: &mut usb::UsbConsole, on_crystal: bool) {
-    let _ = writeln!(console);
-    let _ = writeln!(console, "========================================");
-    let _ = writeln!(console, " RustCLR on {BOARD}");
-    let _ = writeln!(console, " Built by Gravicode Studios, led by Kang Fadhil");
-    let _ = writeln!(console, "========================================");
-    let _ = writeln!(console);
-    let _ = writeln!(
-        console,
-        "clock            {} MHz from {} ({})",
-        SYSCLK_HZ / 1_000_000,
-        if on_crystal { "HSE" } else { "HSI" },
-        if on_crystal { "25 MHz crystal" } else { "no crystal — USB may be out of spec" }
-    );
-    let _ = writeln!(console);
-
-    read_assembly(console);
-    let _ = writeln!(console);
-    exercise_collector(console);
-
-    let _ = writeln!(console);
-    let _ = writeln!(console, "done.");
+/// A tiny fixed string builder, so the detail line needs no allocation.
+struct Detail {
+    bytes: [u8; 96],
+    len: usize,
 }
 
-/// Reads the embedded assembly with the same metadata reader the desktop
-/// runtime uses.
-fn read_assembly(console: &mut usb::UsbConsole) {
-    let _ = writeln!(console, "-- metadata reader --");
-    let _ = writeln!(console, "image bytes      {}", HELLO_WORLD.len());
-
-    let image = match Image::from_bytes(HELLO_WORLD.to_vec()) {
-        Ok(image) => image,
-        Err(e) => {
-            let _ = writeln!(console, "FAILED to parse: {e}");
-            return;
-        }
-    };
-
-    let pe = image.pe();
-    let _ = writeln!(console, "machine          {}", pe.machine.name());
-    let _ = writeln!(console, "PE32+            {}", pe.is_pe32_plus);
-    let _ = writeln!(console, "IL only          {}", pe.is_il_only());
-    let _ = writeln!(console, "assembly         {}", image.assembly_name());
-
-    let md = image.metadata();
-    let _ = writeln!(console, "metadata version {}", md.version);
-    let _ = writeln!(console, "types            {}", md.row_count(TableId::TypeDef));
-    let _ = writeln!(console, "methods          {}", md.row_count(TableId::MethodDef));
-    let _ = writeln!(console, "member refs      {}", md.row_count(TableId::MemberRef));
-    let _ = writeln!(console, "assembly refs    {}", md.row_count(TableId::AssemblyRef));
-
-    match image.entry_point() {
-        Some(token) => match md.method_def(token.row()) {
-            Ok(method) => {
-                let _ = writeln!(console, "entry point      {}", method.name);
-            }
-            Err(e) => {
-                let _ = writeln!(console, "entry point      <unreadable: {e}>");
-            }
-        },
-        None => {
-            let _ = writeln!(console, "entry point      <none>");
-        }
+impl Detail {
+    fn new() -> Self {
+        Self { bytes: [0; 96], len: 0 }
     }
 
-    let _ = writeln!(console, "declared types:");
-    for row in 1..=md.row_count(TableId::TypeDef) {
-        if let Ok(t) = md.type_def(row) {
-            let _ = writeln!(console, "  {}", t.full_name());
-        }
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.bytes[..self.len]).unwrap_or("")
     }
 }
 
-/// Allocates, builds a cycle, drops the root and collects.
-fn exercise_collector(console: &mut usb::UsbConsole) {
-    let _ = writeln!(console, "-- garbage collector --");
-
-    let mut heap = Heap::embedded(MANAGED_SLOTS);
-    let _ = writeln!(console, "collector        {}", heap.collector_name());
-    let _ = writeln!(console, "slot ceiling     {:?}", heap.slot_limit());
-
-    // A three-node ring. Reference counting would never reclaim this; a tracing
-    // collector reclaims it the moment nothing outside points in.
-    let a = heap.alloc(Node { id: 1, next: Handle::NULL });
-    let b = heap.alloc(Node { id: 2, next: a });
-    let c = heap.alloc(Node { id: 3, next: b });
-    if let Some(node) = heap.get_as_mut::<Node>(a) {
-        node.next = c;
-    }
-    let _ = writeln!(
-        console,
-        "after 3 allocs   live={} bytes={}",
-        heap.live_count(),
-        heap.live_bytes()
-    );
-
-    let rooted = Roots(alloc::vec![c]);
-    heap.collect(&rooted);
-    let _ = writeln!(console, "cycle rooted     live={}", heap.live_count());
-
-    let empty = Roots(Vec::new());
-    heap.collect(&empty);
-    let _ = writeln!(console, "cycle unrooted   live={}", heap.live_count());
-
-    // A stale handle is detected rather than dereferenced — the property that
-    // motivated a handle table instead of raw pointers.
-    let _ = writeln!(console, "stale handle     valid={}", heap.is_valid(a));
-
-    let mut allocated = 0usize;
-    let mut refused = false;
-    for id in 0..(MANAGED_SLOTS as u32 + 8) {
-        match heap.try_alloc(Node { id, next: Handle::NULL }) {
-            Some(_) => allocated += 1,
-            None => {
-                refused = true;
-                break;
+impl core::fmt::Write for Detail {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for b in s.as_bytes() {
+            if self.len < self.bytes.len() {
+                self.bytes[self.len] = *b;
+                self.len += 1;
             }
         }
+        Ok(())
     }
-    let _ = writeln!(console, "filled to        {allocated} slots");
-    let _ = writeln!(console, "refused past it  {refused}");
-
-    let stats = heap.stats();
-    let _ = writeln!(console, "collections      {}", stats.collections);
-    let _ = writeln!(console, "total allocs     {}", stats.total_allocations);
-    let _ = writeln!(console, "objects freed    {}", stats.total_objects_freed);
-    let _ = writeln!(console, "peak live bytes  {}", stats.peak_live_bytes);
 }
 
 /// A panic has nowhere to go on a microcontroller. Light the red LED and stop,

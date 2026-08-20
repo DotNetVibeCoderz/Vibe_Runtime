@@ -8,7 +8,10 @@ This is the third architecture; the same two crates run on Xtensa LX6 and
 RISC-V from [embedded/esp32-demo](../esp32-demo), and all three print
 **byte-identical** reports.
 
-**It does not execute IL.** `rustclr-core` still needs `std`. See
+**It executes IL** — 288 KB of the F7's 384 KB of SRAM goes to the allocator,
+which clears the 261 KB the runtime needs for the full set of RustBCL bindings.
+Note that the capture in `docs/logs/meadow-f7.log` predates the interpreter and
+shows metadata and GC only; this board has not been reflashed since. See
 [docs/limitations.md](../../docs/limitations.md).
 
 ---

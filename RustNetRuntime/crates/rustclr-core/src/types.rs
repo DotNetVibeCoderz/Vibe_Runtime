@@ -6,7 +6,10 @@
 //! strings or pointers.
 
 use rustclr_metadata::{MethodSig, Token, TypeSig};
-use std::collections::HashMap;
+
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 
 macro_rules! newtype_id {
     ($(#[$m:meta])* $name:ident) => {
@@ -69,7 +72,7 @@ impl TypeKind {
 }
 
 /// The primitive types the runtime knows intrinsically.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Primitive {
     Boolean,
     Char,

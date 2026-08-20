@@ -5,6 +5,9 @@ use crate::support::*;
 use rustclr_core::{ClrArray, ClrException, Interpreter, Value};
 use rustclr_gc::Handle;
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 pub fn register(interp: &mut Interpreter) {
     register_object(interp);
     register_compiler_services(interp);
@@ -272,9 +275,13 @@ fn register_environment(interp: &mut Interpreter) {
         Ok(Some(Value::I32(1)))
     });
     interp.register_native("System.Environment::get_ProcessorCount()", |_i, _a| {
-        Ok(Some(Value::I32(
-            std::thread::available_parallelism().map(|n| n.get() as i32).unwrap_or(1),
-        )))
+        #[cfg(feature = "std")]
+        let cores = std::thread::available_parallelism().map(|n| n.get() as i32).unwrap_or(1);
+        // A microcontroller has one core and no way to ask. Reporting 1 is the
+        // truth here, not a fallback.
+        #[cfg(not(feature = "std"))]
+        let cores = 1;
+        Ok(Some(Value::I32(cores)))
     });
     interp.register_native("System.Environment::GetCommandLineArgs()", |i, _a| {
         let args: Vec<String> = i.host.args().to_vec();
@@ -352,7 +359,7 @@ fn register_time(interp: &mut Interpreter) {
 
     interp.register_native("System.Threading.Thread::Sleep(int)", |i, a| {
         let ms = arg_i32(i, a, 0)?.max(0) as u64;
-        std::thread::sleep(std::time::Duration::from_millis(ms));
+        sleep_millis(i, ms);
         Ok(None)
     });
 }
@@ -381,7 +388,7 @@ fn register_random(interp: &mut Interpreter) {
     interp.register_native("System.Random::NextDouble()", |i, a| {
         let h = arg_handle(i, a, 0)?;
         let v = next_random(h.to_bits()) as f64 / u32::MAX as f64;
-        Ok(Some(Value::F(v.fract())))
+        Ok(Some(Value::F(crate::fmath::fract(v))))
     });
 }
 
@@ -392,13 +399,43 @@ fn register_random(interp: &mut Interpreter) {
 /// rather than hidden: it keeps sequences reproducible without adding a heap
 /// object kind purely for RNG state.
 fn next_random(seed: u64) -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static STATE: AtomicU64 = AtomicU64::new(0x2545F4914F6CDD1D);
-
-    let mut x = STATE.load(Ordering::Relaxed) ^ seed.rotate_left(17);
+    let mut x = load_random_state() ^ seed.rotate_left(17);
     x ^= x << 13;
     x ^= x >> 7;
     x ^= x << 17;
-    STATE.store(x, Ordering::Relaxed);
+    store_random_state(x);
     x >> 33
+}
+
+const RANDOM_SEED: u64 = 0x2545F4914F6CDD1D;
+
+#[cfg(feature = "std")]
+static RANDOM_STATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(RANDOM_SEED);
+
+#[cfg(feature = "std")]
+fn load_random_state() -> u64 {
+    RANDOM_STATE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(feature = "std")]
+fn store_random_state(x: u64) {
+    RANDOM_STATE.store(x, std::sync::atomic::Ordering::Relaxed);
+}
+
+// RISC-V `imc` — the ESP32-C3's core — has no atomics extension at all, so
+// `AtomicU64` does not exist there. A plain static is sound in its place for
+// the same reason the interpreter needs no locks on a chip: there is one
+// thread. Accessed through raw pointers rather than references, which is what
+// keeps this from being a `static_mut_refs` violation.
+#[cfg(not(feature = "std"))]
+static mut RANDOM_STATE: u64 = RANDOM_SEED;
+
+#[cfg(not(feature = "std"))]
+fn load_random_state() -> u64 {
+    unsafe { core::ptr::read(&raw const RANDOM_STATE) }
+}
+
+#[cfg(not(feature = "std"))]
+fn store_random_state(x: u64) {
+    unsafe { core::ptr::write(&raw mut RANDOM_STATE, x) }
 }

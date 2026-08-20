@@ -8,8 +8,15 @@ authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["std"]
+std = ["rustclr-metadata/std", "rustclr-gc/std"]
+
 [dependencies]
-rustclr-metadata.workspace = true
-rustclr-gc.workspace = true
+# Not `workspace = true`: the workspace entry turns default features on, and a
+# workspace dependency cannot override that. Core has to be able to build
+# without `std`, so it names the paths itself.
+rustclr-metadata = { path = "../rustclr-metadata", version = "0.1.0", default-features = false }
+rustclr-gc = { path = "../rustclr-gc", version = "0.1.0", default-features = false }
 
 [dev-dependencies]

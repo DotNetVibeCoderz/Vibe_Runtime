@@ -3,6 +3,9 @@
 use crate::support::*;
 use rustclr_core::{ByRef, Interpreter, Value};
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 pub fn register(interp: &mut Interpreter) {
     register_math(interp);
     register_convert(interp);
@@ -20,21 +23,21 @@ fn register_math(interp: &mut Interpreter) {
         };
     }
 
-    unary_f64!("System.Math::Sqrt(double)", f64::sqrt);
-    unary_f64!("System.Math::Sin(double)", f64::sin);
-    unary_f64!("System.Math::Cos(double)", f64::cos);
-    unary_f64!("System.Math::Tan(double)", f64::tan);
-    unary_f64!("System.Math::Asin(double)", f64::asin);
-    unary_f64!("System.Math::Acos(double)", f64::acos);
-    unary_f64!("System.Math::Atan(double)", f64::atan);
-    unary_f64!("System.Math::Exp(double)", f64::exp);
-    unary_f64!("System.Math::Log(double)", f64::ln);
-    unary_f64!("System.Math::Log10(double)", f64::log10);
-    unary_f64!("System.Math::Log2(double)", f64::log2);
-    unary_f64!("System.Math::Floor(double)", f64::floor);
-    unary_f64!("System.Math::Ceiling(double)", f64::ceil);
-    unary_f64!("System.Math::Truncate(double)", f64::trunc);
-    unary_f64!("System.Math::Cbrt(double)", f64::cbrt);
+    unary_f64!("System.Math::Sqrt(double)", crate::fmath::sqrt);
+    unary_f64!("System.Math::Sin(double)", crate::fmath::sin);
+    unary_f64!("System.Math::Cos(double)", crate::fmath::cos);
+    unary_f64!("System.Math::Tan(double)", crate::fmath::tan);
+    unary_f64!("System.Math::Asin(double)", crate::fmath::asin);
+    unary_f64!("System.Math::Acos(double)", crate::fmath::acos);
+    unary_f64!("System.Math::Atan(double)", crate::fmath::atan);
+    unary_f64!("System.Math::Exp(double)", crate::fmath::exp);
+    unary_f64!("System.Math::Log(double)", crate::fmath::ln);
+    unary_f64!("System.Math::Log10(double)", crate::fmath::log10);
+    unary_f64!("System.Math::Log2(double)", crate::fmath::log2);
+    unary_f64!("System.Math::Floor(double)", crate::fmath::floor);
+    unary_f64!("System.Math::Ceiling(double)", crate::fmath::ceil);
+    unary_f64!("System.Math::Truncate(double)", crate::fmath::trunc);
+    unary_f64!("System.Math::Cbrt(double)", crate::fmath::cbrt);
 
     interp.register_native("System.Math::Abs(int)", |i, a| {
         let x = arg_i32(i, a, 0)?;
@@ -52,7 +55,7 @@ fn register_math(interp: &mut Interpreter) {
         }
     });
     interp.register_native("System.Math::Abs(double)", |i, a| {
-        Ok(Some(Value::F(arg_f64(i, a, 0)?.abs())))
+        Ok(Some(Value::F(crate::fmath::abs(arg_f64(i, a, 0)?))))
     });
 
     interp.register_native("System.Math::Max(int,int)", |i, a| {
@@ -74,10 +77,10 @@ fn register_math(interp: &mut Interpreter) {
         Ok(Some(Value::F(arg_f64(i, a, 0)?.min(arg_f64(i, a, 1)?))))
     });
     interp.register_native("System.Math::Pow(double,double)", |i, a| {
-        Ok(Some(Value::F(arg_f64(i, a, 0)?.powf(arg_f64(i, a, 1)?))))
+        Ok(Some(Value::F(crate::fmath::powf(arg_f64(i, a, 0)?, arg_f64(i, a, 1)?))))
     });
     interp.register_native("System.Math::Atan2(double,double)", |i, a| {
-        Ok(Some(Value::F(arg_f64(i, a, 0)?.atan2(arg_f64(i, a, 1)?))))
+        Ok(Some(Value::F(crate::fmath::atan2(arg_f64(i, a, 0)?, arg_f64(i, a, 1)?))))
     });
     interp.register_native("System.Math::Sign(int)", |i, a| {
         Ok(Some(Value::I32(arg_i32(i, a, 0)?.signum())))
@@ -232,9 +235,9 @@ fn register_primitives(interp: &mut Interpreter) {
         let x = arg_i32(i, a, 0)?;
         let y = arg_i32(i, a, 1)?;
         Ok(Some(Value::I32(match x.cmp(&y) {
-            std::cmp::Ordering::Less => -1,
-            std::cmp::Ordering::Equal => 0,
-            std::cmp::Ordering::Greater => 1,
+            core::cmp::Ordering::Less => -1,
+            core::cmp::Ordering::Equal => 0,
+            core::cmp::Ordering::Greater => 1,
         })))
     });
 }
@@ -266,16 +269,16 @@ fn parse_i32(s: &str) -> rustclr_core::ExecResult<i32> {
 
 /// Banker's rounding, which is what `Math.Round` uses by default.
 fn round_half_even(x: f64, digits: u32) -> f64 {
-    let factor = 10f64.powi(digits as i32);
+    let factor = crate::fmath::powi(10f64, digits as i32);
     let scaled = x * factor;
-    let floor = scaled.floor();
+    let floor = crate::fmath::floor(scaled);
     let diff = scaled - floor;
 
-    let rounded = if (diff - 0.5).abs() < f64::EPSILON {
+    let rounded = if crate::fmath::abs(diff - 0.5) < f64::EPSILON {
         // Exactly halfway: pick the even neighbour.
         if (floor as i64) % 2 == 0 { floor } else { floor + 1.0 }
     } else {
-        scaled.round()
+        crate::fmath::round(scaled)
     };
     rounded / factor
 }
@@ -295,7 +298,7 @@ mod tests {
 
     #[test]
     fn round_honours_a_digit_count() {
-        assert!((round_half_even(3.14159, 2) - 3.14).abs() < 1e-12);
+        assert!(crate::fmath::abs(round_half_even(3.14159, 2) - 3.14) < 1e-12);
     }
 
     #[test]

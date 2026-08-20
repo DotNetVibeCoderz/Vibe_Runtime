@@ -39,6 +39,9 @@ use rustclr_core::{
 };
 use rustclr_gc::Handle;
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 const ENUMERABLE: &str = "System.Linq.Enumerable";
 
 /// Leaks a stable key string; the native table holds it for the process life.
@@ -430,8 +433,8 @@ fn extreme(
 pub(crate) fn compare(interp: &Interpreter, x: &Value, y: &Value) -> ExecResult<i32> {
     if let (Some(a), Some(b)) = (as_number(x), as_number(y)) {
         return Ok(match a.partial_cmp(&b) {
-            Some(std::cmp::Ordering::Less) => -1,
-            Some(std::cmp::Ordering::Greater) => 1,
+            Some(core::cmp::Ordering::Less) => -1,
+            Some(core::cmp::Ordering::Greater) => 1,
             _ => 0,
         });
     }
@@ -441,9 +444,9 @@ pub(crate) fn compare(interp: &Interpreter, x: &Value, y: &Value) -> ExecResult<
             interp.heap.get_as::<ClrString>(*b).map(|s| s.units.clone()),
         ) {
             return Ok(match sa.cmp(&sb) {
-                std::cmp::Ordering::Less => -1,
-                std::cmp::Ordering::Greater => 1,
-                std::cmp::Ordering::Equal => 0,
+                core::cmp::Ordering::Less => -1,
+                core::cmp::Ordering::Greater => 1,
+                core::cmp::Ordering::Equal => 0,
             });
         }
     }
@@ -655,9 +658,9 @@ pub(crate) fn ordered_values(interp: &mut Interpreter, handle: Handle) -> Vec<Va
             let Ok(result) = compare(interp, ka, kb) else { continue };
             if result != 0 {
                 let ordering = if result < 0 {
-                    std::cmp::Ordering::Less
+                    core::cmp::Ordering::Less
                 } else {
-                    std::cmp::Ordering::Greater
+                    core::cmp::Ordering::Greater
                 };
                 return if descending.get(level).copied().unwrap_or(false) {
                     ordering.reverse()
@@ -666,7 +669,7 @@ pub(crate) fn ordered_values(interp: &mut Interpreter, handle: Handle) -> Vec<Va
                 };
             }
         }
-        std::cmp::Ordering::Equal
+        core::cmp::Ordering::Equal
     });
 
     order.into_iter().filter_map(|i| items.get(i).cloned()).collect()

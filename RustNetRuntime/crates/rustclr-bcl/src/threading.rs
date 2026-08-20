@@ -20,6 +20,8 @@
 //! exclude, so `lock` is a no-op that keeps its own recursion count.
 
 use crate::support::*;
+#[allow(unused_imports)]
+use crate::prelude::*;
 use rustclr_core::{
     ByRef, ClrDelegate, ClrObject, ExecResult, ExecutionError, Interpreter, Value,
 };

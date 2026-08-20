@@ -10,6 +10,8 @@
 //! handler uses.
 
 use crate::support::*;
+#[allow(unused_imports)]
+use crate::prelude::*;
 use rustclr_core::{
     ByRef, ClrArray, ExecResult, ExecutionError, Interpreter, StructValue, Value,
 };

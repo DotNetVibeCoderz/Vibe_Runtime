@@ -31,8 +31,9 @@ public static class Program
             case "exceptions": return Report("exceptions", Exceptions(50000 * scale));
             case "fields": return Report("fields", FieldAccess(3000000 * scale));
             case "kernels": return Report("kernels", Kernels(60000 * scale));
+            case "inlined": return Report("inlined", Inlined(400000 * scale));
             default:
-                Console.WriteLine("workloads: noop fib sieve strings matrix sort alloc virtual exceptions fields");
+                Console.WriteLine("workloads: noop fib sieve strings matrix sort alloc virtual exceptions fields kernels inlined");
                 return 2;
         }
     }
@@ -66,6 +67,33 @@ public static class Program
         }
         return total;
     }
+
+    // ── Inlinable calls ─────────────────────────────────────────────────────
+    //
+    // The same integer arithmetic as `kernels`, but factored into small static
+    // leaves instead of written out longhand. Without the inliner the backend
+    // declines `Step` outright — it contains calls — and the whole workload is
+    // interpreted. With it, the leaves are spliced in and `Step` compiles.
+    //
+    // The point of measuring this separately: `kernels` was written to suit the
+    // backend's limits, and code in the wild is not.
+    private static long Inlined(int iterations)
+    {
+        long total = 0;
+        for (int i = 0; i < iterations; i++) { total += Step(i); }
+        return total;
+    }
+
+    private static int Step(int i)
+    {
+        return Mix2(Scale(i, 3), Scale(i + 1, 5)) + Clamp16(i * i) - Scale(i, 2);
+    }
+
+    private static int Scale(int v, int by) { return v * by + (v >> 1); }
+
+    private static int Clamp16(int v) { return v & 0xFFFF; }
+
+    private static int Mix2(int a, int b) { return (a ^ b) + (a & b) * 2; }
 
     private static long FibIterative(int n)
     {

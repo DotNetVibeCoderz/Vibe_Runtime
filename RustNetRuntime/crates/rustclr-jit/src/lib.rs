@@ -24,13 +24,20 @@
 //! AArch64 and RISC-V backends do not exist yet. `can_compile` reports what is
 //! actually handled rather than implying more.
 
+pub mod aarch64;
 pub mod codepage;
+pub mod inline;
+pub mod riscv64;
 pub mod tier;
+pub mod translate;
 pub mod verify;
 pub mod x64;
 
 pub use codepage::{CodePage, CodePageError};
 pub use verify::{analyse, MethodAnalysis, VerifyError, UNRESOLVED_CALL};
+pub use aarch64::Arm64Backend;
+pub use inline::inline_calls;
+pub use riscv64::RiscVBackend;
 pub use tier::JitTier;
 pub use x64::{NativeMethod, X64Backend};
 

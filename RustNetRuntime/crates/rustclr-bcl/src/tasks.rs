@@ -50,6 +50,9 @@ use rustclr_core::{
 };
 use rustclr_gc::Handle;
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 const TASKS: &str = "System.Threading.Tasks";
 const CS: &str = "System.Runtime.CompilerServices";
 
@@ -305,7 +308,7 @@ fn register_task(interp: &mut Interpreter) {
     });
     interp.register_native(key(&format!("{TASKS}.Task"), "Delay(int)"), |i, a| {
         let ms = arg_i32(i, a, 0)?.max(0) as u64;
-        std::thread::sleep(std::time::Duration::from_millis(ms));
+        sleep_millis(i, ms);
         let task = new_task(i, false);
         set_field(i, task, STATUS, Value::I32(COMPLETED));
         Ok(Some(Value::Obj(task)))

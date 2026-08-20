@@ -19,9 +19,24 @@ It does two things on the chip:
 | Reads a real assembly | `HelloWorld.dll`, built by Roslyn for `net10.0`, embedded in flash and parsed by `rustclr-metadata` |
 | Runs the collector | Allocates, builds a reference cycle, drops the root, collects, and fills a fixed heap to its ceiling |
 
-**It does not execute IL.** `rustclr-core` still needs `std` — a hash map, a
-clock, and a way to read an assembly. That gap is real and is stated in
-[docs/limitations.md](../../docs/limitations.md) rather than glossed over.
+**It executes IL**, and this is the board it was verified on. On the C3 the
+loader builds a type registry, RustBCL registers all 766 of its native
+bindings, and the interpreter runs `HelloWorld.Main` — printing the same bytes
+`dotnet` prints on a desktop, CRLF included, with the same instruction and call
+counts. Capture: [docs/logs/esp32c3-interpreter.log](../../docs/logs/esp32c3-interpreter.log).
+
+The old note here said `rustclr-core` needed "a hash map, a clock, and a way to
+read an assembly". Two of those three were shallow — the maps are keyed by
+types that are all `Ord`, so `BTreeMap` serves, and the clock was already
+behind the `Host` trait. Only reading a file was real, and an assembly on a
+chip arrives as bytes from flash.
+
+**The two chips reach the memory budget differently.** The C3 has one
+contiguous DRAM segment and 288 KB fits in it. The WROOM-32's `dram_seg` tops
+out at 176 KB, which is below even the reduced binding set — what rescues it is
+a second bank of 98,768 bytes past the ROM's data and stacks, which esp-hal
+exposes as `#[ram(reclaimed)]`. `esp-alloc` takes regions rather than one
+arena, so the firmware adds both.
 
 ---
 

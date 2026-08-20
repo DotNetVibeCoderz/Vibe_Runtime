@@ -9,7 +9,7 @@
 //! compiled methods return with their caller's registers destroyed.
 
 use rustclr_core::{CaptureHost, Interpreter};
-use rustclr_jit::JitTier;
+use rustclr_jit::{Compiler, JitTier, X64Backend};
 
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -94,4 +94,81 @@ fn declining_a_method_is_not_an_error() {
     // allocation, calls, exception handling, strings. Every one must fall back
     // to interpretation rather than failing the run.
     interp.run_entry_point(assembly).expect("declined methods are interpreted");
+}
+
+/// The point of the inliner: a method the backend used to decline is compiled
+/// now, and still produces the same answer.
+///
+/// Counting compiled methods across the whole fixture would be the obvious
+/// check and is a misleading one — inlining `Scale` into `Blend` means `Scale`
+/// is never *called*, so it never gets hot enough to compile, and the total
+/// can go down while the inliner is working perfectly. So this names the
+/// method and asks the backend about it directly.
+#[test]
+fn inlining_widens_what_the_backend_will_take() {
+    if !std::path::Path::new(FIXTURE).exists() {
+        eprintln!("skipping: conformance fixture not built");
+        return;
+    }
+    if !cfg!(target_arch = "x86_64") {
+        eprintln!("skipping: the x86-64 backend declines on this host");
+        return;
+    }
+
+    let mut interp = Interpreter::with_host(Box::new(CaptureHost::new()));
+    rustclr_bcl::install(&mut interp);
+    interp.loader.load_from_file(FIXTURE).expect("fixture loads");
+
+    // `Blend` calls two small static leaves and is otherwise pure integer
+    // arithmetic — the exact shape the inliner exists for.
+    let blend = (0..interp.loader.registry.method_count())
+        .map(|i| rustclr_core::MethodId(i as u32))
+        .find(|&id| interp.loader.registry.method(id).name == "Blend")
+        .expect("the fixture defines Blend");
+
+    let mut plain = X64Backend::new();
+    plain.inline = false;
+    assert!(
+        !plain.can_compile(&interp.loader.registry, blend),
+        "Blend contains calls, so without inlining the backend must decline it"
+    );
+
+    let mut inlining = X64Backend::new();
+    assert!(inlining.inline, "inlining is on by default");
+    assert!(
+        inlining.can_compile(&interp.loader.registry, blend),
+        "with inlining, Blend should get past the screen"
+    );
+    let compiled = inlining
+        .compile(&interp.loader, blend)
+        .expect("and should then actually emit");
+    assert!(!compiled.bytes.is_empty(), "no machine code came out");
+}
+
+/// Inlining must not change what the program prints.
+///
+/// The differential test above already compares compiled against interpreted;
+/// this compares compiled-with-inlining against compiled-without, which is the
+/// axis that would catch a bad argument order or a stale local index.
+#[test]
+fn inlining_does_not_change_the_answer() {
+    let output = |inline: bool| -> Option<String> {
+        if !std::path::Path::new(FIXTURE).exists() {
+            eprintln!("skipping: conformance fixture not built");
+            return None;
+        }
+        let mut interp = Interpreter::with_host(Box::new(CaptureHost::new()));
+        rustclr_bcl::install(&mut interp);
+        let mut tier = JitTier::with_threshold(1);
+        tier.set_inline(inline);
+        interp.native_tier = Some(Box::new(tier));
+        let assembly = interp.loader.load_from_file(FIXTURE).expect("fixture loads");
+        interp.run_entry_point(assembly).expect("fixture runs");
+        Some(interp.captured_output().unwrap_or_default())
+    };
+
+    let Some(plain) = output(false) else { return };
+    let Some(inlined) = output(true) else { return };
+    assert_eq!(plain, inlined, "inlining changed the program's output");
+    assert!(inlined.contains("failures=0"), "the fixture reported failures:\n{inlined}");
 }

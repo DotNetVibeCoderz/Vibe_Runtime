@@ -37,6 +37,9 @@ use rustclr_core::{
 };
 use rustclr_gc::Handle;
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 const GENERIC: &str = "System.Collections.Generic";
 
 pub fn register(interp: &mut Interpreter) {
@@ -212,7 +215,7 @@ pub fn value_hash(interp: &Interpreter, v: &Value) -> u64 {
         Value::Null => 0,
         Value::F(f) => {
             // A `double` that compares equal to an integer must hash with it.
-            if f.fract() == 0.0 && f.is_finite() && *f >= i64::MIN as f64 && *f <= i64::MAX as f64 {
+            if crate::fmath::fract(*f) == 0.0 && f.is_finite() && *f >= i64::MIN as f64 && *f <= i64::MAX as f64 {
                 mix(*f as i64 as u64)
             } else {
                 mix(f.to_bits())
@@ -442,7 +445,7 @@ fn sort_in_place(interp: &mut Interpreter, array: Handle) -> ExecResult<Option<V
             as_number(a)
                 .unwrap_or(0.0)
                 .partial_cmp(&as_number(b).unwrap_or(0.0))
-                .unwrap_or(std::cmp::Ordering::Equal)
+                .unwrap_or(core::cmp::Ordering::Equal)
         });
     } else if values
         .iter()
@@ -1413,8 +1416,8 @@ fn find_equals(interp: &Interpreter, type_id: TypeId) -> Option<MethodId> {
 fn compare_values(interp: &mut Interpreter, x: &Value, y: &Value) -> ExecResult<i32> {
     if let (Some(a), Some(b)) = (as_number(x), as_number(y)) {
         return Ok(match a.partial_cmp(&b) {
-            Some(std::cmp::Ordering::Less) => -1,
-            Some(std::cmp::Ordering::Greater) => 1,
+            Some(core::cmp::Ordering::Less) => -1,
+            Some(core::cmp::Ordering::Greater) => 1,
             _ => 0,
         });
     }
@@ -1428,9 +1431,9 @@ fn compare_values(interp: &mut Interpreter, x: &Value, y: &Value) -> ExecResult<
             ));
         };
         return Ok(match sa.cmp(&sb) {
-            std::cmp::Ordering::Less => -1,
-            std::cmp::Ordering::Greater => 1,
-            std::cmp::Ordering::Equal => 0,
+            core::cmp::Ordering::Less => -1,
+            core::cmp::Ordering::Greater => 1,
+            core::cmp::Ordering::Equal => 0,
         });
     }
     Err(invalid_operation(

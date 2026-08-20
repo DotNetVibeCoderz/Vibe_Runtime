@@ -19,8 +19,11 @@ use rustclr_metadata::{
     method_attributes, method_impl_attributes, Image, MethodSig, SignatureParser, TableId, Token,
     TypeSig,
 };
-use std::collections::HashMap;
+#[cfg(feature = "std")]
 use std::path::{Path, PathBuf};
+
+#[allow(unused_imports)]
+use crate::prelude::*;
 
 /// The static slot holding the cached `Default` instance of a comparer.
 ///
@@ -49,6 +52,9 @@ pub struct LoadedAssembly {
     pub id: AssemblyId,
     pub name: String,
     pub version: String,
+    /// Where it was loaded from. There is no filesystem without `std`, so
+    /// on a microcontroller an assembly arrives as bytes and has no path.
+    #[cfg(feature = "std")]
     pub path: Option<PathBuf>,
     /// Copy of the `#US` heap, so `ldstr` needs no live metadata borrow.
     pub user_strings: Vec<u8>,
@@ -112,6 +118,7 @@ pub struct Loader {
     pub registry: TypeRegistry,
     assemblies: Vec<LoadedAssembly>,
     by_name: HashMap<String, AssemblyId>,
+    #[cfg(feature = "std")]
     search_paths: Vec<PathBuf>,
     primitives: HashMap<Primitive, TypeId>,
     core: CoreTypes,
@@ -131,6 +138,7 @@ impl Loader {
             registry: TypeRegistry::new(),
             assemblies: Vec::new(),
             by_name: HashMap::new(),
+            #[cfg(feature = "std")]
             search_paths: Vec::new(),
             primitives: HashMap::new(),
             // Placeholder; replaced by `install_core_types` below.
@@ -162,6 +170,7 @@ impl Loader {
         self.bcl
     }
 
+    #[cfg(feature = "std")]
     pub fn add_search_path(&mut self, path: impl Into<PathBuf>) {
         self.search_paths.push(path.into());
     }
@@ -207,6 +216,7 @@ impl Loader {
             id: bcl,
             name: "RustBCL".into(),
             version: "0.1.0.0".into(),
+            #[cfg(feature = "std")]
             path: None,
             user_strings: Vec::new(),
             type_by_row: HashMap::new(),
@@ -1009,6 +1019,7 @@ impl Loader {
     // -- assembly loading ----------------------------------------------------
 
     /// Loads an assembly from disk, or returns the id if already loaded.
+    #[cfg(feature = "std")]
     pub fn load_from_file(&mut self, path: impl AsRef<Path>) -> ExecResult<AssemblyId> {
         let path = path.as_ref();
         let image = Image::from_file(path).map_err(ExecutionError::Metadata)?;
@@ -1041,6 +1052,7 @@ impl Loader {
             id,
             name: name.clone(),
             version,
+            #[cfg(feature = "std")]
             path: image.path().map(|p| p.to_path_buf()),
             user_strings: md.user_strings.0.to_vec(),
             type_by_row: HashMap::new(),

@@ -8,7 +8,7 @@ the assistant against a live LLM — produce byte-identical output on RustCLR an
 .NET.
 
 ```
-Conformance    IDENTICAL — checks=134 failures=0
+Conformance    IDENTICAL — checks=136 failures=0
 ModernSyntax   IDENTICAL — checks=35 failures=0
 UserDirectory  IDENTICAL
 PrimeSieve     IDENTICAL   (written by Jack from a prompt)
@@ -24,11 +24,38 @@ SensorGateway  IDENTICAL   (edited by Jack from a prompt)
 | `rustclr-metadata` | PE/COFF + ECMA-335 reader, signatures, IL bodies | 27 tests, incl. 9 against a real Roslyn-built assembly |
 | `rustclr-gc` | Handle-based heap, pluggable collectors, mark-sweep | 10 tests; 200k-deep graph marks without stack overflow |
 | `rustclr-core` | Type system, loader, IL interpreter, exception handling | 18 tests |
-| `rustclr-bcl` | Native BCL: Console, String, Math, interpolation, tuples, ranges, Nullable, generic collections, LINQ, Task and async, reflection | 20 unit + 8 integration; 757 bindings |
+| `rustclr-bcl` | Native BCL: Console, String, Math, interpolation, tuples, ranges, Nullable, generic collections, LINQ, Task and async, reflection | 20 unit + 8 integration; 766 bindings |
 | `rustclr-sched` | Lock-free MS queue, MPMC channel, thread pool | 16 tests |
 | `rustclr-interop` | P/Invoke, dynamic loading, marshalling | 9 tests; calls the real `GetCurrentProcessId` |
 | `rustclr-jit` | Compiler trait, IL verifier, analysis, **x86-64 code generator**, W^X pages, tiering | 25 unit + 3 differential |
 | `rustnet-cli` | `run` / `info` / `disasm` / `verify` / `build` / `capabilities` | Drives every fixture |
+
+### Five board firmwares, one demonstration
+
+`embedded/demo-common` holds the on-chip report and each firmware supplies a
+`core::fmt::Write` to receive it. That refactor was the point of adding the
+fourth and fifth boards: "they all print the same thing" is only true if there
+is one copy of it, and four copies would have drifted.
+
+| Board | Core | Target | State |
+| --- | --- | --- | --- |
+| ESP32-WROOM-32 | Xtensa LX6 | `xtensa-esp32-none-elf` | run on hardware |
+| ESP32-C3 | RISC-V 32 | `riscv32imc-unknown-none-elf` | run on hardware |
+| Meadow F7 Micro | Arm Cortex-M7 | `thumbv7em-none-eabihf` | run on hardware |
+| Raspberry Pi Pico | Arm Cortex-M0+ | `thumbv6m-none-eabi` | builds; **not yet flashed** |
+| Sipeed Maix Go | RISC-V 64 | `riscv64gc-unknown-none-elf` | builds; **not yet flashed** |
+
+`tests/firmware.sh` builds all five. That catches a class `tests/embedded.sh`
+cannot: a change to a shared type breaks a board firmware long before it breaks
+the host build, and otherwise nobody notices until they reach for the hardware.
+
+**Two facts worth not rediscovering**, both taken from the sibling RustNet ports
+rather than worked out again. The RP2040's ROM checks a CRC over the first 256
+bytes of flash, so the second-stage bootloader is taken prebuilt — a wrong CRC
+is a board that silently returns to BOOTSEL. And the K210 derives its UART baud
+straight from the core clock, so the firmware *reads* PLL0 and the clock
+selector rather than assuming 26 MHz; assuming would give a port that opens and
+prints noise.
 
 ### The bare-metal crates actually build now
 
@@ -81,13 +108,59 @@ reading**. The first build printed on enumeration and lost most of its report
 into an endpoint nothing was draining. It now waits for `DTR` — a terminal
 actually opening the port — and reports once per session.
 
-**IL did not execute there**, and that distinction matters. The chip can read a
-.NET assembly and manage a heap; it cannot yet run a method, because
-`rustclr-core` still needs `std`.
-
 Two bugs stood between "compiles" and "runs": the metadata crate's `use alloc::…`
 reached only `lib.rs`, and `Image` was gated on `std` in its entirety when only
 `from_file` and `path()` need a filesystem.
+
+### The interpreter runs on the chip
+
+**C# executes on an ESP32-C3** — RISC-V, 400 KB of SRAM, no operating system.
+The loader builds a type registry, RustBCL registers all 766 of its native
+bindings, and `HelloWorld.Main` prints the same three lines `dotnet` prints,
+CRLF included, with the same 68 IL instructions and 6 calls:
+[docs/logs/esp32c3-interpreter.log](docs/logs/esp32c3-interpreter.log).
+
+**The blocker was written down wrong.** The note here said `rustclr-core`
+needed "a hash map, a clock and file IO", and that had gone unchallenged for
+three milestones. Two thirds of it was false: every map key in the runtime is
+an integer id, a tuple of them, or a name — all `Ord`, so `BTreeMap` serves
+without `std` — and the clock had been behind the `Host` trait since the trait
+existed. Only the filesystem was real, and it is now the one thing gated.
+`rustclr-bcl` went the same way: 20 of its 24 `std::` paths were
+`std::cmp::Ordering`.
+
+Two differences are genuine rather than cosmetic:
+
+* **`Arc` becomes `Rc` without `std`.** RISC-V `imc` has no atomics extension,
+  so `Arc` does not exist on the ESP32-C3 at all. `Rc` is correct there anyway:
+  the interpreter is single-threaded on a chip.
+* **Float maths comes from `libm`.** `core` has no `sqrt`, no `sin`, not even
+  `abs` for `f64`, and `System.Math` is largely a libm. This is the only
+  external dependency anywhere in the runtime; it is optional and a default
+  build does not pull it in.
+
+**The memory budget is the whole story on these boards**, and guessing at it
+wasted two flash cycles. The first attempt asked for a single 98,304-byte
+allocation and died — `Heap::embedded(4096)` reserves its slot table up front,
+deliberately, and 4,096 was a number I picked rather than measured. The second
+died inside `rustclr_bcl::install` at 192 KB. Measuring it with a counting
+allocator settled it: **260,702 bytes** peak with every binding, **192,045**
+with console, strings and maths only. `Tier::for_budget` now compares a board's
+heap against those, and a board that clears neither says so in a line of text
+instead of faulting inside the allocator.
+
+**The WROOM-32 needed two heap regions**, which is the most transferable thing
+here. Its `dram_seg` tops out at 176 KB — found by bisecting until the link
+succeeded — below even the reduced set. The ESP32 has a second bank of 98,768
+bytes past the ROM's data and stacks that the linker will not put ordinary
+statics in; `esp-alloc` takes regions rather than one arena, so the firmware
+adds both and reaches 272 KB. A single allocation cannot span them, and the
+largest the runtime makes is 67,584 bytes, which clears either.
+
+**Sizing the heap as a static array is what made these failures cheap.** Asking
+the C3 for 320 KB produces `.bss will not fit in region DRAM, overflowed by
+13844 bytes` at link time. A dynamically grown heap would have found the same
+limit as a hard fault on the wire.
 
 ### Reflection works on real Type objects
 
@@ -121,14 +194,47 @@ after 32 calls; everything the backend declines is interpreted exactly as
 before.
 
 **What it is worth.** On the `kernels` benchmark, which is the shape the backend
-covers: 2484 ms interpreted, 232 ms compiled — **10.7× faster**, and 1.6× .NET
-rather than 17.5×.
+covers: 2971 ms interpreted, 269 ms compiled — **11.0× faster**, and 1.8× .NET
+rather than 20×.
+
+**Then inlining, and a second benchmark to measure it honestly.** A `call` used
+to disqualify a method outright, which meant the backend only took code written
+to suit it. `crates/rustclr-jit/src/inline.rs` splices branch-free static
+callees into their callers — one level, arguments spilled to fresh locals,
+`ldarg.N` rewritten to `ldloc`, the trailing `ret` dropped. The `inlined`
+workload is the same arithmetic as `kernels` factored into helpers:
+
+| | interpreted | compiled, `--no-inline` | compiled |
+| --- | ---: | ---: | ---: |
+| `inlined` | 1629 ms | 1148 ms | **400 ms** |
+
+**2.9× of that is the inliner alone**, and it is worth exactly 1.0× on
+`kernels`, whose callees all contain loops. Adding `--no-inline` was what made
+the claim checkable rather than asserted — the same reasoning that produced
+`--no-jit`.
+
+**A bug worth recording: synthetic offsets do not work.** The first design gave
+spliced instructions offsets in a high range (`0x8000_0000+`) so the caller's
+offsets would never need renumbering. It was wrong. `analyse` reaches an
+instruction's successor as `offset + length`, so the chain broke at each splice
+boundary, `depth_at` came back sparse, and the translator read a missing entry
+as depth zero — surfacing as `attempt to subtract with overflow` at
+`translate.rs:416`, nowhere near the cause. The fix was to stop pretending
+offsets are byte positions: renumber the whole stream one instruction per
+offset and remap branch targets through a table. Nothing downstream cares,
+because everything downstream treats offsets as identifiers.
+
+**A metric that lied, caught by writing it down.** The first test asserted that
+inlining compiles *more* methods across the fixture. It failed at 9 vs 10 — and
+the inliner was working. Inlining `Scale` into `Blend` means `Scale` is never
+called, so it never gets hot enough to compile, and the total goes *down*. The
+test now names `Blend` and asks the backend about it directly.
 
 **What it does not cover, and why that matters.** Running `rustnet jit` on the
-existing benchmark suite compiles *nothing*: every workload there uses arrays or
-calls. That is a real finding, not a footnote — the backend's reach is narrow,
-and the honest way to show it was to add a workload of the covered shape beside
-the others rather than in place of them.
+existing benchmark suite still compiles nothing outside those two workloads:
+every other one uses arrays. That is a real finding, not a footnote — the
+backend's reach is narrow, and the honest way to show it was to add workloads of
+the covered shape beside the others rather than in place of them.
 
 The next step is arrays, and it is a real one. Handles are not pointers, so
 reading `a[i]` from machine code means resolving a handle through the handle
@@ -339,17 +445,21 @@ Ordered as in [Plan.md](Plan.md):
    runs its body inline. `rustclr-sched` has the substrate; what is missing is a
    re-entrant interpreter several OS threads can drive at once. TPL
    (`Parallel.For`) and `await using` are unimplemented.
-3. **Native code generation beyond leaf integer methods** — the x86-64 backend
-   exists and is 10.7× faster where it applies, but it declines anything using
-   arrays, calls, allocation or exception handling, which is most of a real
-   program. Arrays are the next piece; AArch64, RISC-V and inlining are untouched.
+3. **Native code generation beyond integer methods** — the x86-64 backend is
+   11.0× faster where it applies, and inlining widened "where" to include
+   methods that call small helpers. It still declines anything using arrays,
+   allocation or exception handling, which is most of a real program. Arrays are
+   the next piece. The AArch64 and RISC-V backends emit and disassemble
+   correctly but **have never executed a single instruction** — running them
+   needs hardware this host is not.
 4. **Reflection breadth** — `PropertyInfo` accessors, `MethodInfo` parameter
    lists, `Assembly`/`Module` enumeration, and constructing generic types at run
    time. Types, members, invocation and attributes all work.
-5. **IL execution on hardware** — the metadata reader and collector run on an
-   ESP32; the interpreter does not, because `rustclr-core` still needs a hash
-   map, a clock and file IO. Ahead-of-time compilation additionally needs Arm
-   and RISC-V backends.
+5. **IL execution on more hardware** — an ESP32-C3 runs the interpreter with
+   the whole of RustBCL. The other four board images build but have not been
+   flashed since; the Pico clears only the reduced binding set, and no board
+   was connected for it or the K210. Ahead-of-time compilation additionally
+   needs the Arm and RISC-V backends to actually execute.
 6. **Exception filters** — `catch when` is treated as non-matching.
 
 `rustnet capabilities` prints this from the runtime itself, and

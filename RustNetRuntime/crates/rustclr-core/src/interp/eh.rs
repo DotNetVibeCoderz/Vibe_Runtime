@@ -13,6 +13,9 @@
 
 use super::*;
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 impl Interpreter {
     /// Turns a thrown object into a propagating error.
     pub(super) fn exception_from_handle(&mut self, handle: Handle) -> ExecutionError {

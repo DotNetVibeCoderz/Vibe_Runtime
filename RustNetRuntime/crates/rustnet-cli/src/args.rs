@@ -19,6 +19,8 @@ pub enum Command {
         jit: bool,
         /// Calls before a method is compiled; `None` uses the backend default.
         jit_threshold: Option<u32>,
+        /// Splice small static callees into their callers. On by default.
+        inline: bool,
     },
     /// Summarise an assembly's metadata.
     Info { assembly: String, verbose: bool },
@@ -67,6 +69,7 @@ pub fn parse(argv: &[String]) -> Result<Command, ParseError> {
             let mut max_instructions = None;
             let mut jit = true;
             let mut jit_threshold = None;
+            let mut inline = true;
             let mut rest = argv[1..].iter();
 
             while let Some(a) = rest.next() {
@@ -74,6 +77,7 @@ pub fn parse(argv: &[String]) -> Result<Command, ParseError> {
                     "--stats" => stats = true,
                     "--trace" => trace = true,
                     "--no-jit" => jit = false,
+                    "--no-inline" => inline = false,
                     "--jit-threshold" => {
                         let v = rest.next().ok_or_else(|| {
                             ParseError("--jit-threshold needs a value".into())
@@ -109,6 +113,7 @@ pub fn parse(argv: &[String]) -> Result<Command, ParseError> {
                 max_instructions,
                 jit,
                 jit_threshold,
+                inline,
             })
         }
 
@@ -182,10 +187,11 @@ USAGE
 
 COMMANDS
     run <assembly> [--stats] [--trace] [--max-instructions N]
-                   [--no-jit] [--jit-threshold N] [-- args...]
+                   [--no-jit] [--no-inline] [--jit-threshold N] [-- args...]
         Execute an assembly's entry point on RustCLR. Hot methods the code
         generator can take are compiled to machine code; --no-jit interprets
-        everything, which must produce identical output.
+        everything and --no-inline compiles without splicing small callees.
+        All three must produce identical output.
 
     info <assembly> [--verbose]
         Summarise types, methods and references.

@@ -8,6 +8,20 @@ authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["std"]
+std = ["rustclr-core/std", "rustclr-gc/std"]
+# Float maths from libm instead of std. Enable together with no-default-features.
+libm-math = ["dep:libm"]
+
 [dependencies]
-rustclr-core.workspace = true
-rustclr-gc.workspace = true
+# Paths rather than `workspace = true`: a workspace dependency forces default
+# features on, and RustBCL has to be buildable without `std`.
+rustclr-core = { path = "../rustclr-core", version = "0.1.0", default-features = false }
+rustclr-gc = { path = "../rustclr-gc", version = "0.1.0", default-features = false }
+
+# The one external dependency anywhere in the runtime, and it is optional.
+# `System.Math` is most of a libm, and `core` has no transcendental functions,
+# so without this a chip would have a `Math` class that cannot take a square
+# root. A default (`std`) build does not pull it in.
+libm = { version = "0.2", optional = true }

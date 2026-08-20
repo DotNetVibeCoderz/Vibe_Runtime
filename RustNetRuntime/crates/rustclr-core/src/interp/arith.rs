@@ -5,7 +5,10 @@
 //! division by zero throws rather than trapping.
 
 use super::*;
-use std::cmp::Ordering;
+use core::cmp::Ordering;
+
+#[allow(unused_imports)]
+use crate::prelude::*;
 
 /// The common type two operands are promoted to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

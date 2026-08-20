@@ -35,7 +35,7 @@ Run the test suite to confirm the build is sound:
 cargo test --workspace
 ```
 
-You should see 141 tests pass.
+You should see 163 tests pass.
 
 ---
 
@@ -76,7 +76,7 @@ dotnet bin/Release/net10.0/Conformance.dll
 rustnet run bin/Release/net10.0/Conformance.dll
 ```
 
-Both print `checks=134 failures=0`. If they ever differ, that is a runtime bug
+Both print `checks=136 failures=0`. If they ever differ, that is a runtime bug
 and the differing check names it. `tests/fixtures/ModernSyntax/` is the same
 idea for modern C# features and prints `checks=35 failures=0`.
 

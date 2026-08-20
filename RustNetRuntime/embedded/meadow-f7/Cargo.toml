@@ -11,8 +11,7 @@ publish = false
 [workspace]
 
 [dependencies]
-rustclr-metadata = { path = "../../crates/rustclr-metadata", default-features = false }
-rustclr-gc = { path = "../../crates/rustclr-gc", default-features = false }
+rustclr-demo-common = { path = "../demo-common" }
 
 cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
 cortex-m-rt = "0.7"

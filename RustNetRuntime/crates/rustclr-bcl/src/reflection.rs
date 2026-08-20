@@ -31,6 +31,9 @@ use rustclr_core::{
 };
 use rustclr_gc::Handle;
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 const REFLECT: &str = "System.Reflection";
 
 /// Leaks a stable key string; the native table holds it for the process life.

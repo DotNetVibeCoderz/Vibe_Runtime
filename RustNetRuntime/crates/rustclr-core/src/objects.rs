@@ -3,7 +3,10 @@
 use crate::types::{MethodId, Primitive, TypeId};
 use crate::value::Value;
 use rustclr_gc::{GcObject, Handle, Tracer};
-use std::any::Any;
+use core::any::Any;
+
+#[allow(unused_imports)]
+use crate::prelude::*;
 
 /// An instance of a reference type: a type id plus its instance-field slots.
 #[derive(Debug)]

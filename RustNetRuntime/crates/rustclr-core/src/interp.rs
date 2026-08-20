@@ -11,7 +11,9 @@
 //! interpreted body for native code behind the same interface.
 
 use crate::error::{ClrExceptionKind, ExecResult, ExecutionError};
-use crate::host::{Host, SystemHost};
+use crate::host::Host;
+#[cfg(feature = "std")]
+use crate::host::SystemHost;
 use crate::loader::Loader;
 use crate::objects::*;
 use crate::opcode::{decode_all, Instruction, Op, Operand};
@@ -19,8 +21,10 @@ use crate::types::*;
 use crate::value::{ByRef, StructValue, Value};
 use rustclr_gc::{Handle, Heap, RootSet};
 use rustclr_metadata::{ExceptionClause, HandlerKind, Token, TypeSig};
-use std::collections::HashMap;
-use std::sync::Arc;
+
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 
 /// A method decoded and prepared for execution.
 #[derive(Debug)]
@@ -200,6 +204,7 @@ pub struct Interpreter {
     current_native: Option<MethodId>,
 }
 
+#[cfg(feature = "std")]
 impl Default for Interpreter {
     fn default() -> Self {
         Self::new()
@@ -207,6 +212,12 @@ impl Default for Interpreter {
 }
 
 impl Interpreter {
+    /// An interpreter on real stdio and the system clock.
+    ///
+    /// Needs `std`, because [`SystemHost`] does. Without it, construct one with
+    /// [`Interpreter::with_host`] and a host of your own — which is what the
+    /// board firmwares do.
+    #[cfg(feature = "std")]
     pub fn new() -> Self {
         Self::with_host(Box::new(SystemHost::new()))
     }
@@ -555,7 +566,7 @@ impl Interpreter {
         };
 
         let instructions = decode_all(&body.il)?;
-        let mut index_of_offset = HashMap::with_capacity(instructions.len() + 1);
+        let mut index_of_offset = HashMap::new();
         for (i, ins) in instructions.iter().enumerate() {
             index_of_offset.insert(ins.offset, i);
         }

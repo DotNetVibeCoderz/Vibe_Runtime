@@ -25,6 +25,9 @@ use crate::support::*;
 use rustclr_core::{ByRef, ClrString, ExecResult, ExecutionError, Interpreter, Value};
 use rustclr_gc::Handle;
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 const TYPE: &str = "System.Runtime.CompilerServices.DefaultInterpolatedStringHandler";
 
 pub fn register(interp: &mut Interpreter) {

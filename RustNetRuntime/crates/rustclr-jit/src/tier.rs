@@ -48,6 +48,11 @@ impl JitTier {
         }
     }
 
+    /// Whether the backend inlines small callees. See [`X64Backend::inline`].
+    pub fn set_inline(&mut self, inline: bool) {
+        self.backend.inline = inline;
+    }
+
     pub fn compiled_count(&self) -> usize {
         self.compiled.len()
     }

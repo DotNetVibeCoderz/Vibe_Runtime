@@ -18,17 +18,18 @@ process start.
 
 | Workload | .NET (ms) | RustCLR (ms) | Ratio | What it stresses |
 | --- | ---: | ---: | ---: | --- |
-| `noop` | 126 | **65** | **0.5×** | Process start — nothing else |
-| `exceptions` | 125 | **128** | **1.0×** | 50k throws through `try`/`catch`/`finally` |
-| `strings` | 134 | **176** | **1.3×** | 20k concatenations, `Length`, `IndexOf` |
-| `fib` | 119 | 427 | 3.6× | Recursive call overhead, fib(27) |
-| `alloc` | 119 | 992 | 8.3× | 300k allocations with collection pressure |
-| `sieve` | 114 | 1,187 | 10.4× | 1M-element sieve: array writes in a tight loop |
-| `matrix` | 110 | 1,305 | 11.9× | 120×120 multiply: floating-point array maths |
-| `virtual` | 110 | 1,632 | 14.8× | 2M virtual calls through a base reference |
-| `sort` | 120 | 2,242 | 18.7× | Quicksort over 200k ints |
-| `fields` | 144 | 2,764 | 19.2× | 3M instance field reads and writes |
-| `kernels` | 126 | **232** | **1.8×** | Integer kernels in leaf methods — **compiled to machine code** |
+| `noop` | 108 | **62** | **0.6×** | Process start — nothing else |
+| `exceptions` | 130 | **111** | **0.9×** | 50k throws through `try`/`catch`/`finally` |
+| `kernels` | 149 | **268** | **1.8×** | Integer arithmetic written longhand — **compiled** |
+| `strings` | 96 | **190** | **2.0×** | 20k concatenations, `Length`, `IndexOf` |
+| `inlined` | 106 | **310** | **2.9×** | The same arithmetic in helpers — **compiled, inlined** |
+| `fib` | 108 | 442 | 4.1× | Recursive call overhead, fib(27) |
+| `alloc` | 112 | 1,014 | 9.1× | 300k allocations with collection pressure |
+| `sieve` | 107 | 1,287 | 12.0× | 1M-element sieve: array writes in a tight loop |
+| `matrix` | 110 | 1,470 | 13.4× | 120×120 multiply: floating-point array maths |
+| `virtual` | 115 | 1,788 | 15.5× | 2M virtual calls through a base reference |
+| `sort` | 122 | 2,460 | 20.2× | Quicksort over 200k ints |
+| `fields` | 111 | 2,943 | 26.5× | 3M instance field reads and writes |
 
 Every row's checksum is compared between the two runtimes before it is timed. A
 mismatch prints `MISMATCH` instead of a number — a benchmark that computed a
@@ -48,19 +49,42 @@ That is what interpretation costs. .NET compiles IL to machine code; RustCLR
 walks it instruction by instruction — around 33 million IL instructions per
 second on this machine.
 
-**Except where the code generator reaches.** `kernels` is the one workload whose
-shape the x86-64 backend takes: integer arithmetic in leaf methods that call
-nothing and allocate nothing. Compiled, it runs in 232 ms against 2,484 ms
-interpreted — **10.7× faster**, moving it from 17.5× slower than .NET to 1.6×.
+**Except where the code generator reaches.** Two rows are compiled to machine
+code rather than interpreted, and they are deliberately the same arithmetic
+written two ways.
 
-Every other row is unchanged by the JIT, because every other row uses arrays or
-calls and `rustnet jit` declines them all. That is why `kernels` was added
-*beside* the existing workloads rather than replacing one: the interesting
-number is not just what compilation is worth where it applies, but how narrow
-"where it applies" currently is.
+`kernels` writes it out longhand, in methods that call nothing and allocate
+nothing — the shape the backend has always taken. Compiled it runs in 269 ms
+against 2,971 ms interpreted: **11.0× faster**, moving it from 20× slower than
+.NET to 1.8×.
+
+`inlined` factors the identical arithmetic into small static helpers, which is
+what code in the wild actually looks like. Every one of those calls used to
+disqualify the calling method outright. With the inliner splicing them in:
+
+| | interpreted | compiled, `--no-inline` | compiled |
+| --- | ---: | ---: | ---: |
+| `inlined` | 1,629 ms | 1,148 ms | **400 ms** |
+
+**2.9× of that is the inliner alone.** Without it, only the leaf helpers compile
+and the method around them stays interpreted. Inlining is worth nothing at all
+on `kernels` — 1.0×, because its callees contain loops and none are eligible —
+and that contrast is the point. The gain is not in compiling more instructions;
+it is in compiling code that was written normally.
+
+Every other row is unchanged by the JIT, because every other row uses arrays and
+`rustnet jit` declines them all. That is why these two were added *beside* the
+existing workloads rather than replacing one: the interesting number is not just
+what compilation is worth where it applies, but how narrow "where it applies"
+still is.
 
 ```bash
 rustnet jit benchmarks/Benchmarks/bin/Release/net10.0/Benchmarks.dll
+
+# The two figures above, isolated:
+rustnet run --no-jit    …/Benchmarks.dll -- inlined   # interpreted
+rustnet run --no-inline …/Benchmarks.dll -- inlined   # compiled, nothing spliced
+rustnet run            …/Benchmarks.dll -- inlined    # compiled and inlined
 ```
 
 **RustCLR starts in half the time.** Its tiering compiles nothing until a method

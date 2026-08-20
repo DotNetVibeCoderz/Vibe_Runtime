@@ -13,10 +13,18 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 cd "$ROOT" || exit 1
 
-# The crates that are meant to work without an operating system. `rustclr-core`
-# is deliberately absent: it needs `HashMap`, file IO and a clock, and listing
-# it here would make this script assert something untrue.
-CRATES="${CRATES:-rustclr-metadata rustclr-gc}"
+# The crates that are meant to work without an operating system.
+#
+# `rustclr-core` and `rustclr-bcl` were deliberately absent here for a long
+# time — the note said they needed `HashMap`, file IO and a clock. Two of those
+# three turned out to be shallow: the maps are keyed by types that are all
+# `Ord`, so `BTreeMap` serves without `std`, and the clock was already behind
+# the `Host` trait. Only the filesystem was real, and `load_from_file` is now
+# the only thing gated on `std`.
+#
+# `rustnet-cli` and `rustclr-jit` are not here and are not meant to be: one is
+# a command-line program and the other maps executable pages.
+CRATES="${CRATES:-rustclr-metadata rustclr-gc rustclr-core rustclr-bcl}"
 
 TARGETS="${TARGETS:-thumbv7em-none-eabihf thumbv6m-none-eabi riscv32imc-unknown-none-elf riscv64gc-unknown-none-elf}"
 
@@ -33,7 +41,11 @@ for target in $TARGETS; do
     continue
   fi
   for crate in $CRATES; do
-    if cargo build -p "$crate" --no-default-features --target "$target" >/tmp/embedded.$$ 2>&1; then
+    # RustBCL takes its float maths from libm when there is no std to take it
+    # from; without this `System.Math` would not build.
+    extra=""
+    [[ "$crate" == "rustclr-bcl" ]] && extra="--features libm-math"
+    if cargo build -p "$crate" --no-default-features $extra --target "$target" >/tmp/embedded.$$ 2>&1; then
       printf '%-34s %-20s %s\n' "$target" "$crate" "ok"
     else
       printf '%-34s %-20s %s\n' "$target" "$crate" "FAILED"
