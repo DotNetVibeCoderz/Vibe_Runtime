@@ -87,13 +87,24 @@ impl Heap {
     }
 
     /// A heap tuned for microcontroller targets.
+    ///
+    /// The capacity is a **hard ceiling**, not a hint: allocation past it
+    /// fails rather than growing. That is the whole point on a device whose
+    /// RAM was budgeted up front — a heap that quietly grows has not been
+    /// bounded at all. Use [`Self::try_alloc`] there, and treat `None` as the
+    /// out-of-memory condition it is.
     pub fn embedded(slot_capacity: usize) -> Self {
         Self {
-            space: ObjectSpace::with_capacity(slot_capacity),
+            space: ObjectSpace::fixed(slot_capacity),
             collector: Box::new(MarkSweep::embedded()),
             bytes_since_collection: 0,
             stats: GcStats::default(),
         }
+    }
+
+    /// The slot ceiling, if this heap has one.
+    pub fn slot_limit(&self) -> Option<usize> {
+        self.space.limit()
     }
 
     /// A heap with a caller-supplied policy.
@@ -120,6 +131,22 @@ impl Heap {
     /// This never collects on its own — collection needs the root set, which
     /// only the runtime can supply. Call [`Heap::should_collect`] after
     /// allocating and run [`Heap::collect`] at a safe point.
+    /// Allocates, or reports that a fixed heap is full.
+    ///
+    /// Returns `None` only for a heap built by [`Self::embedded`]. A caller
+    /// that gets `None` should collect and try again; if it still fails, the
+    /// heap really is exhausted.
+    pub fn try_alloc<T: GcObject>(&mut self, object: T) -> Option<Handle> {
+        let size = object.size_hint();
+        let handle = self.space.try_alloc(Box::new(object))?;
+        self.bytes_since_collection += size;
+        self.stats.total_allocations += 1;
+        self.stats.total_bytes_allocated += size as u64;
+        self.stats.peak_live_bytes = self.stats.peak_live_bytes.max(self.space.live_bytes());
+        self.stats.peak_live_count = self.stats.peak_live_count.max(self.space.live_count());
+        Some(handle)
+    }
+
     pub fn alloc<T: GcObject>(&mut self, object: T) -> Handle {
         let size = object.size_hint();
         let handle = self.space.alloc(Box::new(object));

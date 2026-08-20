@@ -125,33 +125,84 @@ noisy, but correct — rather than swallowing it, which would be silently wrong.
 
 ---
 
-## There is no native code generator
+## The native code generator only takes leaf integer methods
 
-**What happens:** every method is interpreted. `rustclr-jit` provides the
-`Compiler` trait, the IL verifier and basic-block analysis, but
-`InterpreterTier` is the only implementation and it reports every method as
-interpreted.
+**What happens:** most methods are still interpreted. The x86-64 backend
+compiles a method only when it makes no calls, allocates nothing, has no
+exception handling, and works entirely in integers — arguments, locals, results
+and every intermediate value.
 
-**What this costs:** roughly 1.8 million IL instructions per second on the
-conformance suite. Fine for scripts, tools and IoT control loops; not fine for
-anything numerically heavy.
+That is narrow on purpose: a partial backend that is honest about its reach is
+useful immediately, and everything it declines runs exactly as it did before.
 
-The tiering design already accounts for a partial backend —
-`Compiler::can_compile` decides per method, so the first emitter only has to
-handle leaf integer methods to be useful. This is [Milestone 4](../Plan.md).
+```bash
+rustnet jit <assembly>     # what compiles, and why the rest does not
+rustnet run --no-jit …     # interpret everything; output must be identical
+```
+
+**What it is worth where it applies.** The `kernels` benchmark — integer
+arithmetic in leaf methods — runs in 2484 ms interpreted and 232 ms compiled:
+**10.7× faster**, which moves it from 17.5× slower than .NET to 1.6×.
+
+**What it does not reach.** Every other workload in the benchmark suite. They
+use arrays and calls, so `rustnet jit` compiles none of them and the figures are
+unchanged. The immediate blocker is arrays: handles here are not pointers, so
+reading `a[i]` from machine code means resolving a handle through the handle
+table, which needs a call back into the runtime and therefore a calling
+convention the backend does not have yet.
+
+**Not implemented at all:** AArch64 and RISC-V backends, and inlining — the
+`is_inline_candidate` analysis exists and nothing consumes it.
+
+**Code memory is write-xor-execute.** A page is mapped readable and writable,
+filled, and only then flipped to readable and executable. It is never both at
+once. In an environment that forbids executable mappings outright, compilation
+fails and everything is interpreted.
+
+This is [Milestone 4](../Plan.md).
 
 ---
 
-## Reflection is minimal
+## Reflection works, except for attributes
 
-`GetType()` returns a type *name*, not a `System.Type` object. There is no
-member enumeration, no attribute reading, no `Activator.CreateInstance`.
+**What works.** `System.Type` is a real object, interned one per runtime type,
+so `typeof(T) == typeof(T)` is reference equality as .NET guarantees.
 
-`ldtoken` pushes the raw metadata token, which is enough for
-`RuntimeHelpers.InitializeArray` — the mechanism behind `new int[] { 1, 2, 3 }` —
-but not for anything that inspects types at run time.
+```csharp
+Type t = value.GetType();
+Console.WriteLine(t.Name + " : " + t.BaseType.Name);
+foreach (FieldInfo f in t.GetFields()) Console.WriteLine(f.Name);
+MethodInfo m = t.GetMethod("Compute");
+object result = m.Invoke(value, new object[] { 21 });
+object made = Activator.CreateInstance(typeof(Widget));
+```
 
-This is [Milestone 5](../Plan.md).
+All of that runs: names and namespaces, base types, the `IsValueType` /
+`IsClass` / `IsInterface` / `IsEnum` / `IsArray` / `IsPrimitive` / `IsAbstract` /
+`IsSealed` family, `IsAssignableFrom`, `IsInstanceOfType`, member enumeration,
+`MethodInfo.Invoke`, `FieldInfo` get and set, and `Activator.CreateInstance`. A
+boxed value reports the type it holds rather than `System.Object`.
+
+**Custom attributes are decoded**, including constructor arguments, named
+fields and named properties:
+
+```csharp
+var mark = (MarkAttribute)typeof(Widget).GetCustomAttributes(typeof(MarkAttribute), false)[0];
+Console.WriteLine(mark.Text + " " + mark.Order);
+```
+
+An argument this runtime cannot decode — an array, a `Type`, a boxed object —
+omits that attribute from the result rather than building it with an invented
+value. "Not found" is an answer a caller can act on; a wrong value is not.
+
+**`typeof(T)` on a generic parameter throws.** The type argument was erased, so
+there is no type to name. The two honest options were `System.Object` — a
+plausible-looking wrong answer that nobody would notice — or a clear
+`NotSupportedException`. It throws, and the message says why. The same applies
+to `Activator.CreateInstance<T>()`; pass the type explicitly instead.
+
+**Not implemented:** `PropertyInfo` accessors, `MethodInfo` parameter lists,
+`Assembly` and `Module` enumeration, and constructing generic types at run time.
 
 ---
 
@@ -185,16 +236,44 @@ so it is refused rather than mis-encoded.
 
 ---
 
-## Embedded targets are designed for, not proven
+## Embedded: the reader and collector run on hardware, the interpreter does not
 
-The core crates are written to be `no_std`-friendly, the collector has an
-`embedded` profile, the Cargo `embedded` profile optimises for size, and the
-metadata reader recognises RISC-V and Arm machine types.
+**Verified on three architectures** — an ESP32-WROOM-32 (Xtensa LX6), an
+ESP32-C3 (RISC-V) and a Meadow F7 Micro (STM32F777, Arm Cortex-M7) — with
+byte-identical output. On each chip, `rustclr-metadata` parsed a Roslyn-built
+assembly out of flash and `rustclr-gc` reclaimed a reference cycle:
 
-**Nothing has been flashed to real hardware.** Until the core crates build for
-`thumbv7em-none-eabihf` and `riscv32imc-unknown-none-elf` without `std`, and the
-`iot-gateway` template runs on an actual ESP32, this is a design intent rather
-than a claim. This is [Milestone 6](../Plan.md).
+```
+assembly         HelloWorld
+metadata version v4.0.30319
+entry point      Main
+cycle unrooted   live=0
+refused past it  true
+```
+
+Full captures: [Xtensa](logs/esp32-wroom32.log) · [RISC-V](logs/esp32c3.log) ·
+[Arm](logs/meadow-f7.log). Firmware:
+[embedded/esp32-demo](../embedded/esp32-demo) and
+[embedded/meadow-f7](../embedded/meadow-f7).
+
+Both crates also build without `std` for `thumbv7em-none-eabihf`,
+`thumbv6m-none-eabi`, `riscv32imc-unknown-none-elf` and
+`riscv64gc-unknown-none-elf` — `bash tests/embedded.sh` checks all of them.
+
+`Heap::embedded(n)` is a **hard ceiling**: `try_alloc` returns `None` when full
+rather than growing past the budget. On a device whose RAM was allocated up
+front, a heap that quietly grows has not been bounded at all.
+
+**What does not run on hardware.**
+
+| | |
+| --- | --- |
+| IL execution | `rustclr-core` needs a hash map, a clock and a way to read an assembly |
+| Ahead-of-time compilation | Needs Arm and RISC-V code generators; only x86-64 exists |
+
+That first row is the honest boundary: the chip can *read* a .NET assembly and
+manage a heap, but it cannot execute a method. This is
+[Milestone 6](../Plan.md).
 
 ---
 

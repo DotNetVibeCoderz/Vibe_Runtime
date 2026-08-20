@@ -1,0 +1,64 @@
+[package]
+name = "rustclr-esp32-demo"
+version = "0.1.0"
+edition = "2021"
+description = "Runs RustCLR's metadata reader and collector on ESP32 hardware"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Its own workspace on purpose. The runtime crates have no external
+# dependencies at all, and this firmware needs a HAL — keeping it out of the
+# main workspace is what lets both of those stay true.
+[workspace]
+
+[features]
+# Exactly one chip must be selected; the HAL crates refuse to build otherwise.
+# Two very different cores — Xtensa LX6 and RISC-V — from one source file.
+esp32 = [
+    "esp-hal/esp32",
+    # Xtensa-only: it pulls xtensa-lx-rt, which has no RISC-V counterpart.
+    "esp-hal/float-save-restore",
+    "esp-backtrace/esp32",
+    "esp-println/esp32",
+    "esp-bootloader-esp-idf/esp32",
+]
+esp32c3 = [
+    "esp-hal/esp32c3",
+    "esp-backtrace/esp32c3",
+    "esp-println/esp32c3",
+    "esp-bootloader-esp-idf/esp32c3",
+]
+
+[dependencies]
+# The two RustCLR crates that build without `std`. No default features: that is
+# what turns `std` off.
+rustclr-metadata = { path = "../../crates/rustclr-metadata", default-features = false }
+rustclr-gc = { path = "../../crates/rustclr-gc", default-features = false }
+
+# `rt` and `exception-handler` are defaults; they have to come back explicitly
+# because the chip feature has to be selectable, which needs defaults off.
+esp-hal = { version = "1.1.2", default-features = false, features = [
+    "unstable",
+    "rt",
+    "exception-handler",
+] }
+esp-backtrace = { version = "0.17.0", default-features = false, features = [
+    "panic-handler",
+    "println",
+] }
+esp-println = { version = "0.15.0", default-features = false, features = ["uart"] }
+esp-alloc = "0.10.0"
+# The second-stage bootloader reads an app descriptor from the image header and
+# refuses to flash an image without one.
+esp-bootloader-esp-idf = { version = "0.5.0", default-features = false }
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+# A panic on a microcontroller has nowhere to unwind to.
+panic = "abort"
+overflow-checks = false
+
+[profile.dev]
+opt-level = "s"

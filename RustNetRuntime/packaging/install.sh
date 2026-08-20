@@ -124,6 +124,6 @@ fi
 echo "Installed. Try it:"
 echo
 echo "    rustnet capabilities"
-echo "    rustnet run $SHARE/samples/UserDirectory/bin/Release/net9.0/UserDirectory.dll"
+echo "    rustnet run $SHARE/samples/UserDirectory/bin/Release/net10.0/UserDirectory.dll"
 echo
 echo "Built by Gravicode Studios, led by Kang Fadhil."

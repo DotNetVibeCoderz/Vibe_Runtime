@@ -1,5 +1,8 @@
 //! The four metadata heaps: `#Strings`, `#US`, `#Blob` and `#GUID`.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use crate::error::{MetadataError, Result};
 use crate::reader::Reader;
 

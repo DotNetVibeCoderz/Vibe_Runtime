@@ -11,3 +11,8 @@ rust-version.workspace = true
 [dependencies]
 rustclr-core.workspace = true
 rustclr-metadata.workspace = true
+
+# The differential test needs a real BCL to run a real fixture through both
+# execution paths. Only a dev dependency: the backend itself needs none.
+[dev-dependencies]
+rustclr-bcl.workspace = true

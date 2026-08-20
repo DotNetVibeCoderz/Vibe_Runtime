@@ -23,6 +23,8 @@ pub struct ObjectSpace {
     free_list: Vec<u32>,
     live_bytes: usize,
     live_count: usize,
+    /// Hard ceiling on slots, for a fixed heap. `None` means grow on demand.
+    limit: Option<usize>,
 }
 
 impl Default for ObjectSpace {
@@ -38,6 +40,7 @@ impl ObjectSpace {
             free_list: Vec::new(),
             live_bytes: 0,
             live_count: 0,
+            limit: None,
         }
     }
 
@@ -49,6 +52,33 @@ impl ObjectSpace {
             free_list: Vec::with_capacity(slots / 4),
             live_bytes: 0,
             live_count: 0,
+            limit: None,
+        }
+    }
+
+    /// Pre-reserves capacity *and* refuses to exceed it.
+    ///
+    /// Reserving alone is only a performance hint — the vector still grows on
+    /// demand, which on a microcontroller means quietly running past the RAM
+    /// that was budgeted. A fixed heap has to be able to say no.
+    pub fn fixed(slots: usize) -> Self {
+        let mut space = Self::with_capacity(slots);
+        space.limit = Some(slots);
+        space
+    }
+
+    /// The hard ceiling on slots, if there is one.
+    #[inline]
+    pub fn limit(&self) -> Option<usize> {
+        self.limit
+    }
+
+    /// Whether another object would fit without growing past the limit.
+    #[inline]
+    pub fn has_room(&self) -> bool {
+        match self.limit {
+            Some(limit) => !self.free_list.is_empty() || self.slots.len() < limit,
+            None => true,
         }
     }
 
@@ -69,6 +99,21 @@ impl ObjectSpace {
 
     /// Allocates an object and returns its handle.
     pub fn alloc(&mut self, object: Box<dyn GcObject>) -> Handle {
+        self.try_alloc(object).expect("heap exhausted; call try_alloc on a fixed heap")
+    }
+
+    /// Allocates, or reports that a fixed heap is full.
+    ///
+    /// Only a heap built with [`Self::fixed`] can answer `None`; an unbounded
+    /// one always succeeds or aborts on the host allocator.
+    pub fn try_alloc(&mut self, object: Box<dyn GcObject>) -> Option<Handle> {
+        if !self.has_room() {
+            return None;
+        }
+        Some(self.alloc_unchecked(object))
+    }
+
+    fn alloc_unchecked(&mut self, object: Box<dyn GcObject>) -> Handle {
         let bytes = object.size_hint();
         self.live_bytes += bytes;
         self.live_count += 1;
@@ -240,5 +285,51 @@ impl core::fmt::Debug for ObjectSpace {
             .field("slots", &self.slots.len())
             .field("free", &self.free_list.len())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod fixed_tests {
+    use super::*;
+
+    struct Blob;
+    impl GcObject for Blob {
+        fn trace(&self, _t: &mut Tracer) {}
+        fn size_hint(&self) -> usize {
+            8
+        }
+        fn type_name(&self) -> &str {
+            "blob"
+        }
+        fn as_any(&self) -> &dyn core::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn a_fixed_space_refuses_to_grow_past_its_ceiling() {
+        let mut space = ObjectSpace::fixed(3);
+        assert_eq!(space.limit(), Some(3));
+        for i in 0..3 {
+            assert!(space.try_alloc(Box::new(Blob)).is_some(), "slot {i} should fit");
+        }
+        assert!(!space.has_room());
+        assert!(
+            space.try_alloc(Box::new(Blob)).is_none(),
+            "a fixed heap must say no rather than growing past its budget"
+        );
+    }
+
+    #[test]
+    fn an_unbounded_space_never_refuses() {
+        let mut space = ObjectSpace::new();
+        assert_eq!(space.limit(), None);
+        for _ in 0..64 {
+            assert!(space.try_alloc(Box::new(Blob)).is_some());
+        }
+        assert!(space.has_room());
     }
 }

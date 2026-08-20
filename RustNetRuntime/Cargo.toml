@@ -1,5 +1,14 @@
 [workspace]
 resolver = "3"
+# The ESP32 firmware is its own workspace: it depends on esp-hal and friends,
+# and the runtime crates are deliberately dependency-free.
+exclude = [
+    "embedded/esp32-demo",
+    "embedded/meadow-f7",
+    "embedded/rp2040",
+    "embedded/k210",
+    "embedded/demo-common",
+]
 members = [
     "crates/rustclr-metadata",
     "crates/rustclr-gc",

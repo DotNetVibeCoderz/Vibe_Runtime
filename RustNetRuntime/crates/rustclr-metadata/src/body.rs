@@ -1,5 +1,8 @@
 //! IL method bodies (ECMA-335 II.25.4): tiny/fat headers and EH clauses.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use crate::error::{MetadataError, Result};
 use crate::reader::Reader;
 use crate::token::Token;

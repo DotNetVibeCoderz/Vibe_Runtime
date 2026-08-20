@@ -1,0 +1,39 @@
+[package]
+name = "rustclr-rp2040"
+version = "0.1.0"
+edition = "2021"
+description = "Runs RustCLR's metadata reader and collector on an RP2040 (Cortex-M0+)"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Its own workspace: the runtime crates have no external dependencies and this
+# firmware needs a HAL, a boot stage and a USB stack.
+[workspace]
+
+[dependencies]
+rustclr-demo-common = { path = "../demo-common" }
+
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+# The 256-byte second-stage bootloader the RP2040's ROM loads from flash offset
+# 0. It configures QSPI for execute-in-place and is checked by a CRC the ROM
+# verifies, so it is taken prebuilt rather than hand-assembled — a wrong CRC is
+# a board that does nothing at all.
+rp2040-boot2 = "0.3"
+embedded-alloc = "0.6"
+# Used for the clock tree and the USB device bus. A Cortex-M0+ has no CAS, and
+# the crystal-to-48 MHz path USB needs is exactly the kind of thing worth
+# taking from a maintained implementation.
+rp2040-hal = { version = "0.10", features = ["rt", "critical-section-impl"] }
+usb-device = "0.3"
+usbd-serial = "0.2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+debug = true
+panic = "abort"
+
+[profile.dev]
+panic = "abort"

@@ -26,8 +26,37 @@
 
 extern crate alloc;
 
-#[cfg(not(feature = "std"))]
-use alloc::{format, string::{String, ToString}, vec::Vec, boxed::Box};
+/// The owned types every module here needs, from whichever crate provides them.
+///
+/// A `use alloc::…` in this file reaches only this file, which is why building
+/// without `std` used to fail in every submodule at once. Each module imports
+/// this instead, and the same source then compiles for a host and for a
+/// microcontroller.
+pub(crate) mod prelude {
+    #[cfg(not(feature = "std"))]
+    #[allow(unused_imports)]
+    pub(crate) use alloc::{
+        borrow::ToOwned,
+        boxed::Box,
+        format,
+        string::{String, ToString},
+        vec,
+        vec::Vec,
+    };
+    #[cfg(feature = "std")]
+    #[allow(unused_imports)]
+    pub(crate) use std::{
+        borrow::ToOwned,
+        boxed::Box,
+        format,
+        string::{String, ToString},
+        vec,
+        vec::Vec,
+    };
+}
+
+#[allow(unused_imports)]
+use crate::prelude::*;
 
 pub mod body;
 pub mod error;
@@ -54,17 +83,21 @@ pub use token::{CodedIndex, TableId, Token};
 /// `Image` self-references — the metadata borrows from the same buffer the PE
 /// header describes — so it stores the bytes in a boxed slice and rebuilds the
 /// borrowed views on demand. Callers get `&`-lifetimes tied to the `Image`.
-#[cfg(feature = "std")]
 pub struct Image {
     bytes: Box<[u8]>,
     /// Byte range of the metadata root within `bytes`.
     metadata_range: core::ops::Range<usize>,
+    #[cfg(feature = "std")]
     path: Option<std::path::PathBuf>,
 }
 
-#[cfg(feature = "std")]
 impl Image {
     /// Loads and validates an image from a file.
+    ///
+    /// The only part of `Image` that needs a filesystem. Everything else works
+    /// from a byte slice, which is what lets a microcontroller read an assembly
+    /// straight out of flash.
+    #[cfg(feature = "std")]
     pub fn from_file(path: impl AsRef<std::path::Path>) -> Result<Self> {
         let path = path.as_ref();
         let bytes = std::fs::read(path).map_err(|_| MetadataError::NotManaged)?;
@@ -85,7 +118,12 @@ impl Image {
         };
         // Validate the metadata root eagerly so callers can trust later access.
         Metadata::parse(&bytes[metadata_range.clone()])?;
-        Ok(Image { bytes, metadata_range, path: None })
+        Ok(Image {
+            bytes,
+            metadata_range,
+            #[cfg(feature = "std")]
+            path: None,
+        })
     }
 
     /// The PE container view.
@@ -104,6 +142,7 @@ impl Image {
         &self.bytes
     }
 
+    #[cfg(feature = "std")]
     pub fn path(&self) -> Option<&std::path::Path> {
         self.path.as_deref()
     }
@@ -143,12 +182,11 @@ impl Image {
     }
 }
 
-#[cfg(feature = "std")]
 impl core::fmt::Debug for Image {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Image")
-            .field("path", &self.path)
-            .field("size", &self.bytes.len())
-            .finish()
+        let mut out = f.debug_struct("Image");
+        #[cfg(feature = "std")]
+        out.field("path", &self.path);
+        out.field("size", &self.bytes.len()).finish()
     }
 }

@@ -28,6 +28,7 @@ process start.
 | `virtual` | 110 | 1,632 | 14.8× | 2M virtual calls through a base reference |
 | `sort` | 120 | 2,242 | 18.7× | Quicksort over 200k ints |
 | `fields` | 144 | 2,764 | 19.2× | 3M instance field reads and writes |
+| `kernels` | 126 | **232** | **1.8×** | Integer kernels in leaf methods — **compiled to machine code** |
 
 Every row's checksum is compared between the two runtimes before it is timed. A
 mismatch prints `MISMATCH` instead of a number — a benchmark that computed a
@@ -44,11 +45,27 @@ startup and about 1.1 s of work. The compute ratio is therefore far worse than
 the wall-clock ratio suggests — closer to 100× on the tightest loops.
 
 That is what interpretation costs. .NET compiles IL to machine code; RustCLR
-walks it instruction by instruction. Roughly 1.8 million IL instructions per
-second is the current throughput.
+walks it instruction by instruction — around 33 million IL instructions per
+second on this machine.
 
-**RustCLR starts in half the time.** No JIT, no tiered compilation, no warm-up:
-65 ms against 126 ms. For a CLI tool that runs briefly and exits, or a
+**Except where the code generator reaches.** `kernels` is the one workload whose
+shape the x86-64 backend takes: integer arithmetic in leaf methods that call
+nothing and allocate nothing. Compiled, it runs in 232 ms against 2,484 ms
+interpreted — **10.7× faster**, moving it from 17.5× slower than .NET to 1.6×.
+
+Every other row is unchanged by the JIT, because every other row uses arrays or
+calls and `rustnet jit` declines them all. That is why `kernels` was added
+*beside* the existing workloads rather than replacing one: the interesting
+number is not just what compilation is worth where it applies, but how narrow
+"where it applies" currently is.
+
+```bash
+rustnet jit benchmarks/Benchmarks/bin/Release/net10.0/Benchmarks.dll
+```
+
+**RustCLR starts in half the time.** Its tiering compiles nothing until a method
+has been called 32 times, and emits a few hundred bytes when it does, so there
+is no warm-up to pay for: 65 ms against 126 ms. For a CLI tool that runs briefly and exits, or a
 microcontroller that has no room for a code cache, that matters more than steady
 -state throughput.
 

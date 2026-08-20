@@ -1,0 +1,27 @@
+[package]
+name = "rustclr-k210"
+version = "0.1.0"
+edition = "2021"
+description = "Runs RustCLR's metadata reader and collector on a Kendryte K210 (RV64GC)"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Its own workspace: the runtime crates have no external dependencies and this
+# firmware needs a runtime and an allocator.
+[workspace]
+
+[dependencies]
+rustclr-demo-common = { path = "../demo-common" }
+
+# `critical-section-single-hart` supplies the critical_section implementation
+# the allocator needs. Sound here for the reason the feature name gives: only
+# hart 0 ever leaves the startup code, so masking this hart's interrupts really
+# is mutual exclusion.
+riscv = { version = "0.11", features = ["critical-section-single-hart"] }
+riscv-rt = "0.12"
+embedded-alloc = "0.6"
+
+[profile.release]
+opt-level = "s"
+lto = true
+debug = true

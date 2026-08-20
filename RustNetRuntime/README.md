@@ -24,10 +24,10 @@ handling — produces identical output on both runtimes:
 
 ```console
 $ dotnet Conformance.dll
-checks=80 failures=0
+checks=134 failures=0
 
 $ rustnet run Conformance.dll --stats
-checks=80 failures=0
+checks=134 failures=0
 
 ─── execution ──────────────────────────────
   wall clock                  10.505 ms
@@ -49,7 +49,7 @@ divide-by-zero, delegates, and allocation under collection pressure. A second
 suite, `tests/fixtures/ModernSyntax/`, does the same for 35 modern C# features.
 Both are normal C# projects you can read and extend.
 
-`cargo test --workspace` runs 116 tests across the eight crates.
+`cargo test --workspace` runs 141 tests across the eight crates.
 
 ---
 
@@ -258,28 +258,68 @@ so side effects in a predicate happen at the call rather than at consumption;
 and ordering compares numbers and strings, refusing any other key type rather
 than sorting it arbitrarily.
 
-**Advanced C# features.** 12 of 21 probed features produce identical output on
-both runtimes: garbage collection, `IDisposable`/`using`, threading with `lock`
-and `Interlocked` (serialised — see below), primary constructors, collection
-expressions over arrays, extension members, P/Invoke, pattern matching, records,
-LINQ, source generators and interceptors.
+**async and await.** `Task`, `Task<T>`, `TaskCompletionSource`, `Task.Run`,
+`Task.WhenAll` and the awaiter pattern are implemented, so `async` methods run —
+including an exception thrown across an `await` and caught by the caller.
 
-Most of the remaining gaps share one cause: **generic types are erased rather
-than instantiated**, so `async`/`await`, TPL, `Span<T>` and struct marshalling
-cannot resolve. Union types and closed hierarchies are not in .NET 10 at all —
-the compiler parses them but the BCL types they need do not exist yet.
+```csharp
+static async Task<int> Chain(int n)
+{
+    int a = await Doubled(n);
+    int b = await Doubled(a);
+    return a + b;
+}
+```
+
+An `async` method is not special to the runtime: Roslyn lowers it to an ordinary
+struct plus calls into a *builder*, and implementing that builder is the whole of
+`await`. The caveat is the same one `Thread` carries — **there is no overlap**. A
+task runs to completion where it is created, so results and ordering are correct
+but nothing runs in parallel.
+
+**Reflection works on real `Type` objects.** `typeof(T)`, `GetType()`, base
+types, `IsAssignableFrom`, member enumeration, `MethodInfo.Invoke`, `FieldInfo`
+get and set, and `Activator.CreateInstance`. Type objects are interned one per
+runtime type, so `typeof(int) == typeof(int)` is reference equality. Custom
+attributes are decoded too — constructor arguments, named fields and named
+properties. `typeof(T)` on an *erased* generic parameter throws rather than
+answering `System.Object`.
+
+**Some methods are compiled to machine code.** `rustclr-jit` emits x86-64 into
+write-xor-execute pages for leaf methods doing integer arithmetic, after 32
+calls have shown them to be worth compiling. On the `kernels` benchmark that is
+**10.7× faster** than interpreting — 232 ms against 2,484 ms, which is 1.6× .NET
+rather than 17.5×.
+
+The reach is narrow and `rustnet jit <assembly>` says exactly how narrow:
+anything using arrays, calls, allocation or exception handling is interpreted.
+`rustnet run --no-jit` interprets everything, and must print the same bytes —
+there is a differential test that asserts it.
+
+**Advanced C# features.** 13 of 21 probed features produce identical output on
+both runtimes: garbage collection, `IDisposable`/`using`, `async`/`await`,
+threading with `lock` and `Interlocked` (both serialised — see below), primary
+constructors, collection expressions over arrays, extension members, P/Invoke,
+pattern matching, records, LINQ, source generators and interceptors.
+
+The remaining gaps are `Span<T>` and struct marshalling, which need generic type
+arguments the runtime has erased; TPL and `await using`, which are simply
+unimplemented; and unsafe pointers, which structural managed references cannot
+express. Union types and closed hierarchies are not in .NET 10 at all — the
+compiler parses them but the BCL types they need do not exist yet.
 
 The full matrix, with why each row lands where it does:
 [docs/advanced-features.md](docs/advanced-features.md).
 
 
-**Does not work yet.** Generic type *arguments* are erased, so user generic
-code that reads `T` at run time — `typeof(T)`, `is T`, a static field per
-instantiation — does not behave correctly, and custom comparers are ignored.
-Exception filters (`catch when`) are not evaluated. `async`/`await` state
-machines are not driven by the scheduler. Reflection is minimal. There is no
-native code generator — `rustclr-jit` supplies the compilation interface and the
-IL verifier, and execution is interpreted.
+**Does not work yet.** Nothing runs concurrently: `async` tasks and `Thread`
+bodies both execute inline, so results are right but there is no parallelism.
+Generic type *arguments* are erased, so user generic code that reads `T` at run
+time — `typeof(T)`, `is T`, a static field per instantiation — does not behave
+correctly, and custom comparers are ignored. Exception filters (`catch when`)
+are not evaluated. The native code generator takes only
+leaf integer methods — 10.7× faster where it applies, and it declines anything
+using arrays or calls, which is most of a real program.
 
 `rustnet capabilities` prints this list from the runtime itself, so it cannot
 drift from reality. Detail: [docs/limitations.md](docs/limitations.md).
@@ -289,9 +329,36 @@ drift from reality. Detail: [docs/limitations.md](docs/limitations.md).
 ## Targets
 
 The metadata reader recognises x86, x64, Arm, Arm64, RISC-V 32 and RISC-V 64.
-The core crates are written to be `no_std`-friendly, and the collector has an
-`embedded` profile with a small allocation trigger for microcontroller targets
-(ESP32, STM32, RISC-V). The `embedded` Cargo profile builds for size.
+`rustclr-metadata` and `rustclr-gc` **build without `std`** for
+`thumbv7em-none-eabihf`, `thumbv6m-none-eabi`, `riscv32imc-unknown-none-elf` and
+`riscv64gc-unknown-none-elf` — `bash tests/embedded.sh` checks all four.
+
+**And they run on real hardware — on three architectures.** An ESP32-WROOM-32
+(Xtensa LX6), an ESP32-C3 (RISC-V) and a Meadow F7 Micro (STM32F777, Arm
+Cortex-M7), with byte-identical output. On each chip the metadata reader parsed
+a Roslyn-built assembly straight out of flash and the collector reclaimed a
+reference cycle:
+
+```
+assembly         HelloWorld
+metadata version v4.0.30319
+entry point      Main
+cycle unrooted   live=0
+refused past it  true
+```
+
+Firmware: [ESP32](embedded/esp32-demo) · [Meadow F7](embedded/meadow-f7). Full
+captures: [Xtensa](docs/logs/esp32-wroom32.log) ·
+[RISC-V](docs/logs/esp32c3.log) · [Arm](docs/logs/meadow-f7.log).
+
+**IL does not execute on the chip.** That needs the interpreter, and
+`rustclr-core` still requires `std` — a hash map, a clock and file access. The
+board can read a .NET assembly and manage a heap; it cannot yet run a method.
+
+`Heap::embedded(n)` is a hard ceiling rather than a hint: allocation past it
+fails instead of growing, which is the only kind of bound worth having on a
+device whose RAM was budgeted up front. The `embedded` Cargo profile builds for
+size.
 
 ---
 

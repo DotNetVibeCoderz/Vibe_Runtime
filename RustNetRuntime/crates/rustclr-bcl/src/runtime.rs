@@ -41,10 +41,20 @@ fn register_object(interp: &mut Interpreter) {
         Ok(Some(Value::I32((x == y) as i32)))
     });
     interp.register_native("System.Object::GetType()", |i, a| {
-        // `Type` is represented by its name until reflection lands.
-        let h = arg_handle(i, a, 0)?;
-        let name = i.type_name_of(h);
-        Ok(Some(string_value(i, &name)))
+        let value = arg(i, a, 0)?;
+        // A boxed value reports the type it holds, not `System.Object`.
+        let type_id = match &value {
+            Value::Obj(h) if !h.is_null() => i.type_of(*h),
+            Value::I32(_) => Some(i.loader.primitive_type(rustclr_core::Primitive::Int32)),
+            Value::I64(_) => Some(i.loader.primitive_type(rustclr_core::Primitive::Int64)),
+            Value::F(_) => Some(i.loader.primitive_type(rustclr_core::Primitive::Double)),
+            Value::Struct(s) => Some(s.type_id),
+            _ => return Err(rustclr_core::ExecutionError::null_reference()),
+        };
+        let Some(type_id) = type_id else {
+            return Err(rustclr_core::ExecutionError::null_reference());
+        };
+        Ok(Some(Value::Obj(i.type_object(type_id))))
     });
 }
 

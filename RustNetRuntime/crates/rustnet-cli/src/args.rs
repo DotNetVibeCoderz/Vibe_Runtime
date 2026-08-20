@@ -15,9 +15,15 @@ pub enum Command {
         stats: bool,
         trace: bool,
         max_instructions: Option<u64>,
+        /// Compile hot methods to machine code. On by default.
+        jit: bool,
+        /// Calls before a method is compiled; `None` uses the backend default.
+        jit_threshold: Option<u32>,
     },
     /// Summarise an assembly's metadata.
     Info { assembly: String, verbose: bool },
+    /// Report what the code generator can compile.
+    Jit { assembly: String },
     /// Disassemble methods to IL.
     Disasm {
         assembly: String,
@@ -59,12 +65,24 @@ pub fn parse(argv: &[String]) -> Result<Command, ParseError> {
             let mut stats = false;
             let mut trace = false;
             let mut max_instructions = None;
+            let mut jit = true;
+            let mut jit_threshold = None;
             let mut rest = argv[1..].iter();
 
             while let Some(a) = rest.next() {
                 match a.as_str() {
                     "--stats" => stats = true,
                     "--trace" => trace = true,
+                    "--no-jit" => jit = false,
+                    "--jit-threshold" => {
+                        let v = rest.next().ok_or_else(|| {
+                            ParseError("--jit-threshold needs a value".into())
+                        })?;
+                        jit_threshold = Some(
+                            v.parse()
+                                .map_err(|_| ParseError(format!("`{v}` is not a number")))?,
+                        );
+                    }
                     "--max-instructions" => {
                         let v = rest.next().ok_or_else(|| {
                             ParseError("--max-instructions needs a value".into())
@@ -89,7 +107,18 @@ pub fn parse(argv: &[String]) -> Result<Command, ParseError> {
                 stats,
                 trace,
                 max_instructions,
+                jit,
+                jit_threshold,
             })
+        }
+
+        "jit" => {
+            let assembly = argv[1..]
+                .iter()
+                .find(|a| !a.starts_with('-'))
+                .cloned()
+                .ok_or_else(|| ParseError("jit needs an assembly path".into()))?;
+            Ok(Command::Jit { assembly })
         }
 
         "info" => {
@@ -152,8 +181,11 @@ USAGE
     rustnet <command> [options]
 
 COMMANDS
-    run <assembly> [--stats] [--trace] [--max-instructions N] [-- args...]
-        Execute an assembly's entry point on RustCLR.
+    run <assembly> [--stats] [--trace] [--max-instructions N]
+                   [--no-jit] [--jit-threshold N] [-- args...]
+        Execute an assembly's entry point on RustCLR. Hot methods the code
+        generator can take are compiled to machine code; --no-jit interprets
+        everything, which must produce identical output.
 
     info <assembly> [--verbose]
         Summarise types, methods and references.
@@ -163,6 +195,10 @@ COMMANDS
 
     verify <assembly>
         Load the assembly and report every member that will not resolve.
+
+    jit <assembly>
+        Report which methods the native code generator compiles, and why it
+        declines the rest. A declined method is interpreted, not a failure.
 
     build [project] [-c Release] [--run]
         Compile a C# project with the .NET SDK, then optionally run it here.

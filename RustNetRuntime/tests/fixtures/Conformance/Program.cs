@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
+using System.Reflection;
 
 namespace Conformance;
 
@@ -43,12 +44,31 @@ struct Point
 
 enum Level { Low = 1, Mid = 5, High = 9 }
 
+/// An attribute with a constructor argument, a named field and a named
+/// property — the three shapes an attribute blob encodes.
+[AttributeUsage(AttributeTargets.All)]
+sealed class MarkAttribute : Attribute
+{
+    public string Text;
+    public int Order { get; set; }
+    public bool Enabled;
+    public MarkAttribute(string text) { Text = text; }
+}
+
+[Mark("on the type", Order = 3, Enabled = true)]
+sealed class Marked
+{
+    [Mark("on a field")] public int Slot;
+    [Mark("on a method")] public int Twice(int n) { return n * 2; }
+}
+
 /// A type that genuinely overrides ToString, so dispatch to it can be checked.
 sealed class Tag
 {
     private readonly string text;
     public Tag(string text) { this.text = text; }
     public override string ToString() { return "tag:" + text; }
+    public int Echo(int n) { return n * 2; }
 }
 
 sealed class Node
@@ -161,6 +181,97 @@ static class Program
     {
         int value = await pending;
         return value * 3;
+    }
+
+    // -- integer kernels -----------------------------------------------------
+    // Milestone 4. These are deliberately leaf methods over integers, which is
+    // exactly what the x86-64 backend compiles. Run the fixture with
+    // `--jit-threshold 1` and every one of them executes as machine code, so
+    // these checks compare the code generator against the interpreter rather
+    // than merely against .NET.
+
+    static int Arithmetic(int a, int b)
+    {
+        return a + b - (a * b) / (b + 1) + a % (b + 3);
+    }
+
+    static long Bitwise(long x, int shift)
+    {
+        long masked = (x & 0xFF00FF00) | (x ^ 0x0F0F0F0F);
+        return (masked << shift) ^ (masked >> shift) ^ (long)((ulong)masked >> shift);
+    }
+
+    static int Comparisons(int a, int b)
+    {
+        int score = 0;
+        if (a < b) score += 1;
+        if (a > b) score += 2;
+        if (a == b) score += 4;
+        if (a <= b) score += 8;
+        if (a >= b) score += 16;
+        if (a != b) score += 32;
+        return score;
+    }
+
+    static int UnsignedComparisons(int a, int b)
+    {
+        uint x = (uint)a;
+        uint y = (uint)b;
+        int score = 0;
+        if (x < y) score += 1;
+        if (x > y) score += 2;
+        if (x <= y) score += 4;
+        if (x >= y) score += 8;
+        return score;
+    }
+
+    /// Assigns to its own parameter, which compiles to `starg`.
+    static int Collatz(int n)
+    {
+        int steps = 0;
+        while (n != 1)
+        {
+            if (n % 2 == 0) n = n / 2;
+            else n = 3 * n + 1;
+            steps++;
+        }
+        return steps;
+    }
+
+    static int Gcd(int a, int b)
+    {
+        while (b != 0) { int t = b; b = a % b; a = t; }
+        return a;
+    }
+
+    static long FibIterative(int n)
+    {
+        long a = 0, b = 1;
+        for (int i = 0; i < n; i++) { long t = a + b; a = b; b = t; }
+        return a;
+    }
+
+    /// Negation, complement and a deep evaluation stack in one place: the
+    /// backend keeps two stack slots in registers and spills the rest.
+    static int DeepStack(int a, int b, int c)
+    {
+        return (a + b) * (c - a) + (-b) + (~c) + (a + b + c + a + b + c);
+    }
+
+    // -- reflection ----------------------------------------------------------
+    // Milestone 5. `System.Type` is a real object here, interned one per
+    // runtime type, so identity comparisons work as .NET guarantees.
+
+    static string DescribeType(object value)
+    {
+        Type t = value.GetType();
+        return t.Name + "/" + t.BaseType.Name + "/" + t.IsValueType;
+    }
+
+    static int InvokeByName(object target, string method, int argument)
+    {
+        MethodInfo m = target.GetType().GetMethod(method);
+        return (int)m.Invoke(target, new object[] { argument });
     }
 
     static int Fib(int n) { return n < 2 ? n : Fib(n - 1) + Fib(n - 2); }
@@ -474,6 +585,83 @@ static class Program
         // runtime raises its own errors differently, so this is the case that
         // used to come back empty.
         CheckStr("exception message", MessageOf(), "written by the program");
+
+        // integer kernels — the shapes the native code generator takes
+        // 17+5 - 85/6 + 17%8  =  22 - 14 + 1
+        CheckEq("jit arithmetic", Arithmetic(17, 5), 9);
+        // -9+4 - (-36/5) + (-9%7)  =  -5 + 7 - 2; division truncates toward zero
+        CheckEq("jit arithmetic negative", Arithmetic(-9, 4), 0);
+        CheckEq("jit bitwise", (int)Bitwise(0x1234ABCD, 5), (int)Bitwise(0x1234ABCD, 5));
+        Check("jit bitwise is not zero", Bitwise(0x1234ABCD, 5) != 0);
+        CheckEq("jit comparisons less", Comparisons(3, 9), 1 + 8 + 32);
+        CheckEq("jit comparisons equal", Comparisons(7, 7), 4 + 8 + 16);
+        CheckEq("jit comparisons greater", Comparisons(9, 3), 2 + 16 + 32);
+        CheckEq("jit unsigned comparisons", UnsignedComparisons(-1, 1), 2 + 8);
+        CheckEq("jit starg loop", Collatz(27), 111);
+        CheckEq("jit gcd", Gcd(1071, 462), 21);
+        // 64-bit result: the 46th Fibonacci number exceeds int.MaxValue.
+        Check("jit fib as long", FibIterative(46) == 1836311903L);
+        Check("jit fib beyond 32 bits", FibIterative(92) == 7540113804746346429L);
+        CheckEq("jit deep stack", DeepStack(3, 4, 5), 14 + (-4) + (-6) + 24);
+        CheckEq("jit division truncates toward zero", Arithmetic(-7, 2), -3);
+
+        // reflection
+        CheckStr("typeof name", typeof(Tag).Name, "Tag");
+        CheckStr("typeof full name", typeof(Tag).FullName, "Conformance.Tag");
+        Check("typeof identity", typeof(Tag) == typeof(Tag));
+        Check("typeof distinguishes", typeof(Tag) != typeof(Circle));
+        Check("typeof of a primitive", typeof(int).IsValueType);
+        Check("typeof of a class", !typeof(Tag).IsValueType);
+        Check("sealed is reported", typeof(Tag).IsSealed);
+
+        CheckStr("GetType on an instance", new Tag("x").GetType().Name, "Tag");
+        Check("GetType matches typeof", new Tag("x").GetType() == typeof(Tag));
+        CheckStr("base type", typeof(Circle).BaseType.Name, "Shape");
+        Check("assignable from derived", typeof(Shape).IsAssignableFrom(typeof(Circle)));
+        Check("not assignable to derived", !typeof(Circle).IsAssignableFrom(typeof(Shape)));
+        Check("IsInstanceOfType", typeof(Shape).IsInstanceOfType(new Circle(1)));
+
+        // A boxed value reports the type it holds, not System.Object — and
+        // calling a method on it must reach the value type's implementation
+        // with an unboxed receiver.
+        object boxedInt = 42;
+        CheckStr("boxed value type", boxedInt.GetType().Name, "Int32");
+        CheckStr("ToString through a box", "" + boxedInt, "42");
+
+        CheckStr("struct describes itself", DescribeType(gorigin), "Point/ValueType/True");
+
+        // Members.
+        FieldInfo sides = typeof(Node).GetField("Value");
+        Check("GetField found it", sides != null);
+        Node probe = new Node();
+        sides.SetValue(probe, 17);
+        CheckEq("FieldInfo round trip", probe.Value, 17);
+        CheckEq("FieldInfo GetValue", (int)sides.GetValue(probe), 17);
+
+        CheckEq("MethodInfo invoke", InvokeByName(new Tag("y"), "Echo", 21), 42);
+        CheckStr("MethodInfo return type", typeof(Tag).GetMethod("Echo").ReturnType.Name, "Int32");
+
+        // Activator.
+        object made = Activator.CreateInstance(typeof(Node));
+        Check("Activator produced the type", made.GetType() == typeof(Node));
+
+        // custom attributes
+        object[] marks = typeof(Marked).GetCustomAttributes(false);
+        CheckEq("attribute count", marks.Length, 1);
+        MarkAttribute mark = (MarkAttribute)marks[0];
+        CheckStr("attribute constructor argument", mark.Text, "on the type");
+        CheckEq("attribute named property", mark.Order, 3);
+        Check("attribute named field", mark.Enabled);
+        CheckEq(
+            "attributes filtered by type",
+            typeof(Marked).GetCustomAttributes(typeof(MarkAttribute), false).Length,
+            1);
+        CheckEq("no attributes is not an error", typeof(Tag).GetCustomAttributes(false).Length, 0);
+
+        object[] fieldMarks = typeof(Marked).GetField("Slot").GetCustomAttributes(false);
+        CheckStr("attribute on a field", ((MarkAttribute)fieldMarks[0]).Text, "on a field");
+        object[] methodMarks = typeof(Marked).GetMethod("Twice").GetCustomAttributes(false);
+        CheckStr("attribute on a method", ((MarkAttribute)methodMarks[0]).Text, "on a method");
 
         Console.WriteLine("checks=" + checks + " failures=" + failures);
     }

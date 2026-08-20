@@ -83,11 +83,11 @@ type. It no longer does, because the collections are implemented natively over
 storage that is self-describing — a runtime value already knows whether it holds
 an integer or a reference, so one implementation serves every `T`.
 
-What remains blocked is what genuinely needs the argument at run time:
-`Span<T>` and `Task<T>` are ref structs and state-machine types the runtime
-would have to model, and `Marshal.SizeOf<T>` needs a layout for a `T` it does
-not have. Those are [Milestone 3](../Plan.md) and [Milestone 4](../Plan.md)
-work, not one blocked milestone.
+`Task<T>` turned out to need nothing from erasure either — a task carries its
+result as a runtime value, so one `Task` type serves every `T`. What remains
+blocked is what genuinely needs the argument at run time: `Span<T>` is a ref
+struct the runtime would have to model, and `Marshal.SizeOf<T>` needs a layout
+for a `T` it does not have.
 
 For user-written generic code, the measured effects of erasure — `typeof(T)`,
 `is T`, statics per instantiation — are tabulated in

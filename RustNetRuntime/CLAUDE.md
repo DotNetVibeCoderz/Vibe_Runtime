@@ -2,11 +2,13 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Status: milestones 1 and 2 complete, and it works
+## Status: milestones 1-3 and 5 complete, 4 and 6 partly done, and it works
 
-The runtime executes real Roslyn-compiled assemblies. `cargo test --workspace` runs 116 tests;
-the conformance fixture prints `checks=80 failures=0` on RustCLR, byte-identical to `dotnet`,
-and `ModernSyntax` prints `checks=35 failures=0`. Generic collections and LINQ run.
+The runtime executes real Roslyn-compiled assemblies. `cargo test --workspace` runs 141 tests;
+the conformance fixture prints `checks=134 failures=0` on RustCLR, byte-identical to `dotnet`,
+and `ModernSyntax` prints `checks=35 failures=0`. Generic collections, LINQ and
+`async`/`await` all run, hot integer methods compile to x86-64 machine code, and reflection works on real
+`System.Type` objects.
 CodeGen builds and runs. Not a git repository.
 
 `requirements.md` is the single source of truth for scope. Read it before starting any work —
@@ -89,7 +91,8 @@ the C# side is one project built by path.
 ```bash
 # Runtime
 cargo build --release                      # produces target/release/rustnet
-cargo test --workspace                     # 116 tests; must stay green
+cargo test --workspace                     # 141 tests; must stay green
+bash tests/embedded.sh                     # bare-metal builds; must stay green
 cargo test -p rustclr-core                 # one crate
 cargo test -p rustclr-gc a_cycle_is        # one test by substring
 
@@ -107,7 +110,7 @@ Before claiming a runtime change works, run a real assembly through both runtime
 
 ```bash
 cd tests/fixtures/Conformance && dotnet build -c Release
-dotnet bin/Release/net10.0/Conformance.dll                    # expect: checks=80 failures=0
+dotnet bin/Release/net10.0/Conformance.dll                    # expect: checks=134 failures=0
 ../../../target/debug/rustnet.exe run bin/Release/net10.0/Conformance.dll
 ```
 
@@ -134,5 +137,5 @@ docs/            documentation and generated screenshots
 - **Refuse rather than guess.** Unsupported interop shapes, unresolvable tokens and unmatched
   exception filters all produce a clear error instead of a plausible-looking wrong answer.
 - **Templates marked `RunsOnRustClr = true` must actually run there.** Generic collections
-  and LINQ landed with Milestone 2, so they are fair game; `async`/`await`, `Span<T>` and
-  exception filters are not.
+  and LINQ landed with Milestone 2 and `async`/`await` with Milestone 3, so all three are
+  fair game; `Span<T>`, TPL and exception filters are not.

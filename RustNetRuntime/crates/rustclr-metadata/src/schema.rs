@@ -6,6 +6,9 @@
 //! row-size formulas we describe each table as a list of typed columns and
 //! compute sizes from the actual image.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use crate::token::{CodedIndex, TableId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

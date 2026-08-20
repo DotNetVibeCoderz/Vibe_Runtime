@@ -5,6 +5,9 @@
 //! first place where the Rust rewrite buys us something CoreCLR pays for with
 //! hand-audited pointer arithmetic.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use crate::error::{MetadataError, Result};
 
 #[derive(Debug, Clone)]

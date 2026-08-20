@@ -1,0 +1,31 @@
+[package]
+name = "rustclr-meadow-f7"
+version = "0.1.0"
+edition = "2021"
+description = "Runs RustCLR's metadata reader and collector on a Meadow F7 Micro (STM32F777)"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Its own workspace, like the ESP32 demo: the runtime crates have no external
+# dependencies and this firmware needs a linker script and a USB stack.
+[workspace]
+
+[dependencies]
+rustclr-metadata = { path = "../../crates/rustclr-metadata", default-features = false }
+rustclr-gc = { path = "../../crates/rustclr-gc", default-features = false }
+
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7"
+embedded-alloc = "0.6"
+# The USB device driver only — the Synopsys OTG core ST licenses. Everything
+# else here is register-level, so pulling a fifteen-device PAC for one
+# peripheral would be the odd one out.
+synopsys-usb-otg = { version = "0.5", features = ["fs"] }
+usb-device = "0.3"
+usbd-serial = "0.2"
+
+[profile.release]
+codegen-units = 1
+debug = true
+lto = true
+opt-level = "s"

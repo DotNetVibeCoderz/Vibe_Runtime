@@ -24,10 +24,10 @@ menghasilkan keluaran yang identik di kedua runtime:
 
 ```console
 $ dotnet Conformance.dll
-checks=80 failures=0
+checks=134 failures=0
 
 $ rustnet run Conformance.dll --stats
-checks=80 failures=0
+checks=134 failures=0
 
 ─── execution ──────────────────────────────
   wall clock                  10.505 ms
@@ -49,7 +49,7 @@ bersarang, pembagian nol, delegate, serta alokasi di bawah tekanan GC. Suite
 kedua, `tests/fixtures/ModernSyntax/`, melakukan hal sama untuk 35 fitur C#
 modern. Keduanya proyek C# biasa yang bisa Anda baca dan kembangkan.
 
-`cargo test --workspace` menjalankan 116 test di delapan crate.
+`cargo test --workspace` menjalankan 141 test di delapan crate.
 
 ---
 
@@ -260,29 +260,75 @@ bukan lazy, sehingga efek samping di dalam predikat terjadi saat pemanggilan,
 bukan saat konsumsi; dan pengurutan membandingkan angka dan string, serta
 menolak tipe kunci lain alih-alih mengurutkannya secara sembarang.
 
-**Fitur lanjutan C#.** 12 dari 21 fitur yang diuji menghasilkan keluaran identik
-di kedua runtime: garbage collection, `IDisposable`/`using`, threading dengan
-`lock` dan `Interlocked` (diserialkan — lihat dokumennya), primary constructor,
-collection expression atas array, extension members, P/Invoke, pattern matching,
-record, LINQ, source generator, dan interceptor.
+**async dan await.** `Task`, `Task<T>`, `TaskCompletionSource`, `Task.Run`,
+`Task.WhenAll`, dan pola awaiter sudah diimplementasikan, sehingga metode
+`async` berjalan — termasuk exception yang dilempar melintasi `await` lalu
+ditangkap pemanggilnya.
 
-Sebagian besar celah yang tersisa berbagi satu penyebab: **argumen tipe generic
-di-*erase*, bukan diinstansiasi**, sehingga `async`/`await`, TPL, `Span<T>`, dan
-marshalling struct tidak bisa di-resolve. Union types dan closed hierarchies
-belum ada di .NET 10 sama sekali — compiler mengurainya, tetapi tipe BCL yang
+```csharp
+static async Task<int> Chain(int n)
+{
+    int a = await Doubled(n);
+    int b = await Doubled(a);
+    return a + b;
+}
+```
+
+Metode `async` bukan sesuatu yang istimewa bagi runtime: Roslyn menurunkannya
+menjadi struct biasa ditambah panggilan ke sebuah *builder*, dan
+mengimplementasikan builder itulah keseluruhan dukungan `await`. Catatannya sama
+dengan yang dibawa `Thread` — **tidak ada tumpang tindih**. Sebuah task berjalan
+sampai selesai di titik ia dibuat, jadi hasil dan urutannya benar, tetapi tidak
+ada yang berjalan paralel.
+
+**Reflection bekerja di atas objek `Type` yang sungguhan.** `typeof(T)`,
+`GetType()`, base type, `IsAssignableFrom`, enumerasi anggota,
+`MethodInfo.Invoke`, get dan set `FieldInfo`, serta `Activator.CreateInstance`.
+Objek Type di-*intern* satu per tipe runtime, jadi `typeof(int) == typeof(int)`
+adalah kesetaraan referensi. Custom attribute juga sudah didekode — argumen
+konstruktor, named field, dan named property. `typeof(T)` atas parameter
+generic yang sudah di-*erase* melempar exception alih-alih menjawab
+`System.Object`.
+
+**Sebagian metode dikompilasi menjadi kode mesin.** `rustclr-jit` menghasilkan
+x86-64 ke dalam halaman write-xor-execute untuk metode *leaf* yang mengerjakan
+aritmetika bilangan bulat, setelah 32 panggilan membuktikan metode itu layak
+dikompilasi. Pada benchmark `kernels` hasilnya **10,7× lebih cepat** daripada
+interpretasi — 232 ms berbanding 2.484 ms, yaitu 1,6× .NET, bukan 17,5×.
+
+Jangkauannya sempit, dan `rustnet jit <assembly>` menyebutkan persis seberapa
+sempit: apa pun yang memakai array, pemanggilan, alokasi, atau exception
+handling tetap diinterpretasi. `rustnet run --no-jit` menginterpretasi
+semuanya, dan harus mencetak byte yang sama — ada differential test yang
+menjaminnya.
+
+**Fitur lanjutan C#.** 13 dari 21 fitur yang diuji menghasilkan keluaran identik
+di kedua runtime: garbage collection, `IDisposable`/`using`, `async`/`await`,
+threading dengan `lock` dan `Interlocked` (keduanya diserialkan — lihat
+dokumennya), primary constructor, collection expression atas array, extension
+members, P/Invoke, pattern matching, record, LINQ, source generator, dan
+interceptor.
+
+Celah yang tersisa adalah `Span<T>` dan marshalling struct, yang membutuhkan
+argumen tipe generic yang sudah di-*erase*; TPL dan `await using`, yang memang
+belum diimplementasikan; serta pointer unsafe, yang tidak bisa diekspresikan
+referensi terkelola yang struktural. Union types dan closed hierarchies belum
+ada di .NET 10 sama sekali — compiler mengurainya, tetapi tipe BCL yang
 dibutuhkannya belum ada.
 
 Matriks lengkapnya, beserta alasan tiap baris:
 [docs/id/fitur-lanjutan.md](docs/id/fitur-lanjutan.md).
 
 
-**Belum jalan.** *Argumen* tipe generic di-*erase*, sehingga kode generic buatan
+**Belum jalan.** Tidak ada yang berjalan konkuren: task `async` maupun badan
+`Thread` sama-sama dieksekusi inline, jadi hasilnya benar tetapi tidak ada
+paralelisme. *Argumen* tipe generic di-*erase*, sehingga kode generic buatan
 pengguna yang membaca `T` saat runtime — `typeof(T)`, `is T`, static field per
 instansiasi — tidak berperilaku benar, dan comparer kustom diabaikan.
-Exception filter (`catch when`) belum dievaluasi. State machine `async`/`await`
-belum dijalankan scheduler. Reflection masih minimal. Belum ada penghasil kode
-native — `rustclr-jit` menyediakan antarmuka kompilasi dan verifier IL,
-sedangkan eksekusinya masih interpretasi.
+Exception filter (`catch when`) belum dievaluasi.
+Penghasil kode native hanya menangani metode *leaf* bilangan bulat — 10,7× lebih
+cepat di tempat ia berlaku, tetapi menolak apa pun yang memakai array atau
+pemanggilan, yang mencakup sebagian besar program nyata.
 
 `rustnet capabilities` mencetak daftar ini langsung dari runtime, jadi tidak
 bisa melenceng dari kenyataan. Rincian: [docs/limitations.md](docs/limitations.md).
@@ -291,10 +337,37 @@ bisa melenceng dari kenyataan. Rincian: [docs/limitations.md](docs/limitations.m
 
 ## Target
 
-Pembaca metadata mengenali x86, x64, Arm, Arm64, RISC-V 32, dan RISC-V 64. Crate
-inti ditulis agar ramah `no_std`, dan collector punya profil `embedded` dengan
-pemicu alokasi kecil untuk target mikrokontroler (ESP32, STM32, RISC-V). Profil
-Cargo `embedded` melakukan build yang dioptimalkan untuk ukuran.
+Pembaca metadata mengenali x86, x64, Arm, Arm64, RISC-V 32, dan RISC-V 64.
+`rustclr-metadata` dan `rustclr-gc` **bisa dibangun tanpa `std`** untuk
+`thumbv7em-none-eabihf`, `thumbv6m-none-eabi`, `riscv32imc-unknown-none-elf`,
+dan `riscv64gc-unknown-none-elf` — `bash tests/embedded.sh` memeriksa keempatnya.
+
+**Dan keduanya berjalan di perangkat keras sungguhan — di tiga arsitektur.**
+Sebuah ESP32-WROOM-32 (Xtensa LX6), sebuah ESP32-C3 (RISC-V), dan sebuah
+Meadow F7 Micro (STM32F777, Arm Cortex-M7), dengan keluaran yang identik byte
+demi byte. Di tiap chip, pembaca metadata mengurai assembly hasil Roslyn
+langsung dari flash, dan collector-nya mereklamasi sebuah siklus referensi:
+
+```
+assembly         HelloWorld
+metadata version v4.0.30319
+entry point      Main
+cycle unrooted   live=0
+refused past it  true
+```
+
+Firmware: [ESP32](embedded/esp32-demo) · [Meadow F7](embedded/meadow-f7).
+Rekaman lengkap: [Xtensa](docs/logs/esp32-wroom32.log) ·
+[RISC-V](docs/logs/esp32c3.log) · [Arm](docs/logs/meadow-f7.log).
+
+**IL belum dieksekusi di chip.** Itu butuh interpreter, dan `rustclr-core` masih
+memerlukan `std` — hash map, jam, dan akses berkas. Papan itu bisa membaca
+assembly .NET dan mengelola heap, tetapi belum bisa menjalankan sebuah metode.
+
+`Heap::embedded(n)` adalah batas keras, bukan sekadar petunjuk: alokasi
+melampauinya gagal alih-alih tumbuh — satu-satunya jenis batas yang berarti di
+perangkat yang RAM-nya sudah dianggarkan di muka. Profil Cargo `embedded`
+melakukan build yang dioptimalkan untuk ukuran.
 
 ---
 
@@ -340,16 +413,60 @@ bukan lazy, sehingga efek samping di dalam predikat terjadi saat pemanggilan,
 bukan saat konsumsi; dan pengurutan membandingkan angka dan string, serta
 menolak tipe kunci lain alih-alih mengurutkannya secara sembarang.
 
-**Fitur lanjutan C#.** 12 dari 21 fitur yang diuji menghasilkan keluaran identik
-di kedua runtime: garbage collection, `IDisposable`/`using`, threading dengan
-`lock` dan `Interlocked` (diserialkan — lihat dokumennya), primary constructor,
-collection expression atas array, extension members, P/Invoke, pattern matching,
-record, LINQ, source generator, dan interceptor.
+**async dan await.** `Task`, `Task<T>`, `TaskCompletionSource`, `Task.Run`,
+`Task.WhenAll`, dan pola awaiter sudah diimplementasikan, sehingga metode
+`async` berjalan — termasuk exception yang dilempar melintasi `await` lalu
+ditangkap pemanggilnya.
 
-Sebagian besar celah yang tersisa berbagi satu penyebab: **argumen tipe generic
-di-*erase*, bukan diinstansiasi**, sehingga `async`/`await`, TPL, `Span<T>`, dan
-marshalling struct tidak bisa di-resolve. Union types dan closed hierarchies
-belum ada di .NET 10 sama sekali — compiler mengurainya, tetapi tipe BCL yang
+```csharp
+static async Task<int> Chain(int n)
+{
+    int a = await Doubled(n);
+    int b = await Doubled(a);
+    return a + b;
+}
+```
+
+Metode `async` bukan sesuatu yang istimewa bagi runtime: Roslyn menurunkannya
+menjadi struct biasa ditambah panggilan ke sebuah *builder*, dan
+mengimplementasikan builder itulah keseluruhan dukungan `await`. Catatannya sama
+dengan yang dibawa `Thread` — **tidak ada tumpang tindih**. Sebuah task berjalan
+sampai selesai di titik ia dibuat, jadi hasil dan urutannya benar, tetapi tidak
+ada yang berjalan paralel.
+
+**Reflection bekerja di atas objek `Type` yang sungguhan.** `typeof(T)`,
+`GetType()`, base type, `IsAssignableFrom`, enumerasi anggota,
+`MethodInfo.Invoke`, get dan set `FieldInfo`, serta `Activator.CreateInstance`.
+Objek Type di-*intern* satu per tipe runtime, jadi `typeof(int) == typeof(int)`
+adalah kesetaraan referensi. Custom attribute juga sudah didekode — argumen
+konstruktor, named field, dan named property. `typeof(T)` atas parameter
+generic yang sudah di-*erase* melempar exception alih-alih menjawab
+`System.Object`.
+
+**Sebagian metode dikompilasi menjadi kode mesin.** `rustclr-jit` menghasilkan
+x86-64 ke dalam halaman write-xor-execute untuk metode *leaf* yang mengerjakan
+aritmetika bilangan bulat, setelah 32 panggilan membuktikan metode itu layak
+dikompilasi. Pada benchmark `kernels` hasilnya **10,7× lebih cepat** daripada
+interpretasi — 232 ms berbanding 2.484 ms, yaitu 1,6× .NET, bukan 17,5×.
+
+Jangkauannya sempit, dan `rustnet jit <assembly>` menyebutkan persis seberapa
+sempit: apa pun yang memakai array, pemanggilan, alokasi, atau exception
+handling tetap diinterpretasi. `rustnet run --no-jit` menginterpretasi
+semuanya, dan harus mencetak byte yang sama — ada differential test yang
+menjaminnya.
+
+**Fitur lanjutan C#.** 13 dari 21 fitur yang diuji menghasilkan keluaran identik
+di kedua runtime: garbage collection, `IDisposable`/`using`, `async`/`await`,
+threading dengan `lock` dan `Interlocked` (keduanya diserialkan — lihat
+dokumennya), primary constructor, collection expression atas array, extension
+members, P/Invoke, pattern matching, record, LINQ, source generator, dan
+interceptor.
+
+Celah yang tersisa adalah `Span<T>` dan marshalling struct, yang membutuhkan
+argumen tipe generic yang sudah di-*erase*; TPL dan `await using`, yang memang
+belum diimplementasikan; serta pointer unsafe, yang tidak bisa diekspresikan
+referensi terkelola yang struktural. Union types dan closed hierarchies belum
+ada di .NET 10 sama sekali — compiler mengurainya, tetapi tipe BCL yang
 dibutuhkannya belum ada.
 
 Matriks lengkapnya, beserta alasan tiap baris:

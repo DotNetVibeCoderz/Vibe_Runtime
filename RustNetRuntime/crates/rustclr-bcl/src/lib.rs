@@ -26,6 +26,7 @@ pub mod interpolation;
 pub mod linq;
 pub mod numerics;
 pub mod ranges;
+pub mod reflection;
 pub mod runtime;
 pub mod strings;
 pub mod tasks;
@@ -46,6 +47,7 @@ pub fn install(interp: &mut Interpreter) {
     collections::register(interp);
     linq::register(interp);
     tasks::register(interp);
+    reflection::register(interp);
 }
 
 /// The number of native bindings [`install`] provides.

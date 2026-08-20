@@ -30,12 +30,13 @@ fn main() -> ExitCode {
             Ok(0)
         }
         Command::Capabilities => commands::capabilities(),
-        Command::Run { assembly, args, stats, trace, max_instructions } => {
-            commands::run(&assembly, args, stats, trace, max_instructions)
+        Command::Run { assembly, args, stats, trace, max_instructions, jit, jit_threshold } => {
+            commands::run(&assembly, args, stats, trace, max_instructions, jit, jit_threshold)
         }
         Command::Info { assembly, verbose } => commands::info(&assembly, verbose),
         Command::Disasm { assembly, filter } => commands::disasm(&assembly, filter.as_deref()),
         Command::Verify { assembly } => commands::verify(&assembly),
+        Command::Jit { assembly } => commands::jit(&assembly),
         Command::Build { project, configuration, run } => {
             commands::build(&project, &configuration, run)
         }

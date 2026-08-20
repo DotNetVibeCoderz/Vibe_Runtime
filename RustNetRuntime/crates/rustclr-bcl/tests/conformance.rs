@@ -9,7 +9,7 @@ use rustclr_core::{CaptureHost, Interpreter};
 
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../tests/fixtures/Conformance/bin/Release/net9.0/Conformance.dll"
+    "/../../tests/fixtures/Conformance/bin/Release/net10.0/Conformance.dll"
 );
 
 /// Recovers the managed stack trace captured when the exception was raised.

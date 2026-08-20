@@ -30,6 +30,7 @@ public static class Program
             case "virtual": return Report("virtual", VirtualCalls(2000000 * scale));
             case "exceptions": return Report("exceptions", Exceptions(50000 * scale));
             case "fields": return Report("fields", FieldAccess(3000000 * scale));
+            case "kernels": return Report("kernels", Kernels(60000 * scale));
             default:
                 Console.WriteLine("workloads: noop fib sieve strings matrix sort alloc virtual exceptions fields");
                 return 2;
@@ -45,6 +46,59 @@ public static class Program
 
     // ── Recursive call overhead ─────────────────────────────────────────────
     private static long Fib(int n) => n < 2 ? n : Fib(n - 1) + Fib(n - 2);
+
+    // ── Integer kernels: leaf methods, no arrays, no calls ──────────────────
+    //
+    // This is the shape RustCLR's x86-64 backend compiles, so it is the
+    // workload that shows what native code generation is worth. Every other
+    // workload here uses arrays or calls and is interpreted on both settings —
+    // which is itself worth measuring, since it shows the JIT costs nothing
+    // when it declines.
+    private static long Kernels(int iterations)
+    {
+        long total = 0;
+        for (int i = 0; i < iterations; i++)
+        {
+            total += FibIterative(i % 60);
+            total += Collatz(1 + (i % 500));
+            total += Mix(i);
+            total += Gcd(i, 360);
+        }
+        return total;
+    }
+
+    private static long FibIterative(int n)
+    {
+        long a = 0, b = 1;
+        for (int i = 0; i < n; i++) { long t = a + b; a = b; b = t; }
+        return a;
+    }
+
+    private static int Collatz(int n)
+    {
+        int steps = 0;
+        while (n != 1)
+        {
+            if (n % 2 == 0) n = n / 2;
+            else n = 3 * n + 1;
+            steps++;
+        }
+        return steps;
+    }
+
+    private static long Mix(long x)
+    {
+        x ^= x >> 33;
+        x *= 0x5bd1e995;
+        x ^= x >> 29;
+        return x;
+    }
+
+    private static int Gcd(int a, int b)
+    {
+        while (b != 0) { int t = b; b = a % b; a = t; }
+        return a;
+    }
 
     // ── Array writes and a tight loop ───────────────────────────────────────
     private static long Sieve(int limit)

@@ -15,14 +15,24 @@
 //!
 //! # Status
 //!
-//! No native code generator ships yet — [`InterpreterTier`] is the only
-//! implementation, and it reports every method as interpreted. The analysis it
-//! produces is real and is what a future x86-64/AArch64/RISC-V emitter will
-//! consume. This is stated plainly rather than implied by an empty trait.
+//! [`X64Backend`] emits real x86-64 machine code into write-xor-execute pages
+//! for leaf methods doing integer arithmetic — no calls, no allocation, no
+//! exception handling, no floating point. [`JitTier`] applies it after a method
+//! has been called enough times to be worth compiling, and everything it
+//! declines keeps running in the interpreter.
+//!
+//! AArch64 and RISC-V backends do not exist yet. `can_compile` reports what is
+//! actually handled rather than implying more.
 
+pub mod codepage;
+pub mod tier;
 pub mod verify;
+pub mod x64;
 
+pub use codepage::{CodePage, CodePageError};
 pub use verify::{analyse, MethodAnalysis, VerifyError, UNRESOLVED_CALL};
+pub use tier::JitTier;
+pub use x64::{NativeMethod, X64Backend};
 
 use rustclr_core::{Loader, MethodId, MethodKind, TypeRegistry};
 

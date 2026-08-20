@@ -6,6 +6,7 @@
 //! spec, the arm says so.
 
 use super::*;
+use rustclr_metadata::TableId;
 
 impl Interpreter {
     pub(super) fn execute(&mut self, ins: &Instruction) -> ExecResult<StepOutcome> {
@@ -570,10 +571,37 @@ impl Interpreter {
             // -- metadata ------------------------------------------------------------------------
             Op::Ldtoken => {
                 let token = ins.operand.as_token().ok_or_else(|| self.bad_operand(ins))?;
-                // A handle is opaque to managed code; carry the raw token. That
-                // is enough for `RuntimeHelpers.InitializeArray` and for the
-                // identity comparisons a record generates, and no more — see
-                // "Reflection is minimal" in docs/limitations.md.
+                // A *type* handle is resolved here rather than carried as a raw
+                // token, because a token only means anything relative to the
+                // assembly that emitted it — and the handle may be stored in a
+                // local and consumed somewhere else entirely. `typeof(T)`
+                // becomes `ldtoken T; call Type::GetTypeFromHandle`, and after
+                // this the second call is the identity function.
+                //
+                // Field and method handles stay raw: `InitializeArray` wants
+                // the token, and resolves it against the current assembly at
+                // the point of use.
+                let is_type_token = matches!(
+                    token.table(),
+                    Some(TableId::TypeDef) | Some(TableId::TypeRef) | Some(TableId::TypeSpec)
+                );
+                if is_type_token {
+                    // `typeof(T)` on a generic parameter has no answer here:
+                    // the argument was erased, and `resolve_type` would report
+                    // `System.Object`. That is a plausible-looking wrong answer
+                    // — the worst kind — so it is refused instead.
+                    if self.token_names_a_generic_parameter(token) {
+                        return Err(ExecutionError::exception(
+                            ClrExceptionKind::NotSupported,
+                            "typeof(T) cannot name a generic parameter on this runtime: type arguments are erased. See docs/limitations.md.",
+                        ));
+                    }
+                    if let Ok(type_id) = self.resolve_type(token) {
+                        let handle = self.type_object(type_id);
+                        self.push(Value::Obj(handle));
+                        return Ok(StepOutcome::Continue);
+                    }
+                }
                 self.push(Value::I32(token.raw() as i32));
             }
             Op::Sizeof => {
@@ -755,6 +783,23 @@ impl Interpreter {
             return Err(ExecutionError::null_reference());
         }
 
+        // A value type's method takes an unboxed `this`. Dispatch may have
+        // arrived here through a box — `object.ToString()` on a boxed `int`
+        // resolves to `Int32::ToString` — so unwrap it, exactly as the CLR
+        // does when it calls a value type's method on a boxed instance.
+        if has_this {
+            let target_type = self.loader.registry.method(target).declaring_type;
+            if self.loader.registry.ty(target_type).kind.is_value_like() {
+                if let Some(Value::Obj(h)) = args.first().cloned() {
+                    if let Some(inner) =
+                        self.heap.get_as::<ClrBox>(h).map(|b| b.value.clone())
+                    {
+                        args[0] = inner;
+                    }
+                }
+            }
+        }
+
         match self.enter(target, args)? {
             Entered::Frame => Ok(StepOutcome::Continue),
             Entered::Native(Some(v)) => {
@@ -763,6 +808,49 @@ impl Interpreter {
             }
             Entered::Native(None) => Ok(StepOutcome::Continue),
         }
+    }
+
+    /// True when a type token names a generic parameter rather than a type
+    /// this runtime can identify.
+    fn token_names_a_generic_parameter(&self, token: Token) -> bool {
+        if token.table() != Some(TableId::TypeSpec) {
+            return false;
+        }
+        let Some(assembly) = self.current_assembly() else { return false };
+        matches!(
+            self.loader.assembly(assembly).type_specs.get(&token.row()),
+            Some(TypeSig::Var(_) | TypeSig::MVar(_))
+        )
+    }
+
+    /// A native implementation the *receiver's* type provides for `name`.
+    ///
+    /// Both binding keys are tried, in the same order `enter` uses: the typed
+    /// one first, then the arity fallback. Checking only the typed key was a
+    /// real bug — `Type::GetCustomAttributes` is registered by arity, so a
+    /// virtual call declared on `MemberInfo` reached the base implementation
+    /// and read a type id as a method id.
+    fn native_override(
+        &mut self,
+        actual_type: TypeId,
+        name: &str,
+        sig: &rustclr_metadata::MethodSig,
+    ) -> Option<MethodId> {
+        let receiver = self.loader.registry.ty(actual_type).full_name();
+        for candidate in [
+            crate::naming::native_key_typed(&receiver, name, sig),
+            crate::naming::native_key(&receiver, name, sig),
+        ] {
+            if self.natives.contains_key(&candidate) {
+                return Some(self.loader.intern_internal_call(
+                    actual_type,
+                    name,
+                    sig.clone(),
+                    candidate,
+                ));
+            }
+        }
+        None
     }
 
     /// Picks the most-derived implementation for a virtual call.
@@ -797,10 +885,8 @@ impl Interpreter {
             // implementation instead, so `IEnumerable<T>::GetEnumerator` on a
             // list reaches the list's own enumerator rather than the
             // interface's unimplemented stub.
-            let receiver_name = self.loader.registry.ty(actual_type).full_name();
-            let native = crate::naming::native_key_typed(&receiver_name, &name, &sig);
-            if self.natives.contains_key(&native) {
-                return Ok(self.loader.intern_internal_call(actual_type, &name, sig, native));
+            if let Some(m) = self.native_override(actual_type, &name, &sig) {
+                return Ok(m);
             }
             return Ok(declared);
         }
@@ -825,10 +911,20 @@ impl Interpreter {
             None => {
                 let name = info.name.clone();
                 let sig = info.signature.clone();
-                Ok(self
-                    .loader
-                    .find_method_on_type(actual_type, &name, &sig)
-                    .unwrap_or(declared))
+                if let Some(m) = self.loader.find_method_on_type(actual_type, &name, &sig) {
+                    return Ok(m);
+                }
+                // The receiver's own native implementation wins over the one
+                // declared on its base. `System.Type` derives from
+                // `MemberInfo`, so `typeof(T).Name` is a virtual call on
+                // `MemberInfo::get_Name` — and answering it with the base's
+                // implementation would read a type id as a method id.
+                if actual_type != declaring {
+                    if let Some(m) = self.native_override(actual_type, &name, &sig) {
+                        return Ok(m);
+                    }
+                }
+                Ok(declared)
             }
         }
     }
@@ -1215,7 +1311,9 @@ impl Interpreter {
     }
 
     /// The zero value of a type, for `initobj` and default locals.
-    pub(super) fn zero_of(&self, type_id: TypeId) -> Value {
+    /// The default value of a type: zeroed fields for a struct, null for a
+    /// reference. Public because `Activator.CreateInstance` needs it too.
+    pub fn zero_of(&self, type_id: TypeId) -> Value {
         let ty = self.loader.registry.ty(type_id);
         match ty.primitive {
             Some(Primitive::Int64) | Some(Primitive::UInt64) => Value::I64(0),

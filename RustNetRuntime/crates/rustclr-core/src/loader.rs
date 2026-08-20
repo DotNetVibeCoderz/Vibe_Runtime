@@ -74,6 +74,12 @@ pub struct LoadedAssembly {
     /// whether any IL actually reaches one: an attribute constructor is
     /// referenced but never executed, and reporting it would be noise.
     pub unresolved_members: HashMap<u32, String>,
+    /// Custom attributes, keyed by the token they decorate.
+    ///
+    /// Kept as the constructor plus the raw blob rather than decoded up front:
+    /// most attributes are never read, and decoding one means running its
+    /// constructor, which cannot happen during loading.
+    pub attributes: HashMap<u32, Vec<CustomAttribute>>,
     /// Explicit interface implementations: `(implementing type, interface
     /// method)` to the method that implements it.
     ///
@@ -90,6 +96,15 @@ pub struct LoadedAssembly {
     pub entry_point: Option<Token>,
     /// Names of the assemblies this one references.
     pub references: Vec<String>,
+}
+
+/// One custom attribute applied to a type, method or field.
+#[derive(Debug, Clone)]
+pub struct CustomAttribute {
+    /// The attribute's constructor, which decoding calls to build the instance.
+    pub constructor: MethodId,
+    /// The encoded arguments, as ECMA-335 II.23.3 defines them.
+    pub value: Vec<u8>,
 }
 
 /// Resolves assemblies and owns the type registry.
@@ -203,6 +218,7 @@ impl Loader {
             method_spec_by_row: HashMap::new(),
             unresolved_members: HashMap::new(),
             method_impls: HashMap::new(),
+            attributes: HashMap::new(),
             type_specs: HashMap::new(),
             field_data: HashMap::new(),
             entry_point: None,
@@ -573,6 +589,92 @@ impl Loader {
         self.register_linq(synth, object);
         let value_type = self.core.value_type;
         self.register_tasks(synth, object, value_type);
+        self.register_reflection(synth, object, value_type);
+    }
+
+    /// Registers the reflection surface.
+    ///
+    /// `System.Type` carries one field: the id of the runtime type it
+    /// describes. That is what turns `typeof(T)` from a name into an object
+    /// with a base type, members and an identity — and the interpreter interns
+    /// one instance per type, so `typeof(int) == typeof(int)` is reference
+    /// equality as .NET guarantees.
+    fn register_reflection(
+        &mut self,
+        synth: &mut impl FnMut() -> Token,
+        object: TypeId,
+        value_type: TypeId,
+    ) {
+        const REFLECT: &str = "System.Reflection";
+
+        // `System.Type` is already registered without fields; give it the slot
+        // it needs by replacing the registration.
+        if let Some(existing) = self.registry.find_type_by_name("System.Type") {
+            let field_token = Token::new(TableId::Field, 0xFFFF);
+            let field_id = self.registry.add_field(
+                FieldInfo {
+                    id: FieldId::INVALID,
+                    name: "_id".to_string(),
+                    declaring_type: existing,
+                    token: field_token,
+                    signature: TypeSig::I4,
+                    field_type: TypeId::INVALID,
+                    is_static: false,
+                    is_literal: false,
+                    slot: 0,
+                    offset: None,
+                    constant: None,
+                },
+                self.bcl,
+            );
+            self.registry.ty_mut(existing).instance_fields.push(field_id);
+        }
+
+        // A member handle is the same shape: the id of what it describes, plus
+        // the type it was reached through.
+        //
+        // `MemberInfo` comes first because `System.Type` derives from it — that
+        // is what makes `typeof(T).Name` a virtual call on `MemberInfo`, and
+        // the hierarchy has to say so or dispatch resolves to the wrong body.
+        for name in ["MemberInfo", "MethodInfo", "ConstructorInfo", "FieldInfo", "PropertyInfo"] {
+            self.add_native_type_with_fields_of_kind(
+                REFLECT,
+                name,
+                TypeKind::Class,
+                Some(object),
+                synth(),
+                &["_id", "_declaring"],
+                self.bcl,
+            );
+        }
+        if let (Some(type_type), Some(member_info)) = (
+            self.registry.find_type_by_name("System.Type"),
+            self.registry.find_type_by_name("System.Reflection.MemberInfo"),
+        ) {
+            self.registry.ty_mut(type_type).base = Some(member_info);
+        }
+
+        for name in ["Assembly", "Module", "MethodBase", "ParameterInfo", "Binder"] {
+            self.add_native_type(REFLECT, name, TypeKind::Class, Some(object), synth());
+        }
+        // `BindingFlags` is an enum, so a cast to int has something to cast.
+        let flags = self.add_native_type(
+            REFLECT,
+            "BindingFlags",
+            TypeKind::Enum,
+            Some(self.core.enum_type),
+            synth(),
+        );
+        self.registry.ty_mut(flags).underlying = Some(Primitive::Int32);
+        self.add_native_type(
+            REFLECT,
+            "TargetInvocationException",
+            TypeKind::Class,
+            Some(self.core.exception),
+            synth(),
+        );
+        self.add_native_type("System", "Attribute", TypeKind::Class, Some(object), synth());
+        let _ = value_type;
     }
 
     /// Registers the `Task` and `async`/`await` surface.
@@ -950,6 +1052,7 @@ impl Loader {
             method_spec_by_row: HashMap::new(),
             unresolved_members: HashMap::new(),
             method_impls: HashMap::new(),
+            attributes: HashMap::new(),
             type_specs: HashMap::new(),
             field_data: HashMap::new(),
             entry_point: image.entry_point(),
@@ -1389,6 +1492,29 @@ impl Loader {
             }
         }
 
+        // --- pass 11: custom attributes ---------------------------------------
+        // Recorded, not decoded. Building an attribute instance means running
+        // its constructor, and nothing can run while the assembly is still
+        // loading — so the blob is kept and decoded on first request.
+        for row in 1..=md.row_count(TableId::CustomAttribute) {
+            let ca = md.custom_attribute(row).map_err(ExecutionError::Metadata)?;
+            let constructor = match ca.constructor.table() {
+                Some(TableId::MethodDef) => {
+                    assembly.method_by_row.get(&ca.constructor.row()).copied()
+                }
+                Some(TableId::MemberRef) => {
+                    assembly.member_ref_by_row.get(&ca.constructor.row()).copied()
+                }
+                _ => None,
+            };
+            let Some(constructor) = constructor else { continue };
+            assembly
+                .attributes
+                .entry(ca.parent.raw())
+                .or_default()
+                .push(CustomAttribute { constructor, value: ca.value.to_vec() });
+        }
+
         self.by_name.insert(name, id);
         self.assemblies.push(assembly);
 
@@ -1526,6 +1652,19 @@ impl Loader {
             TypeSig::FnPtr(_) => self.primitives[&Primitive::IntPtr],
             TypeSig::Modified { .. } | TypeSig::Pinned(_) => return None,
         })
+    }
+
+    /// Custom attributes applied to a metadata token, across every assembly.
+    ///
+    /// Searched by token rather than by declaring assembly because a caller has
+    /// only the runtime type in hand, and the token identifies the row that
+    /// declared it.
+    pub fn attributes_on(&self, assembly: AssemblyId, token: Token) -> &[CustomAttribute] {
+        self.assemblies
+            .get(assembly.index())
+            .and_then(|a| a.attributes.get(&token.raw()))
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// The explicit implementation of `declared` on `type_id`, if there is one.

@@ -135,7 +135,7 @@ cargo build --release            # target/release/rustnet
 dotnet run --project src/CodeGen # IDE-nya
 ```
 
-`cargo test --workspace` semestinya melaporkan 116 test lulus.
+`cargo test --workspace` semestinya melaporkan 141 test lulus.
 
 ---
 

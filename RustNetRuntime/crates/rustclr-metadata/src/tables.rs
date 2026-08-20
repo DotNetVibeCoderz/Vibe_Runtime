@@ -1,5 +1,8 @@
 //! The metadata root, its streams, and random access into the `#~` tables.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use crate::error::{MetadataError, Result};
 use crate::heaps::{BlobHeap, GuidHeap, StringHeap, UserStringHeap};
 use crate::reader::Reader;

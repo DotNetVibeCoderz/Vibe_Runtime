@@ -20,14 +20,15 @@ bash probe.sh
 
 ## Matriksnya
 
-**12 dari 21 probe menghasilkan keluaran identik di kedua runtime.**
+**13 dari 21 probe menghasilkan keluaran identik di kedua runtime.**
 
 ### Asynchronous & Parallel Programming
 
 | Fitur | RustCLR | Alasan |
 | --- | --- | --- |
-| `async` / `await` | ❌ | State machine-nya butuh `AsyncTaskMethodBuilder<T>` dan `TaskAwaiter<T>` |
-| Task Parallel Library (TPL) | ❌ | `Task<T>`, `Parallel.For` atas delegate generic |
+| `async` / `await` | ⚠️ **jalan, sinkron** | Builder dan awaiter-nya sudah ada; lihat catatan di bawah |
+| `Task`, `Task<T>`, `WhenAll`, `TaskCompletionSource` | ✅ | Hasil, urutan, dan propagasi exception sama dengan .NET |
+| Task Parallel Library (TPL) | ❌ | `Parallel.For` belum diimplementasikan |
 | Threading, `lock`, `Interlocked` | ⚠️ **jalan, tapi diserialkan** | Lihat catatan di bawah |
 
 ### Memory & Resource Management
@@ -36,7 +37,7 @@ bash probe.sh
 | --- | --- | --- |
 | Garbage Collection | ✅ | Mark-sweep, menangani siklus, bisa diganti |
 | `IDisposable` / `using` | ✅ | Dispatch interface menemukan `Dispose` yang konkret |
-| `IAsyncDisposable` / `await using` | ❌ | Butuh `async` |
+| `IAsyncDisposable` / `await using` | ❌ | Belum diimplementasikan; `async` sendiri sudah jalan |
 | `Span<T>`, `Memory<T>` | ❌ | Ref struct generic, dan `stackalloc` butuh `localloc` |
 
 ### Modern Language Features (C# 12–15)
@@ -84,10 +85,11 @@ tahu apakah ia memuat bilangan bulat atau referensi, sehingga satu implementasi
 melayani setiap `T`.
 
 Yang masih terhalang adalah hal yang benar-benar membutuhkan argumennya saat
-runtime: `Span<T>` dan `Task<T>` adalah ref struct dan tipe state-machine yang
-harus dimodelkan runtime, dan `Marshal.SizeOf<T>` butuh tata letak untuk `T`
-yang tidak dimilikinya. Itu pekerjaan [Milestone 3](../../Plan.md) dan
-[Milestone 4](../../Plan.md).
+runtime. `Task<T>` ternyata juga tidak membutuhkan apa pun dari *erasure* —
+sebuah task membawa hasilnya sebagai nilai runtime, jadi satu tipe `Task`
+melayani setiap `T`. Yang masih terhalang adalah `Span<T>`, sebuah ref struct
+yang harus dimodelkan runtime, dan `Marshal.SizeOf<T>` yang butuh tata letak
+untuk `T` yang tidak dimilikinya.
 
 Untuk kode generic buatan pengguna, dampak *erasure* yang terukur — `typeof(T)`,
 `is T`, static per instansiasi — ada di
@@ -106,6 +108,26 @@ hasilnya.
 Pengurutan membandingkan angka dan string. Tipe kunci lain **ditolak** dengan
 pesan yang jelas alih-alih diurutkan sembarangan, dan argumen `IComparer<T>`
 kustom diterima tetapi diabaikan.
+
+---
+
+## async bersifat sinkron
+
+`await` sudah jalan, dan hasil, urutan, serta propagasi exception sebuah metode
+async sama persis dengan .NET — termasuk exception yang dilempar melintasi
+`await` lalu ditangkap pemanggilnya. Yang tidak terjadi adalah *tumpang tindih*:
+sebuah task berjalan sampai selesai di titik ia dibuat, karena hanya ada satu
+thread interpreter. `Task.Run` langsung memanggil delegate-nya; `Task.Delay`
+tidur.
+
+Jalur suspend-and-resume-nya nyata, bukan dilewati: sebuah
+`TaskCompletionSource` yang diselesaikan setelah awaiter-nya menggantung
+benar-benar memarkir state machine di heap dan melanjutkannya saat selesai.
+Itulah yang diuji conformance check `resumed continuation`.
+
+Biayanya adalah setiap program yang bergantung pada dua task berjalan bersamaan,
+dan setiap percepatan wall-clock dari paralelisme. Itu datang bersama
+interpreter re-entrant — lihat catatan tentang thread di bawah, penyebabnya sama.
 
 ---
 
@@ -128,8 +150,8 @@ ditemukan sendiri.
 
 `rustclr-sched` sudah memiliki substrat aslinya — antrean lock-free, channel,
 dan thread pool, semuanya teruji. Yang belum ada adalah interpreter re-entrant
-yang bisa digerakkan beberapa thread OS sekaligus. Itu datang bersama
-[Milestone 3](../../Plan.md).
+yang bisa digerakkan beberapa thread OS sekaligus. Itulah satu-satunya bagian
+yang ditunggu baik oleh ini maupun oleh `async`.
 
 ---
 

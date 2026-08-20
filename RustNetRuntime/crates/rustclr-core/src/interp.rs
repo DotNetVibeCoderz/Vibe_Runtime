@@ -92,6 +92,32 @@ impl Frame {
     }
 }
 
+/// A code generator the interpreter can hand methods to.
+///
+/// The interpreter cannot depend on `rustclr-jit` — that crate depends on this
+/// one — so the seam is a trait here and the backend is installed by whoever
+/// builds the runtime. Declining is the normal answer: a backend that handles
+/// only some method shapes is useful immediately, and everything it turns down
+/// is interpreted exactly as before.
+pub trait NativeTier: Send {
+    fn name(&self) -> &'static str;
+
+    /// Offers a call to the backend.
+    ///
+    /// `None` means "not compiled — interpret it". `Some(result)` means the
+    /// method ran natively; the inner `Option` is its return value, absent for
+    /// a void method.
+    fn try_execute(
+        &mut self,
+        loader: &Loader,
+        method: MethodId,
+        args: &[Value],
+    ) -> Option<Option<Value>>;
+
+    /// Methods compiled and bytes emitted, for `--stats`.
+    fn stats(&self) -> (usize, usize);
+}
+
 /// A natively implemented method.
 ///
 /// Receives the interpreter — for heap access and re-entrant managed calls —
@@ -122,6 +148,8 @@ pub struct ExecutionStats {
     pub allocations: u64,
     pub max_frame_depth: usize,
     pub collections: u64,
+    /// Calls that ran as compiled machine code rather than being interpreted.
+    pub native_tier_calls: u64,
 }
 
 /// Outcome of entering a method.
@@ -147,6 +175,8 @@ pub struct Interpreter {
     pub limits: Limits,
     pub stats: ExecutionStats,
     natives: HashMap<String, NativeFn>,
+    /// Optional native code generator. `None` means everything is interpreted.
+    pub native_tier: Option<Box<dyn NativeTier>>,
     /// Frame depth below which a `ret` is returning out of the current
     /// invocation rather than into a managed caller. Zero at the top level;
     /// raised while a native method calls back into managed code.
@@ -158,6 +188,9 @@ pub struct Interpreter {
     literal_cache: HashMap<(u32, u32), Handle>,
     /// Interned strings, which are also GC roots.
     interned: HashMap<String, Handle>,
+    /// One `System.Type` instance per runtime type, so `typeof(T) == typeof(T)`
+    /// compares equal by reference the way .NET guarantees. Also GC roots.
+    type_objects: HashMap<TypeId, Handle>,
     exit_requested: Option<i32>,
     /// The method a native handler is currently servicing.
     ///
@@ -186,12 +219,14 @@ impl Interpreter {
             limits: Limits::default(),
             stats: ExecutionStats::default(),
             natives: HashMap::new(),
+            native_tier: None,
             frame_floor: 0,
             code_cache: HashMap::new(),
             frames: Vec::new(),
             next_frame_id: 1,
             literal_cache: HashMap::new(),
             interned: HashMap::new(),
+            type_objects: HashMap::new(),
             exit_requested: None,
             current_native: None,
         }
@@ -425,6 +460,48 @@ impl Interpreter {
         }
     }
 
+    /// The `System.Type` instance describing `type_id`, allocated once.
+    ///
+    /// Reflection identity matters: `typeof(int) == typeof(int)` is reference
+    /// equality on .NET, and code does rely on it. Interning here gives that
+    /// for free and keeps the object reachable for the process's life.
+    pub fn type_object(&mut self, type_id: TypeId) -> Handle {
+        if let Some(h) = self.type_objects.get(&type_id) {
+            if self.heap.is_valid(*h) {
+                return *h;
+            }
+        }
+        let Some(type_type) = self.loader.registry.find_type_by_name("System.Type") else {
+            return Handle::NULL;
+        };
+        let handle = self.alloc_object(type_type);
+        if let Some(o) = self.heap.get_as_mut::<ClrObject>(handle) {
+            if o.fields.is_empty() {
+                o.fields.push(Value::I32(type_id.0 as i32));
+            } else {
+                o.fields[0] = Value::I32(type_id.0 as i32);
+            }
+        }
+        self.type_objects.insert(type_id, handle);
+        handle
+    }
+
+    /// The runtime type a `System.Type` instance describes.
+    pub fn type_from_object(&self, handle: Handle) -> Option<TypeId> {
+        let object = self.heap.get_as::<ClrObject>(handle)?;
+        let type_type = self.loader.registry.find_type_by_name("System.Type")?;
+        if object.type_id != type_type {
+            return None;
+        }
+        let id = object.fields.first()?.as_i32()?;
+        let id = TypeId(id as u32);
+        if id.index() < self.loader.registry.type_count() {
+            Some(id)
+        } else {
+            None
+        }
+    }
+
     pub fn type_name_of(&self, handle: Handle) -> String {
         self.type_of(handle)
             .map(|t| self.loader.registry.ty(t).full_name())
@@ -445,6 +522,7 @@ impl Interpreter {
         }
         out.extend(self.interned.values().copied());
         out.extend(self.literal_cache.values().copied());
+        out.extend(self.type_objects.values().copied());
         out
     }
 
@@ -571,6 +649,16 @@ impl Interpreter {
         if !kind_is_il {
             let value = self.call_non_il(method, &args)?;
             return Ok(Entered::Native(value));
+        }
+
+        // Offer the call to the code generator before building a frame. A
+        // compiled method needs no interpreter state at all, so this is where
+        // the saving is: no frame, no locals vector, no decode loop.
+        if let Some(tier) = self.native_tier.as_mut() {
+            if let Some(result) = tier.try_execute(&self.loader, method, &args) {
+                self.stats.native_tier_calls += 1;
+                return Ok(Entered::Native(result));
+            }
         }
 
         if self.frames.len() >= self.limits.max_frames {

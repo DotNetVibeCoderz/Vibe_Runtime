@@ -13,35 +13,45 @@ cargo build --release        # produces target/release/rustnet
 Execute an assembly's entry point on RustCLR.
 
 ```bash
-rustnet run <assembly> [--stats] [--trace] [--max-instructions N] [-- args...]
+rustnet run <assembly> [--stats] [--trace] [--max-instructions N]
+                       [--no-jit] [--jit-threshold N] [-- args...]
 ```
 
 | | |
 | --- | --- |
-| `--stats` | Print execution and heap counters when the program exits |
+| `--stats` | Print execution, code-generation and heap counters when the program exits |
 | `--trace` | Report what was loaded before running |
 | `--max-instructions N` | Stop after N IL instructions — a runaway loop fails predictably |
+| `--no-jit` | Interpret everything. Output must be identical; if it is not, that is a code-generation bug |
+| `--jit-threshold N` | Calls before a method is compiled. Default 32; `1` compiles on first call |
 | `-- args...` | Everything after `--` reaches the program as `Main`'s arguments |
 
 ```console
-$ rustnet run Conformance.dll --stats
-checks=37 failures=0
+$ rustnet run Conformance.dll --stats --jit-threshold 1
+checks=134 failures=0
 
 ─── execution ──────────────────────────────
-  wall clock                  10.505 ms
-  IL instructions              19,617
-  throughput                 1,867,343 instr/s
-  managed calls                 2,167
-  native calls                    103
-  peak frame depth                 16
+  wall clock                  88.147 ms
+  IL instructions              799,420
+  throughput                 9,069,189 instr/s
+  managed calls                 84,266
+  native calls                  41,893
+  compiled calls                    13
+  methods compiled                   8
+  code emitted               2,040 bytes
+  peak frame depth                  16
 ─── heap ───────────────────────────────────
-  collector               mark-sweep
-  allocations                     194
-  bytes allocated              10,023
-  collections                       0
-  objects reclaimed                 0
-  live objects                    194
+  collector                 mark-sweep
+  allocations                   41,508
+  bytes allocated            2,627,093
+  collections                        0
+  objects reclaimed                  0
+  live objects                  41,508
 ```
+
+The three code-generation rows appear only when the JIT is enabled.
+`compiled calls` counts entries into machine code; `methods compiled` is how
+many distinct methods the backend took.
 
 An unhandled exception prints the managed stack trace, the way a .NET host does,
 and exits with 1.
@@ -120,6 +130,38 @@ Verifying MyApp
 
 A clean report is a good predictor that the program will run. Exit code is 0
 when nothing was found, 1 otherwise, so it fits in a build script.
+
+---
+
+## jit
+
+Report what the native code generator can compile, and why it declines the rest.
+
+```bash
+rustnet jit <assembly>
+```
+
+```console
+$ rustnet jit Benchmarks.dll
+Code generation for Benchmarks
+Backend: x86-64 baseline
+
+  JIT  Benchmarks.Program::FibIterative(int)  (226 bytes)
+  JIT  Benchmarks.Program::Collatz(int)  (277 bytes)
+  JIT  Benchmarks.Program::Mix(long)  (195 bytes)
+  JIT  Benchmarks.Program::Gcd(int,int)  (131 bytes)
+
+  --   Benchmarks.Program::Fib(int): uses call
+  --   Benchmarks.Program::Sieve(int): local 0 is not an integer
+  --   Benchmarks.Program::Exceptions(int): has exception handling
+  --   Node::.ctor(): is an instance method
+
+4 compiled, 20 interpreted, 829 bytes emitted.
+```
+
+**A declined method is not a failure.** It is interpreted, exactly as it was
+before the backend existed. The reasons are listed because they are actionable:
+they are the backend's to-do list, ordered by what a real program actually hits.
 
 ---
 

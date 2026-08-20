@@ -2,13 +2,13 @@
 
 Tracking for RustNetRuntime. Updated 2026-08-20.
 
-**Verified this session:** `cargo test --workspace` → 116 passed, 0 failed.
+**Verified this session:** `cargo test --workspace` → 141 passed, 0 failed.
 Five programs — two conformance suites, a sample, and two written or edited by
 the assistant against a live LLM — produce byte-identical output on RustCLR and
 .NET.
 
 ```
-Conformance    IDENTICAL — checks=90 failures=0
+Conformance    IDENTICAL — checks=134 failures=0
 ModernSyntax   IDENTICAL — checks=35 failures=0
 UserDirectory  IDENTICAL
 PrimeSieve     IDENTICAL   (written by Jack from a prompt)
@@ -24,11 +24,125 @@ SensorGateway  IDENTICAL   (edited by Jack from a prompt)
 | `rustclr-metadata` | PE/COFF + ECMA-335 reader, signatures, IL bodies | 27 tests, incl. 9 against a real Roslyn-built assembly |
 | `rustclr-gc` | Handle-based heap, pluggable collectors, mark-sweep | 10 tests; 200k-deep graph marks without stack overflow |
 | `rustclr-core` | Type system, loader, IL interpreter, exception handling | 18 tests |
-| `rustclr-bcl` | Native BCL: Console, String, Math, interpolation, tuples, ranges, Nullable, generic collections, LINQ, Task and async | 16 unit + 8 integration; 655 bindings |
+| `rustclr-bcl` | Native BCL: Console, String, Math, interpolation, tuples, ranges, Nullable, generic collections, LINQ, Task and async, reflection | 20 unit + 8 integration; 757 bindings |
 | `rustclr-sched` | Lock-free MS queue, MPMC channel, thread pool | 16 tests |
 | `rustclr-interop` | P/Invoke, dynamic loading, marshalling | 9 tests; calls the real `GetCurrentProcessId` |
-| `rustclr-jit` | Compiler trait, IL verifier, basic-block analysis | 9 tests |
+| `rustclr-jit` | Compiler trait, IL verifier, analysis, **x86-64 code generator**, W^X pages, tiering | 25 unit + 3 differential |
 | `rustnet-cli` | `run` / `info` / `disasm` / `verify` / `build` / `capabilities` | Drives every fixture |
+
+### The bare-metal crates actually build now
+
+Milestone 6, the buildable half. `rustclr-metadata` and `rustclr-gc` compile
+without `std` for four targets — thumbv7em, thumbv6m, riscv32imc, riscv64gc —
+and `tests/embedded.sh` checks all of them.
+
+**The `no_std` claim was half true before.** `rustclr-gc` built; the metadata
+crate did not, because its `use alloc::…` sat in `lib.rs` and reached no
+submodule, so every module failed at once the moment `std` went away. A shared
+prelude fixed it. The script exists so this cannot rot silently — which is
+exactly what happened to three integration tests left pointing at `net9.0`.
+
+**A fixed heap has to be able to say no.** `Heap::embedded(n)` *reserved* n
+slots and then grew past them on demand, which on a device whose RAM was
+budgeted up front is not a bound at all. It is a ceiling now: `try_alloc`
+returns `None` when full, and there is a test that fills one and checks it
+refuses.
+
+**And it runs on three architectures.** An ESP32-WROOM-32 (Xtensa LX6), an
+ESP32-C3 (RISC-V) and a Meadow F7 Micro (STM32F777, Arm Cortex-M7) were all
+flashed and run, and their metadata and collector output is **byte-identical**.
+On each chip:
+
+- `rustclr-metadata` parsed a Roslyn-built `HelloWorld.dll` out of flash and
+  reported its assembly name, metadata version, table counts, entry point and
+  both declared types;
+- `rustclr-gc` allocated a three-node ring, kept it while rooted, **collected it
+  once unrooted** (`live=0` — cycles really are reclaimed), detected a stale
+  handle, and filled its heap to exactly the 128-slot ceiling before refusing.
+
+Captured output: [Xtensa](docs/logs/esp32-wroom32.log) ·
+[RISC-V](docs/logs/esp32c3.log) · [Arm](docs/logs/meadow-f7.log).
+
+**Difficulty tracked how upstream the target is.** RISC-V and Arm are both
+upstream Rust targets: stable toolchain, prebuilt `core` and `alloc`, no
+`build-std`. Xtensa needed the forked toolchain from `espup`, an ESP-IDF app
+descriptor the bootloader would accept, and a physically held BOOT button.
+
+**The Meadow's obstacle was different in kind.** Its crystal frequency is
+published nowhere and USB will not enumerate without it. The sibling RustNet
+Meadow F7 port had already established it — 25 MHz, an Abracon ABM12W-25 at
+X401 — by sweeping candidates and letting a USB host adjudicate. Reusing that
+answer rather than rediscovering it is the difference between a board that
+boots and one that spends its first seconds searching; the firmware prints what
+it actually locked to, so the claim stays checkable.
+
+A second lesson from that board: **enumeration is not the same as someone
+reading**. The first build printed on enumeration and lost most of its report
+into an endpoint nothing was draining. It now waits for `DTR` — a terminal
+actually opening the port — and reports once per session.
+
+**IL did not execute there**, and that distinction matters. The chip can read a
+.NET assembly and manage a heap; it cannot yet run a method, because
+`rustclr-core` still needs `std`.
+
+Two bugs stood between "compiles" and "runs": the metadata crate's `use alloc::…`
+reached only `lib.rs`, and `Image` was gated on `std` in its entirety when only
+`from_file` and `path()` need a filesystem.
+
+### Reflection works on real Type objects
+
+Milestone 5, three quarters of it. `System.Type` is an object holding a type id,
+interned one per runtime type — so `typeof(int) == typeof(int)` is reference
+equality, which .NET guarantees and real code relies on. `ldtoken` resolves a
+type token where it executes rather than carrying it as a number, because a
+metadata token means nothing outside the assembly that emitted it.
+
+Delivered: names, namespace, base type, the `IsXxx` family, `IsAssignableFrom`,
+`IsInstanceOfType`, `GetMethods`/`GetFields`/`GetMethod`/`GetField`,
+`MethodInfo.Invoke`, `FieldInfo` get and set, and `Activator.CreateInstance`.
+
+**Custom attributes are decoded on demand.** The blob is kept at load time and
+read the first time someone asks, because building an instance means running its
+constructor and nothing can run mid-load. Constructor arguments, named fields
+and named properties all work.
+
+**Three refusals rather than plausible answers.** `typeof(T)` on a generic
+parameter throws `NotSupportedException` — the argument was erased, and
+answering `System.Object` would be wrong in a way nobody would notice. Same for
+`Activator.CreateInstance<T>()`. And an attribute whose argument shape cannot be
+decoded is omitted rather than built with an invented value.
+
+### Some methods now run as machine code
+
+Milestone 4, half of it. `rustclr-jit` emits real x86-64 for leaf methods doing
+integer arithmetic, into pages that are mapped writable, filled, and only then
+flipped to executable — never both at once. A tiering policy compiles a method
+after 32 calls; everything the backend declines is interpreted exactly as
+before.
+
+**What it is worth.** On the `kernels` benchmark, which is the shape the backend
+covers: 2484 ms interpreted, 232 ms compiled — **10.7× faster**, and 1.6× .NET
+rather than 17.5×.
+
+**What it does not cover, and why that matters.** Running `rustnet jit` on the
+existing benchmark suite compiles *nothing*: every workload there uses arrays or
+calls. That is a real finding, not a footnote — the backend's reach is narrow,
+and the honest way to show it was to add a workload of the covered shape beside
+the others rather than in place of them.
+
+The next step is arrays, and it is a real one. Handles are not pointers, so
+reading `a[i]` from machine code means resolving a handle through the handle
+table — which needs a call back into the runtime, and therefore a calling
+convention the backend does not have yet.
+
+**The bug worth remembering.** The first working version passed every unit test
+and then corrupted memory in release builds only. The prologue pushed `rbx`,
+`r14` and `r15` *after* establishing `rbp`, so local 0 at `[rbp-8]` sat exactly
+on top of saved `rbx`: a compiled method returned having destroyed its caller's
+registers. It never showed up in the emitter's own tests, because the corruption
+lands in whoever called it. There is now an assertion on the frame layout, and a
+differential test that runs the whole conformance fixture both ways and compares
+byte for byte.
 
 ### async and await now run
 
@@ -179,6 +293,11 @@ Each was found by running something real, not by reading code.
 | The loader ignored the `MethodImpl` table, so **every explicit interface implementation was invisible to dispatch** | A `yield return` iterator, whose state machine implements `IEnumerable<T>` explicitly |
 | **`e.Message` was empty for every exception a program constructed itself** — the setter wrote field 0, the getter only ever read a `ClrException` | Chasing what looked like an async bug; the synchronous case failed the same way |
 | `string.Join` bound only the `string[]` overload, so joining any other sequence failed to resolve | `Task.WhenAll` results, which come back as a list |
+| **Compiled code destroyed its caller's callee-saved registers** — locals overlapped the saved `rbx`/`r14`/`r15` | A release-only crash; the emitter's own tests all passed |
+| Three integration tests pointed at `net9.0` and had been silently *skipping* since the .NET 10 migration | Reading them while adding a fourth |
+| **`"" + boxedInt` printed 0.** Improving virtual dispatch routed `object.ToString()` on a boxed `int` to `Int32::ToString`, whose receiver then arrived boxed | The advanced-feature matrix dropping 13 → 10 in one run |
+| `MethodInfo.Invoke` and `FieldInfo.SetValue` passed the *box* to a primitive parameter, so every later read returned zero | The reflection conformance checks |
+| The virtual-dispatch fallback checked only the *typed* native key, not the arity one, so `Type::GetCustomAttributes` lost to `MemberInfo`'s | An attribute probe panicking on a type id read as a method id |
 
 Two are worth dwelling on.
 
@@ -220,10 +339,17 @@ Ordered as in [Plan.md](Plan.md):
    runs its body inline. `rustclr-sched` has the substrate; what is missing is a
    re-entrant interpreter several OS threads can drive at once. TPL
    (`Parallel.For`) and `await using` are unimplemented.
-3. **Native code generation** — `rustclr-jit` has the interface, the verifier
-   and the analysis; there is no backend. This is what the benchmark gap is.
-4. **Reflection** — `GetType()` returns a name, not a `System.Type`.
-5. **Embedded targets** — designed for, never flashed to hardware.
+3. **Native code generation beyond leaf integer methods** — the x86-64 backend
+   exists and is 10.7× faster where it applies, but it declines anything using
+   arrays, calls, allocation or exception handling, which is most of a real
+   program. Arrays are the next piece; AArch64, RISC-V and inlining are untouched.
+4. **Reflection breadth** — `PropertyInfo` accessors, `MethodInfo` parameter
+   lists, `Assembly`/`Module` enumeration, and constructing generic types at run
+   time. Types, members, invocation and attributes all work.
+5. **IL execution on hardware** — the metadata reader and collector run on an
+   ESP32; the interpreter does not, because `rustclr-core` still needs a hash
+   map, a clock and file IO. Ahead-of-time compilation additionally needs Arm
+   and RISC-V backends.
 6. **Exception filters** — `catch when` is treated as non-matching.
 
 `rustnet capabilities` prints this from the runtime itself, and

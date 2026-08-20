@@ -8,7 +8,7 @@ use rustclr_core::{CaptureHost, Interpreter, Value};
 
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../tests/fixtures/HelloWorld/bin/Release/net9.0/HelloWorld.dll"
+    "/../../tests/fixtures/HelloWorld/bin/Release/net10.0/HelloWorld.dll"
 );
 
 /// Builds an interpreter with the BCL installed and the fixture loaded.

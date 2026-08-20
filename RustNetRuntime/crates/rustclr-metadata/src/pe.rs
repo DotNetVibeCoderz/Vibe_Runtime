@@ -4,6 +4,9 @@
 //! translate RVAs), the CLI header (to find the metadata root and entry point),
 //! and enough of the optional header to tell PE32 from PE32+.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use crate::error::{MetadataError, Result};
 use crate::reader::Reader;
 

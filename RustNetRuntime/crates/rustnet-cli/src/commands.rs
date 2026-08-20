@@ -17,16 +17,29 @@ fn runtime(args: Vec<String>) -> Interpreter {
     interp
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     assembly: &str,
     args: Vec<String>,
     show_stats: bool,
     trace: bool,
     max_instructions: Option<u64>,
+    jit: bool,
+    jit_threshold: Option<u32>,
 ) -> Result<i32> {
     let mut interp = runtime(args);
     if let Some(budget) = max_instructions {
         interp.limits.max_instructions = Some(budget);
+    }
+    if jit {
+        // Methods the backend declines keep running in the interpreter, so
+        // enabling this can only change how fast a program runs, never what it
+        // prints. `--no-jit` exists to make that checkable.
+        let tier = match jit_threshold {
+            Some(t) => rustclr_jit::JitTier::with_threshold(t),
+            None => rustclr_jit::JitTier::new(),
+        };
+        interp.native_tier = Some(Box::new(tier));
     }
 
     let id = interp.loader.load_from_file(assembly)?;
@@ -95,6 +108,12 @@ fn print_stats(interp: &Interpreter, elapsed: std::time::Duration) {
     eprintln!("  throughput          {:>14.0} instr/s", ips);
     eprintln!("  managed calls       {:>14}", s.calls);
     eprintln!("  native calls        {:>14}", s.native_calls);
+    if let Some(tier) = interp.native_tier.as_ref() {
+        let (methods, bytes) = tier.stats();
+        eprintln!("  compiled calls      {:>14}", s.native_tier_calls);
+        eprintln!("  methods compiled    {:>14}", methods);
+        eprintln!("  code emitted        {:>14} bytes", bytes);
+    }
     eprintln!("  peak frame depth    {:>14}", s.max_frame_depth);
     eprintln!("─── heap ───────────────────────────────────");
     eprintln!("  collector           {:>14}", interp.heap.collector_name());
@@ -279,6 +298,112 @@ fn render_operand(interp: &Interpreter, operand: &Operand) -> String {
     }
 }
 
+/// Reports what the native code generator can and cannot take.
+///
+/// A declined method is not a failure — it is interpreted, exactly as before.
+/// The point of listing them is that the *reasons* are actionable: they are the
+/// backend's to-do list, in the order a real program cares about.
+pub fn jit(assembly: &str) -> Result<i32> {
+    let mut interp = runtime(Vec::new());
+    let id = interp.loader.load_from_file(assembly)?;
+    rustclr_interop::install(&mut interp);
+
+    println!("Code generation for {}", interp.loader.assembly(id).name);
+    println!("Backend: x86-64 baseline
+");
+
+    let methods: Vec<rustclr_core::MethodId> = interp
+        .loader
+        .registry
+        .iter_methods()
+        .filter(|m| m.assembly == id && matches!(m.kind, MethodKind::Il(_)))
+        .map(|m| m.id)
+        .collect();
+
+    use rustclr_jit::Compiler as _;
+    let mut backend = rustclr_jit::X64Backend::new();
+    let mut compiled = 0usize;
+    let mut declined: Vec<(String, String)> = Vec::new();
+
+    for method in methods {
+        let name = interp.loader.registry.method(method).qualified_name.clone();
+        if !backend.can_compile(&interp.loader.registry, method) {
+            declined.push((name, describe_decline(&interp, method)));
+            continue;
+        }
+        match backend.compile(&interp.loader, method) {
+            Ok(code) => {
+                println!("  JIT  {name}  ({} bytes)", code.bytes.len());
+                compiled += 1;
+            }
+            Err(e) => declined.push((name, e.to_string())),
+        }
+    }
+
+    if !declined.is_empty() {
+        println!();
+        for (name, reason) in &declined {
+            println!("  --   {name}: {reason}");
+        }
+    }
+
+    println!(
+        "
+{compiled} compiled, {} interpreted, {} bytes emitted.",
+        declined.len(),
+        backend.bytes_emitted
+    );
+    Ok(0)
+}
+
+/// Why the baseline backend turned a method down, in the order it checks.
+fn describe_decline(interp: &Interpreter, method: rustclr_core::MethodId) -> String {
+    let info = interp.loader.registry.method(method);
+    let MethodKind::Il(body) = &info.kind else {
+        return "no IL body".into();
+    };
+    if !body.exception_clauses.is_empty() {
+        return "has exception handling".into();
+    }
+    if info.signature.has_this {
+        return "is an instance method".into();
+    }
+    if !info.returns_void() && !is_integer_sig(&info.signature.return_type) {
+        return "returns a non-integer type".into();
+    }
+    if let Some(i) = info.signature.params.iter().position(|p| !is_integer_sig(p)) {
+        return format!("parameter {i} is not an integer");
+    }
+    if let Some(i) = body.locals.iter().position(|l| !is_integer_sig(l)) {
+        return format!("local {i} is not an integer");
+    }
+    match rustclr_core::opcode::decode_all(&body.il) {
+        Ok(instructions) => {
+            let mut unsupported: Vec<String> = instructions
+                .iter()
+                .filter(|i| !rustclr_jit::x64::is_supported(i.op))
+                .map(|i| i.op.name().to_string())
+                .collect();
+            unsupported.sort();
+            unsupported.dedup();
+            if unsupported.is_empty() {
+                "declined by the backend".into()
+            } else {
+                format!("uses {}", unsupported.join(", "))
+            }
+        }
+        Err(e) => format!("undecodable IL: {e}"),
+    }
+}
+
+fn is_integer_sig(sig: &rustclr_core::metadata::TypeSig) -> bool {
+    use rustclr_core::metadata::TypeSig as T;
+    matches!(
+        sig.unwrap_modifiers(),
+        T::Boolean | T::Char | T::I1 | T::U1 | T::I2 | T::U2 | T::I4 | T::U4 | T::I8 | T::U8
+    )
+}
+
 pub fn verify(assembly: &str) -> Result<i32> {
     let mut interp = runtime(Vec::new());
     let id = interp.loader.load_from_file(assembly)?;
@@ -397,7 +522,7 @@ pub fn build(project: &str, configuration: &str, then_run: bool) -> Result<i32> 
         .ok_or("build succeeded but no output assembly was found under bin/")?;
 
     println!("Running {} on RustCLR…\n", assembly.display());
-    run(&assembly.to_string_lossy(), Vec::new(), false, false, None)
+    run(&assembly.to_string_lossy(), Vec::new(), false, false, None, true, None)
 }
 
 /// Finds the first `.dll` under a build output directory.
@@ -421,7 +546,16 @@ pub fn capabilities() -> Result<i32> {
     println!("RustCLR runtime capabilities\n");
     println!("Execution");
     println!("  IL interpreter               yes");
-    println!("  native JIT backend           not yet (analysis tier only)");
+    println!("  native JIT backend           x86-64, LEAF INTEGER METHODS ONLY:");
+    println!("                               integer arithmetic, comparison, branching,");
+    println!("                               arguments and locals. No calls, allocation,");
+    println!("                               exception handling, floating point or object");
+    println!("                               access. Everything else is interpreted, and");
+    println!("                               `rustnet jit <assembly>` says which is which.");
+    println!("  code memory                  write-xor-execute; never both at once");
+    println!("  tiering                      compile after 32 calls; --no-jit disables");
+    println!("  AArch64, RISC-V backends     no - x86-64 only");
+    println!("  inlining                     no - the analysis exists, the backend does not");
     println!("  managed call depth limit     {}", interp.limits.max_frames);
     println!("\nMemory");
     println!("  collector                    {}", interp.heap.collector_name());
@@ -434,7 +568,18 @@ pub fn capabilities() -> Result<i32> {
     println!("  delegates                    yes (unicast and multicast)");
     println!("  generics                     erased to object");
     println!("  generic methods              instantiations bind by type argument");
-    println!("  reflection                   minimal");
+    println!("  reflection                   System.Type is a real object:");
+    println!("                               name, namespace, base type, IsValueType and");
+    println!("                               friends, IsAssignableFrom, GetMethods,");
+    println!("                               GetFields, MethodInfo.Invoke, FieldInfo");
+    println!("                               get/set, Activator.CreateInstance.");
+    println!("                               typeof(T) on a generic parameter is REFUSED:");
+    println!("                               the argument was erased, so there is no type");
+    println!("                               to name and a guess would look plausible.");
+    println!("  custom attributes            yes - constructor arguments, named fields and");
+    println!("                               named properties. An argument shape this");
+    println!("                               runtime cannot decode (arrays, Type, boxed)");
+    println!("                               omits that attribute rather than inventing it.");
 
     println!("
 Collections and LINQ");
@@ -497,6 +642,21 @@ Collections and LINQ");
     println!("  struct marshalling           no - Marshal.SizeOf<T> is generic");
     println!("\nBase class library");
     println!("  native bindings registered   {}", interp.native_count());
+
+    println!("\nEmbedded targets");
+    println!("  metadata + GC without std    yes - thumbv7em, thumbv6m, riscv32imc,");
+    println!("                               riscv64gc, and xtensa-esp32 via the esp fork");
+    println!("  fixed-size heap              yes - Heap::embedded(n) is a hard ceiling");
+    println!("  interpreter without std      no - needs a hash map, a clock and file IO");
+    println!("  ahead-of-time compilation    no - needs Arm and RISC-V backends");
+    println!("  run on real hardware         yes - three architectures, byte-identical:");
+    println!("                               ESP32-WROOM-32 (Xtensa LX6), ESP32-C3");
+    println!("                               (RISC-V), Meadow F7 (Arm Cortex-M7).");
+    println!("                               the metadata reader parsed a Roslyn assembly");
+    println!("                               out of flash and the collector reclaimed a");
+    println!("                               cycle, on each chip. IL execution did NOT run");
+    println!("                               there - that needs the interpreter, which");
+    println!("                               still requires std. See docs/logs/.");
 
     println!("\nArchitectures recognised in PE headers");
     for m in [

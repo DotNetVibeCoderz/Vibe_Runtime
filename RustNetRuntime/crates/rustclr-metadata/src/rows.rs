@@ -1,5 +1,8 @@
 //! Typed views over the metadata rows the runtime actually consumes.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use crate::error::Result;
 use crate::tables::Metadata;
 use crate::token::{CodedIndex, TableId, Token};

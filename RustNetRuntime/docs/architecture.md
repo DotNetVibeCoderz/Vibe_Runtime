@@ -187,10 +187,42 @@ The compilation seam, plus the analysis every backend needs first: basic-block
 leaders, per-instruction stack depth, and the properties that decide whether a
 method is compilable or inlinable.
 
-There is no native code generator yet. `InterpreterTier` is the only
-implementation and reports every method as interpreted. This is stated plainly
-rather than implied by an empty trait — and the analysis it produces is real,
-running as `rustnet verify`.
+`X64Backend` turns that analysis into x86-64 machine code for leaf methods doing
+integer arithmetic. The evaluation stack is not simulated: because the verifier
+knows the depth at every instruction, each stack slot has a statically known
+home — the shallowest two in `r14` and `r15`, the rest spilled to the frame — so
+most operations become a single register-to-register instruction.
+
+`JitTier` decides *when*: a method is interpreted until it has been called 32
+times, then compiled. `InterpreterTier` remains available and is what
+`rustnet verify` runs.
+
+Code memory is **write-xor-execute**. A page is mapped readable and writable,
+filled, and only then flipped to readable and executable; it is never both at
+once. All the `unsafe` in this crate is in `codepage.rs` and the one transmute
+that calls a finished page.
+
+The backend declines far more than it takes — anything with calls, arrays,
+allocation or exception handling — and `rustnet jit <assembly>` reports which is
+which. That is the tiering model working as intended rather than a gap: a
+declined method runs exactly as it did before.
+
+---
+
+## Reflection
+
+`System.Type` is an ordinary managed object carrying one field: the id of the
+runtime type it describes. The interpreter interns one instance per type, which
+is what makes `typeof(int) == typeof(int)` reference equality — a guarantee .NET
+gives and real code depends on.
+
+`ldtoken` resolves a *type* token where it executes rather than pushing the raw
+number, because a metadata token means nothing outside the assembly that emitted
+it and the handle may be consumed somewhere else entirely. Field and method
+tokens stay raw; `RuntimeHelpers.InitializeArray` wants the token.
+
+`MethodInfo`, `FieldInfo` and the rest are the same shape: the id of what they
+describe plus the type they were reached through.
 
 ---
 
@@ -198,7 +230,8 @@ running as `rustnet verify`.
 
 - **A C# compiler.** Roslyn does that. RustCLR consumes IL.
 - **Managed CoreLib.** The framework is a contract implemented natively.
-- **A native backend.** Milestone 4.
+- **A backend for anything but leaf integer methods on x86-64.** Arrays, calls,
+  AArch64 and RISC-V are Milestone 4's remaining half.
 
 See [limitations.md](limitations.md) for the full list, or run
 `rustnet capabilities`, which prints it from the runtime itself.

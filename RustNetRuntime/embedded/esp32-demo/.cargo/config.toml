@@ -1,0 +1,27 @@
+# Two chips, two very different cores.
+#
+#   ESP32-WROOM-32   Xtensa LX6    xtensa-esp32-none-elf
+#   ESP32-C3         RISC-V        riscv32imc-unknown-none-elf
+#
+# The RISC-V target is upstream, so stable Rust builds it with prebuilt `core`
+# and `alloc`. Xtensa is not: it needs the forked toolchain from espup and
+# `-Z build-std`, which is why neither the target nor `build-std` is set
+# globally here. See README.md for the two commands.
+
+[target.riscv32imc-unknown-none-elf]
+runner = "espflash flash --monitor"
+rustflags = [
+  # esp-hal ships the memory map and startup symbols as a linker script.
+  "-C", "link-arg=-Tlinkall.x",
+  "-C", "force-frame-pointers",
+]
+
+[target.xtensa-esp32-none-elf]
+runner = "espflash flash --monitor"
+rustflags = [
+  "-C", "link-arg=-nostartfiles",
+  "-C", "link-arg=-Wl,-Tlinkall.x",
+]
+
+[env]
+ESP_LOG = "info"

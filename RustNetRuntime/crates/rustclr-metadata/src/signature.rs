@@ -1,5 +1,8 @@
 //! Metadata signature blobs (ECMA-335 II.23.2).
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use crate::error::{MetadataError, Result};
 use crate::reader::Reader;
 use crate::token::{CodedIndex, TableId, Token};

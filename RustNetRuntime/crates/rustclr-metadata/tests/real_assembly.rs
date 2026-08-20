@@ -9,7 +9,7 @@ use rustclr_metadata::{Image, TableId, SignatureParser, TypeSig};
 fn fixture() -> Option<Image> {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../tests/fixtures/HelloWorld/bin/Release/net9.0/HelloWorld.dll"
+        "/../../tests/fixtures/HelloWorld/bin/Release/net10.0/HelloWorld.dll"
     );
     if !std::path::Path::new(path).exists() {
         eprintln!("skipping: fixture not built ({path})");

@@ -35,7 +35,7 @@ Jalankan suite test untuk memastikan hasil build-nya sehat:
 cargo test --workspace
 ```
 
-Anda mestinya melihat 116 test lulus.
+Anda mestinya melihat 141 test lulus.
 
 ---
 
@@ -76,7 +76,7 @@ dotnet bin/Release/net10.0/Conformance.dll
 rustnet run bin/Release/net10.0/Conformance.dll
 ```
 
-Keduanya mencetak `checks=80 failures=0`. Kalau suatu saat berbeda, itu bug
+Keduanya mencetak `checks=134 failures=0`. Kalau suatu saat berbeda, itu bug
 runtime — dan pemeriksaan yang berbeda itu langsung menunjuk penyebabnya.
 `tests/fixtures/ModernSyntax/` melakukan hal serupa untuk fitur C# modern dan
 mencetak `checks=35 failures=0`.
@@ -103,9 +103,9 @@ rustnet run bin/Release/net10.0/AplikasiAnda.dll
 ```
 
 Kalau `verify` melaporkan anggota framework yang hilang, itu wajar untuk apa pun
-yang memakai `async`, `Span<T>`, atau tipe framework yang belum
-diimplementasikan RustBCL — lihat [limitations.md](../limitations.md). Koleksi
-generic dan LINQ sudah jalan.
+yang memakai `Span<T>`, TPL, atau tipe framework yang belum diimplementasikan
+RustBCL — lihat [limitations.md](../limitations.md). Koleksi generic, LINQ, dan
+`async`/`await` sudah jalan.
 
 ---
 

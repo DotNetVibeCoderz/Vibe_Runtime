@@ -1,5 +1,8 @@
 //! Metadata tokens and the table identifiers they encode.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use core::fmt;
 
 /// The 45 metadata tables of ECMA-335 II.22, identified by their table number.

@@ -1,5 +1,8 @@
 //! Error type shared by the metadata reader.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use core::fmt;
 
 /// Everything that can go wrong while decoding a PE image or its metadata.

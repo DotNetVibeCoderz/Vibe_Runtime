@@ -11,10 +11,10 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 PROJECT="$HERE/Benchmarks"
-ASSEMBLY="$PROJECT/bin/Release/net9.0/Benchmarks.dll"
+ASSEMBLY="$PROJECT/bin/Release/net10.0/Benchmarks.dll"
 
 RUNS="${RUNS:-3}"
-WORKLOADS="${WORKLOADS:-noop fib sieve strings matrix sort alloc virtual exceptions fields}"
+WORKLOADS="${WORKLOADS:-noop fib sieve strings matrix sort alloc virtual exceptions fields kernels}"
 
 # Prefer a release build of the toolchain; fall back to debug with a warning.
 RUSTNET="$ROOT/target/release/rustnet"

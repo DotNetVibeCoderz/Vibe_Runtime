@@ -1,0 +1,8 @@
+[build]
+target = "riscv64gc-unknown-none-elf"
+
+# memory.x comes first: it defines MEMORY, the REGION_ALIAS lines link.x needs,
+# and the _max_hart_id override — which only takes effect if it is seen before
+# link.x's PROVIDE default.
+[target.riscv64gc-unknown-none-elf]
+rustflags = ["-C", "link-arg=-Tmemory.x", "-C", "link-arg=-Tlink.x"]
