@@ -96,7 +96,7 @@ Install into a throwaway prefix, exercise it, then uninstall:
 ./install.sh --prefix /tmp/rustnet-test
 /tmp/rustnet-test/bin/rustnet capabilities
 /tmp/rustnet-test/bin/rustnet run \
-  /tmp/rustnet-test/samples/UserDirectory/bin/Release/net9.0/UserDirectory.dll
+  /tmp/rustnet-test/samples/UserDirectory/bin/Release/net10.0/UserDirectory.dll
 ./install.sh --prefix /tmp/rustnet-test --uninstall
 ```
 

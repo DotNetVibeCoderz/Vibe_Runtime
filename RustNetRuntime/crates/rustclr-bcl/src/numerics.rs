@@ -247,7 +247,7 @@ fn write_out_param(
     value: Value,
 ) -> rustclr_core::ExecResult<()> {
     if let Some(Value::Ref(r)) = args.get(index) {
-        let target: ByRef = *r;
+        let target: ByRef = r.clone();
         interp.store_indirect_public(target, value)?;
     }
     Ok(())

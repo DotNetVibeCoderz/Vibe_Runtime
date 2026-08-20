@@ -70,7 +70,7 @@ Buka terminal baru sesudahnya agar perubahan `PATH` berlaku.
 
 ```bash
 rustnet capabilities
-rustnet run <prefix>/samples/UserDirectory/bin/Release/net9.0/UserDirectory.dll
+rustnet run <prefix>/samples/UserDirectory/bin/Release/net10.0/UserDirectory.dll
 ```
 
 ---
@@ -135,7 +135,7 @@ cargo build --release            # target/release/rustnet
 dotnet run --project src/CodeGen # IDE-nya
 ```
 
-`cargo test --workspace` semestinya melaporkan 111 test lulus.
+`cargo test --workspace` semestinya melaporkan 116 test lulus.
 
 ---
 

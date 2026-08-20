@@ -24,10 +24,10 @@ handling — produces identical output on both runtimes:
 
 ```console
 $ dotnet Conformance.dll
-checks=38 failures=0
+checks=80 failures=0
 
 $ rustnet run Conformance.dll --stats
-checks=38 failures=0
+checks=80 failures=0
 
 ─── execution ──────────────────────────────
   wall clock                  10.505 ms
@@ -49,7 +49,7 @@ divide-by-zero, delegates, and allocation under collection pressure. A second
 suite, `tests/fixtures/ModernSyntax/`, does the same for 35 modern C# features.
 Both are normal C# projects you can read and extend.
 
-`cargo test --workspace` runs 111 tests across the eight crates.
+`cargo test --workspace` runs 116 tests across the eight crates.
 
 ---
 
@@ -153,7 +153,7 @@ Full guide: [docs/installation.md](docs/installation.md).
 
 ## Getting started
 
-**Prerequisites:** Rust 1.85+ and the .NET SDK 9 or 10.
+**Prerequisites:** Rust 1.85+ and the .NET SDK 10.
 
 ```bash
 # Build the runtime and toolchain
@@ -162,7 +162,7 @@ cargo build --release
 # Compile a C# program with the .NET SDK, then run it on RustCLR
 cd tests/fixtures/HelloWorld
 dotnet build -c Release
-../../../target/release/rustnet run bin/Release/net9.0/HelloWorld.dll
+../../../target/release/rustnet run bin/Release/net10.0/HelloWorld.dll
 ```
 
 ```bash
@@ -237,11 +237,49 @@ records, pattern matching, switch expressions, target-typed `new`, local
 functions and `out` variables. `tests/fixtures/ModernSyntax/` exercises 35 of
 them and reports `failures=0` on both runtimes.
 
-**Does not work yet.** Generics are erased to `object` rather than
-instantiated. Exception filters (`catch when`) are not evaluated. `async`/`await`
-state machines are not driven by the scheduler. Reflection is minimal. There is
-no native code generator — `rustclr-jit` supplies the compilation interface and
-the IL verifier, and execution is interpreted.
+**Collections and LINQ.** `List<T>`, `Dictionary<K,V>`, `HashSet<T>`,
+`Queue<T>` and `Stack<T>` are implemented natively, and so is LINQ — about forty
+`Enumerable` operators including `GroupBy` and `OrderBy`/`ThenBy`.
+
+```csharp
+var totals = orders
+    .Where(o => o.Paid)
+    .GroupBy(o => o.Region)
+    .OrderBy(g => g.Key)
+    .ToDictionary(g => g.Key, g => g.Sum(o => o.Amount));
+```
+
+That runs, byte-identically to .NET. So does `foreach` over `IEnumerable<T>`,
+over a `yield return` iterator, and over any type implementing the enumerator
+pattern.
+
+Two caveats, both stated by `rustnet capabilities`: **LINQ is eager**, not lazy,
+so side effects in a predicate happen at the call rather than at consumption;
+and ordering compares numbers and strings, refusing any other key type rather
+than sorting it arbitrarily.
+
+**Advanced C# features.** 12 of 21 probed features produce identical output on
+both runtimes: garbage collection, `IDisposable`/`using`, threading with `lock`
+and `Interlocked` (serialised — see below), primary constructors, collection
+expressions over arrays, extension members, P/Invoke, pattern matching, records,
+LINQ, source generators and interceptors.
+
+Most of the remaining gaps share one cause: **generic types are erased rather
+than instantiated**, so `async`/`await`, TPL, `Span<T>` and struct marshalling
+cannot resolve. Union types and closed hierarchies are not in .NET 10 at all —
+the compiler parses them but the BCL types they need do not exist yet.
+
+The full matrix, with why each row lands where it does:
+[docs/advanced-features.md](docs/advanced-features.md).
+
+
+**Does not work yet.** Generic type *arguments* are erased, so user generic
+code that reads `T` at run time — `typeof(T)`, `is T`, a static field per
+instantiation — does not behave correctly, and custom comparers are ignored.
+Exception filters (`catch when`) are not evaluated. `async`/`await` state
+machines are not driven by the scheduler. Reflection is minimal. There is no
+native code generator — `rustclr-jit` supplies the compilation interface and the
+IL verifier, and execution is interpreted.
 
 `rustnet capabilities` prints this list from the runtime itself, so it cannot
 drift from reality. Detail: [docs/limitations.md](docs/limitations.md).
@@ -262,6 +300,7 @@ The core crates are written to be `no_std`-friendly, and the collector has an
 - [Getting started](docs/getting-started.md) · [Bahasa Indonesia](docs/id/memulai.md)
 - [Installation](docs/installation.md) · [Bahasa Indonesia](docs/id/instalasi.md)
 - [Benchmarks](docs/benchmarks.md)
+- [Advanced C# features](docs/advanced-features.md) · [Bahasa Indonesia](docs/id/fitur-lanjutan.md)
 - [Architecture](docs/architecture.md)
 - [The runtime in depth](docs/runtime.md)
 - [CodeGen guide](docs/codegen.md) · [Bahasa Indonesia](docs/id/codegen.md)

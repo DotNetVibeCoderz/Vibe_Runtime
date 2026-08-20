@@ -69,7 +69,7 @@ Open a new terminal afterwards so the `PATH` change takes effect.
 
 ```bash
 rustnet capabilities
-rustnet run <install-prefix>/samples/UserDirectory/bin/Release/net9.0/UserDirectory.dll
+rustnet run <install-prefix>/samples/UserDirectory/bin/Release/net10.0/UserDirectory.dll
 ```
 
 ---

@@ -147,6 +147,10 @@ pub struct Interpreter {
     pub limits: Limits,
     pub stats: ExecutionStats,
     natives: HashMap<String, NativeFn>,
+    /// Frame depth below which a `ret` is returning out of the current
+    /// invocation rather than into a managed caller. Zero at the top level;
+    /// raised while a native method calls back into managed code.
+    frame_floor: usize,
     code_cache: HashMap<MethodId, Arc<CompiledMethod>>,
     frames: Vec<Frame>,
     next_frame_id: u32,
@@ -182,6 +186,7 @@ impl Interpreter {
             limits: Limits::default(),
             stats: ExecutionStats::default(),
             natives: HashMap::new(),
+            frame_floor: 0,
             code_cache: HashMap::new(),
             frames: Vec::new(),
             next_frame_id: 1,
@@ -373,6 +378,28 @@ impl Interpreter {
         })
     }
 
+    /// Allocates an array whose elements are untyped evaluation-stack values.
+    ///
+    /// This is the storage the generic collections are built on. `object[]`
+    /// would force every `int` into a box; `Values` storage holds an `I32` slot
+    /// directly, and the collector still traces it because a `Value` reports
+    /// the handles it carries.
+    pub fn alloc_value_array(&mut self, length: usize) -> Handle {
+        let element_type = self.loader.core().object;
+        let array_type = self
+            .loader
+            .registry
+            .find_sz_array(element_type)
+            .unwrap_or_else(|| self.loader.core().array);
+        self.stats.allocations += 1;
+        self.heap.alloc(ClrArray {
+            array_type,
+            element_type,
+            storage: ArrayStorage::Values(vec![Value::Null; length]),
+            dimensions: vec![length as u32],
+        })
+    }
+
     pub fn box_value(&mut self, type_id: TypeId, value: Value) -> Handle {
         self.stats.allocations += 1;
         self.heap.alloc(ClrBox { type_id, value })
@@ -478,10 +505,18 @@ impl Interpreter {
     /// Runs a method to completion and returns its result.
     pub fn invoke(&mut self, method: MethodId, args: Vec<Value>) -> ExecResult<Option<Value>> {
         let base = self.frames.len();
-        match self.enter(method, args)? {
-            Entered::Native(v) => Ok(v),
-            Entered::Frame => self.run_until(base),
-        }
+        // Mark the floor for this invocation. A method returning *to* the floor
+        // is returning to this call, not to the managed frame underneath it —
+        // without which its result would be pushed onto an unrelated
+        // evaluation stack and lost to the caller here.
+        let previous_floor = core::mem::replace(&mut self.frame_floor, base);
+        let result = match self.enter(method, args) {
+            Ok(Entered::Native(v)) => Ok(v),
+            Ok(Entered::Frame) => self.run_until(base),
+            Err(e) => Err(e),
+        };
+        self.frame_floor = previous_floor;
+        result
     }
 
     /// Runs the entry point of an assembly and returns its exit code.
@@ -799,6 +834,7 @@ impl Interpreter {
 
     fn do_return(&mut self, value: Option<Value>) -> ExecResult<StepOutcome> {
         let finished = self.frames.pop();
+        let below_floor = self.frames.len() <= self.frame_floor;
         // A `.ctor` returns void, but `newobj` must leave the new instance on
         // the caller's stack.
         let value = value.or_else(|| match finished {
@@ -814,6 +850,12 @@ impl Interpreter {
             },
             None => None,
         });
+        // Returning to or below the floor hands the value back to whoever
+        // started this invocation — the top-level runner, or a native method
+        // that called into managed code.
+        if below_floor {
+            return Ok(StepOutcome::Returned(value));
+        }
         match (self.frames.last_mut(), value) {
             (Some(caller), Some(v)) => {
                 caller.stack.push(v);

@@ -314,15 +314,49 @@ impl Interpreter {
             Op::Ldflda => {
                 let token = ins.operand.as_token().ok_or_else(|| self.bad_operand(ins))?;
                 let obj = self.pop()?;
-                let handle = obj.as_handle().filter(|h| !h.is_null()).ok_or_else(
-                    ExecutionError::null_reference,
-                )?;
                 let field = self.resolve_field(token)?;
-                let type_id = self.type_of(handle).unwrap_or(TypeId::INVALID);
-                let slot = self
-                    .field_slot(type_id, field)
-                    .ok_or_else(|| self.missing_field(field))? as u32;
-                self.push(Value::Ref(ByRef::Field { object: handle, slot }));
+
+                // The receiver is either a heap object, or a managed pointer to
+                // a value type — `p.X` where `p` is a struct local compiles to
+                // `ldloca p; ldflda X`, and there is no object to point at.
+                let address = match &obj {
+                    Value::Ref(base) => {
+                        let container = self.load_indirect(base.clone())?;
+                        match container {
+                            Value::Struct(s) => {
+                                let slot = self
+                                    .field_slot(s.type_id, field)
+                                    .ok_or_else(|| self.missing_field(field))?
+                                    as u32;
+                                ByRef::StructField { base: Box::new(base.clone()), slot }
+                            }
+                            // A pointer to a slot holding a reference: the
+                            // field lives on the object it refers to.
+                            Value::Obj(h) if !h.is_null() => {
+                                let type_id = self.type_of(h).unwrap_or(TypeId::INVALID);
+                                let slot = self
+                                    .field_slot(type_id, field)
+                                    .ok_or_else(|| self.missing_field(field))?
+                                    as u32;
+                                ByRef::Field { object: h, slot }
+                            }
+                            _ => return Err(ExecutionError::null_reference()),
+                        }
+                    }
+                    _ => {
+                        let handle = obj
+                            .as_handle()
+                            .filter(|h| !h.is_null())
+                            .ok_or_else(ExecutionError::null_reference)?;
+                        let type_id = self.type_of(handle).unwrap_or(TypeId::INVALID);
+                        let slot = self
+                            .field_slot(type_id, field)
+                            .ok_or_else(|| self.missing_field(field))?
+                            as u32;
+                        ByRef::Field { object: handle, slot }
+                    }
+                };
+                self.push(Value::Ref(address));
             }
             Op::Ldsfld => {
                 let token = ins.operand.as_token().ok_or_else(|| self.bad_operand(ins))?;
@@ -536,7 +570,10 @@ impl Interpreter {
             // -- metadata ------------------------------------------------------------------------
             Op::Ldtoken => {
                 let token = ins.operand.as_token().ok_or_else(|| self.bad_operand(ins))?;
-                // A handle is opaque to managed code; carry the raw token.
+                // A handle is opaque to managed code; carry the raw token. That
+                // is enough for `RuntimeHelpers.InitializeArray` and for the
+                // identity comparisons a record generates, and no more — see
+                // "Reflection is minimal" in docs/limitations.md.
                 self.push(Value::I32(token.raw() as i32));
             }
             Op::Sizeof => {
@@ -681,17 +718,25 @@ impl Interpreter {
         }
         args.reverse();
 
-        // `constrained.` on a value type boxes the receiver so a virtual call
-        // through an interface reaches the boxed instance.
+        // `constrained.` hands the call a managed pointer to the receiver, and
+        // ECMA-335 III.2.1 says what to do with it: box a value type so the
+        // virtual call reaches the boxed instance, and *dereference* a
+        // reference type so `this` is the reference the pointer holds.
+        //
+        // Only the value-type half used to be implemented, which left every
+        // `foreach` broken at the `Dispose` in its finally block: the receiver
+        // arrived as a pointer, so dispatch had no object to look at.
         if let Some(ct) = constrained {
             let type_id = self.resolve_type(ct)?;
-            if self.loader.registry.ty(type_id).kind.is_value_like() {
-                if let Some(first) = args.first_mut() {
-                    if let Value::Ref(r) = first.clone() {
-                        let inner = self.load_indirect(r)?;
-                        let boxed = self.box_value(type_id, inner);
-                        *first = Value::Obj(boxed);
-                    }
+            let value_like = self.loader.registry.ty(type_id).kind.is_value_like();
+            if let Some(first) = args.first_mut() {
+                if let Value::Ref(r) = first.clone() {
+                    let inner = self.load_indirect(r)?;
+                    *first = if value_like {
+                        Value::Obj(self.box_value(type_id, inner))
+                    } else {
+                        inner
+                    };
                 }
             }
         }
@@ -738,8 +783,24 @@ impl Interpreter {
         if self.loader.registry.ty(declaring).kind == TypeKind::Interface {
             let name = info.name.clone();
             let sig = info.signature.clone();
+            // An explicit implementation is emitted under a mangled name, so it
+            // has to be looked up through `MethodImpl` before matching by
+            // shape — otherwise it is invisible.
+            if let Some(m) = self.loader.explicit_implementation(actual_type, declared) {
+                return Ok(m);
+            }
             if let Some(m) = self.loader.find_method_on_type(actual_type, &name, &sig) {
                 return Ok(m);
+            }
+            // A natively implemented receiver has no managed method to find —
+            // `List<T>` carries no IL at all. Bind to its native
+            // implementation instead, so `IEnumerable<T>::GetEnumerator` on a
+            // list reaches the list's own enumerator rather than the
+            // interface's unimplemented stub.
+            let receiver_name = self.loader.registry.ty(actual_type).full_name();
+            let native = crate::naming::native_key_typed(&receiver_name, &name, &sig);
+            if self.natives.contains_key(&native) {
+                return Ok(self.loader.intern_internal_call(actual_type, &name, sig, native));
             }
             return Ok(declared);
         }
@@ -750,7 +811,25 @@ impl Interpreter {
                 .registry
                 .resolve_virtual(actual_type, slot)
                 .unwrap_or(declared)),
-            None => Ok(declared),
+            // No slot means the declared method is a native stub — the
+            // framework's own `Object::ToString`, `Equals` or `GetHashCode`,
+            // which have no managed body and so were never laid out in a
+            // vtable. A `callvirt` at one still has to reach the receiver's
+            // override: `item.ToString()` compiles to a virtual call on
+            // `System.Object::ToString`, and without this it printed the type
+            // name instead of running the user's method.
+            //
+            // Only managed methods are found here — native stubs are not
+            // recorded on their declaring type — so a native implementation is
+            // never shadowed by this.
+            None => {
+                let name = info.name.clone();
+                let sig = info.signature.clone();
+                Ok(self
+                    .loader
+                    .find_method_on_type(actual_type, &name, &sig)
+                    .unwrap_or(declared))
+            }
         }
     }
 
@@ -878,7 +957,7 @@ impl Interpreter {
                     .ok_or_else(|| self.missing_field(field))
             }
             Value::Ref(r) => {
-                let inner = self.load_indirect(*r)?;
+                let inner = self.load_indirect(r.clone())?;
                 self.load_field(&inner, token)
             }
             Value::Struct(s) => {
@@ -901,9 +980,9 @@ impl Interpreter {
         // slot, write it back. C# reaches every field of a local struct this
         // way (`ldloca`; `stfld`).
         if let Value::Ref(r) = obj {
-            let mut current = self.load_indirect(*r)?;
+            let mut current = self.load_indirect(r.clone())?;
             self.set_struct_field(&mut current, field, value)?;
-            return self.store_indirect(*r, current);
+            return self.store_indirect(r.clone(), current);
         }
 
         let h = obj.as_handle().filter(|h| !h.is_null()).ok_or_else(
@@ -980,6 +1059,15 @@ impl Interpreter {
                 .get_as::<ClrArray>(array)
                 .and_then(|a| a.storage.get(index as usize))
                 .ok_or_else(|| ExecutionError::index_out_of_range(index as i64, 0))?,
+            ByRef::StructField { base, slot } => {
+                let container = self.load_indirect(*base)?;
+                match container {
+                    Value::Struct(s) => s.fields.get(slot as usize).cloned().unwrap_or(Value::Null),
+                    // The container is not a struct any more, which means the
+                    // slot the pointer was taken from has been overwritten.
+                    other => return Err(self.type_error("load through a struct field pointer", &other)),
+                }
+            }
         })
     }
 
@@ -1005,6 +1093,26 @@ impl Interpreter {
             },
             ByRef::Static { slot, .. } => {
                 *self.loader.static_value_mut(FieldId(slot)) = value;
+            }
+            ByRef::StructField { base, slot } => {
+                // Value types are copied, not aliased: read the container,
+                // write the field, write the container back through the same
+                // pointer. The base always resolves to the live slot, so the
+                // update lands where the struct actually lives.
+                let mut container = self.load_indirect((*base).clone())?;
+                match &mut container {
+                    Value::Struct(s) => {
+                        if let Some(f) = s.fields.get_mut(slot as usize) {
+                            *f = value;
+                        }
+                    }
+                    other => {
+                        return Err(
+                            self.type_error("store through a struct field pointer", &other.clone())
+                        )
+                    }
+                }
+                return self.store_indirect(*base, container);
             }
             ByRef::ArrayElement { array, index } => {
                 let ok = self

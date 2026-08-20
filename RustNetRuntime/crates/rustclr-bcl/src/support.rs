@@ -15,7 +15,7 @@ pub fn arg(interp: &mut Interpreter, args: &[Value], i: usize) -> ExecResult<Val
         return Ok(Value::Null);
     };
     match v {
-        Value::Ref(r) => interp.load_indirect_public(*r),
+        Value::Ref(r) => interp.load_indirect_public(r.clone()),
         other => Ok(other.clone()),
     }
 }
@@ -95,7 +95,7 @@ pub fn display(interp: &mut Interpreter, v: &Value) -> String {
         Value::NativeInt(i) => i.to_string(),
         Value::F(f) => format_double(*f),
         Value::FnPtr(_) => "System.IntPtr".into(),
-        Value::Ref(r) => match interp.load_indirect_public(*r) {
+        Value::Ref(r) => match interp.load_indirect_public(r.clone()) {
             Ok(inner) => display(interp, &inner),
             Err(_) => String::new(),
         },

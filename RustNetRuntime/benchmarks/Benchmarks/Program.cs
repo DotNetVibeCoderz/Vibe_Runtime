@@ -4,9 +4,10 @@ namespace Benchmarks;
 /// One workload per run, so the harness measures wall clock from the outside
 /// and neither runtime gets to hide startup cost inside a timer.
 ///
-/// Everything here stays inside the IL subset RustCLR executes: arrays and
-/// explicit loops, no LINQ, no generic collections. That is deliberate — a
-/// benchmark that only runs on one of the two runtimes measures nothing useful.
+/// Everything here uses arrays and explicit loops: no LINQ, no generic
+/// collections. That is deliberate — a benchmark that only runs on one of the
+/// two runtimes measures nothing useful, and staying allocation-light keeps the
+/// figures about the interpreter rather than the collection implementations.
 /// </summary>
 public static class Program
 {

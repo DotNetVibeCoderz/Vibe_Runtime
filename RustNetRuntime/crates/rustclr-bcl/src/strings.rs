@@ -261,18 +261,11 @@ pub fn register(interp: &mut Interpreter) {
         let array = char_array(i, &s);
         Ok(Some(Value::Obj(array)))
     });
-    interp.register_native("System.String::Join(string,string[])", |i, a| {
-        let sep = arg_string_or_empty(i, a, 0)?;
-        let array = arg_handle(i, a, 1)?;
-        let parts: Vec<String> = array_values(i, array)
-            .iter()
-            .map(|v| {
-                let v = v.clone();
-                display(i, &v)
-            })
-            .collect();
-        Ok(Some(string_value(i, &parts.join(&sep))))
-    });
+    // `Join` has an array overload and an `IEnumerable<T>` one. The latter's
+    // typed key embeds metadata tokens, so both bind through the arity key and
+    // the source is read with whatever reader fits it.
+    interp.register_native("System.String::Join(string,string[])", join_sequence);
+    interp.register_native("System.String::Join/2", join_sequence);
 
     interp.register_native("System.String::Format(string,object)", |i, a| {
         let fmt = arg_string_or_empty(i, a, 0)?;
@@ -358,6 +351,18 @@ pub fn register(interp: &mut Interpreter) {
 /// `StringBuilder` is backed by a managed object whose single field holds a
 /// managed string; that keeps its contents visible to the collector without a
 /// bespoke heap object kind.
+/// `string.Join(separator, values)` over an array or any enumerable.
+fn join_sequence(interp: &mut Interpreter, args: &[Value]) -> ExecResult<Option<Value>> {
+    let separator = arg_string_or_empty(interp, args, 0)?;
+    let source = arg(interp, args, 1)?;
+    let values = crate::collections::sequence_values(interp, &source);
+    let parts: Vec<String> = values
+        .into_iter()
+        .map(|v| display(interp, &v))
+        .collect();
+    Ok(Some(string_value(interp, &parts.join(&separator))))
+}
+
 fn register_string_builder(interp: &mut Interpreter) {
     interp.register_native("System.Text.StringBuilder::.ctor()", |i, a| {
         set_builder(i, a, String::new())?;

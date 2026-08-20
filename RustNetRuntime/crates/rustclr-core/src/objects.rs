@@ -142,6 +142,19 @@ impl ArrayStorage {
         }
     }
 
+    /// The backing vector, when this is untyped `Values` storage.
+    ///
+    /// The generic collections resize their storage in place rather than
+    /// reallocating an array per growth, which needs the vector itself. Every
+    /// other storage kind has a fixed element width and is not resizable this
+    /// way, so they answer `None`.
+    pub fn values_mut(&mut self) -> Option<&mut Vec<Value>> {
+        match self {
+            Self::Values(v) => Some(v),
+            _ => None,
+        }
+    }
+
     /// Reads element `i` as an evaluation-stack value.
     pub fn get(&self, i: usize) -> Option<Value> {
         Some(match self {

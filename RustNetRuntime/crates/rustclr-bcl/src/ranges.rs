@@ -297,7 +297,7 @@ fn write_through(
 ) -> ExecResult<Option<Value>> {
     match args.first() {
         Some(Value::Ref(target)) => {
-            let target: ByRef = *target;
+            let target: ByRef = target.clone();
             interp.store_indirect_public(target, value)?;
             Ok(None)
         }

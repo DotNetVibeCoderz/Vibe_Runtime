@@ -6,45 +6,107 @@ from the runtime itself, so it cannot drift from the code.
 
 ---
 
-## Generics are erased
+## Generic type arguments are erased
 
 **What happens:** a generic type is loaded as its open definition and every type
 argument becomes `object`. `List<int>` and `List<string>` are the same runtime
-type, and `MethodSpec` tokens do not resolve to instantiated methods.
+type.
 
-**What breaks:** most real programs. Generic collections, `IEnumerable<T>`,
-LINQ, anything with a constrained generic call.
+**What still works — nearly everything you would reach for.** The collections
+and LINQ are implemented natively, and erasure costs them nothing, because their
+storage is a managed array of runtime *values* and a value already carries its
+own shape. One implementation serves every `T`, and a `List<int>` holds unboxed
+integers.
+
+```csharp
+var totals = orders
+    .Where(o => o.Paid)
+    .GroupBy(o => o.Region)
+    .OrderBy(g => g.Key)
+    .ToDictionary(g => g.Key, g => g.Sum(o => o.Amount));
+```
+
+That runs. So do `foreach` over `IEnumerable<T>`, over a user type with an
+iterator method, and over anything else that implements the enumerator pattern.
+So do records, which need `EqualityComparer<T>.Default` for their generated
+`Equals`.
+
+**What breaks:** user-written generic code that needs `T` at run time. Each row
+below was measured on both runtimes, not inferred.
+
+| | |
+| --- | --- |
+| `typeof(T)` | Yields an opaque token, so `.Name` and `.ToString()` do not report the type |
+| `value is T` inside a generic method | Always false — there is no argument to test against |
+| A static field on a generic type | One slot shared by every instantiation. `Box<int>.Count` and `Box<string>.Count` are the same field |
+| `where T : new()` construction | `Activator.CreateInstance` is not implemented |
+| A custom `IEqualityComparer<T>` or `IComparer<T>` argument | Accepted and ignored; the default is used |
+
+`default(T)` *does* work, for both value and reference type arguments — the
+compiler emits `initobj` against the erased slot, and the zero it produces is
+the right one.
 
 **Why it is like this:** instantiating generics properly means one runtime type
-per closed construction, a shared open definition, generic virtual dispatch, and
-`constrained.` handling on value types. It is the single largest piece of
-remaining work, and doing it half-way would give wrong answers rather than
-missing ones.
-
-**What does work.** Generic *methods* bind by type argument, so the framework
-types built on generics are usable even though user generics are not:
-string interpolation, tuples and deconstruction, ranges and indices, and
-nullable value types all run. `tests/fixtures/ModernSyntax/` covers 35 such
-features and reports `failures=0`.
-
-**Workaround today:** arrays instead of `List<T>`, explicit loops instead of
-LINQ. The templates marked *runs on RustCLR* are written this way.
-
-This is [Milestone 2](../Plan.md).
+per closed construction, a shared open definition, and generic virtual dispatch.
+It remains the eventual answer — but it is a smaller job now than it was, since
+nothing in the collections depends on it.
 
 ---
 
-## async and await do not run
+## LINQ is eager, not lazy
 
-**What happens:** the compiler-generated state machine loads fine, but nothing
-drives `MoveNext`, and `Task` is not implemented.
+**What happens:** every `Enumerable` operator materialises its result
+immediately rather than returning an iterator that runs as it is consumed.
 
-**Why it is like this:** the scheduler exists — `rustclr-sched` has a lock-free
-run queue, channels and a thread pool, all tested — but the managed side is not
-wired to it. The missing piece is recognising `IAsyncStateMachine` and
-implementing `Task`, `TaskCompletionSource` and the awaiter pattern in RustBCL.
+**What breaks:** three things, and only these three.
 
-This is [Milestone 3](../Plan.md).
+| | |
+| --- | --- |
+| Side-effect timing | A `Console.WriteLine` inside a predicate runs at the LINQ call, not at the `foreach` that consumes it |
+| Infinite sequences | `Enumerable.Range(0, int.MaxValue).Where(…).First()` never returns; on .NET it stops at the first match |
+| Mutating the source afterwards | The result was taken as a snapshot and does not see the change |
+
+For everything else the results are identical, which is what the conformance
+suite checks.
+
+**Ordering** compares numbers and strings. A key of any other type is *refused*
+with a clear error rather than ordered arbitrarily — a silently wrong sort is
+much harder to notice than a failed one.
+
+---
+
+## async and await run, but nothing overlaps
+
+**What happens:** `async`/`await` works. `Task`, `Task<T>`,
+`TaskCompletionSource`, `Task.Run`, `Task.Delay`, `Task.WhenAll` and the awaiter
+pattern are all implemented, and an async method's results, ordering and
+exception propagation match .NET exactly.
+
+What is absent is *concurrency*. There is one interpreter thread, so a task runs
+to completion at the point it is created: `Task.Run` invokes its delegate
+immediately and `Task.Delay` sleeps.
+
+**What breaks:** code that depends on two tasks making progress at the same
+time.
+
+| | |
+| --- | --- |
+| Awaiting a task started earlier so the two overlap | The first ran to completion before the second was created |
+| A producer/consumer pair joined by a `TaskCompletionSource` the producer completes *later* | Works — that path genuinely suspends and resumes |
+| `Parallel.For`, `Parallel.ForEach` | Not implemented |
+| `IAsyncDisposable` / `await using`, `IAsyncEnumerable<T>` | Not implemented |
+| Wall-clock speedup from parallelism | There is none; the work is serialised |
+
+**Why it is like this:** `rustclr-sched` already has the substrate — a lock-free
+run queue, channels and a thread pool, all tested. What is missing is a
+re-entrant interpreter several OS threads could drive at once. Running tasks
+inline makes far more programs produce the right answer than refusing `Task`
+would, so it is offered with the limitation stated here, in
+`rustnet capabilities`, and in the source.
+
+The same reasoning, and the same caveat, applies to `Thread`: `Thread.Start`
+runs the body on the calling thread and `Join` returns at once. See
+[advanced-features.md](advanced-features.md#threads-are-serialised).
 
 ---
 
@@ -164,3 +226,9 @@ rustnet verify <assembly>         # what your program would hit
 
 `verify` is the honest answer for any specific program: it names every framework
 member referenced but not implemented, before you run anything.
+
+For the advanced language and framework features specifically — async/await,
+`Span<T>`, primary constructors, collection expressions, source generators,
+threading — [advanced-features.md](advanced-features.md) has a feature-by-feature
+matrix, each row produced by running a probe on both runtimes and comparing.
+[Bahasa Indonesia](id/fitur-lanjutan.md).

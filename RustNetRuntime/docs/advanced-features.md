@@ -20,14 +20,15 @@ bash probe.sh
 
 ## The matrix
 
-**10 of 21 probes produce identical output on both runtimes.**
+**13 of 21 probes produce identical output on both runtimes.**
 
 ### Asynchronous and parallel programming
 
 | Feature | RustCLR | Why |
 | --- | --- | --- |
-| `async` / `await` | ❌ | The state machine needs `AsyncTaskMethodBuilder<T>` and `TaskAwaiter<T>` |
-| Task Parallel Library | ❌ | `Task<T>`, `Parallel.For` over generic delegates |
+| `async` / `await` | ⚠️ **works, synchronous** | The builders and awaiters are implemented; see the note below |
+| `Task`, `Task<T>`, `WhenAll`, `TaskCompletionSource` | ✅ | Results, ordering and exception propagation match .NET |
+| Task Parallel Library | ❌ | `Parallel.For` is unimplemented |
 | Threading, `lock`, `Interlocked` | ⚠️ **works, serialised** | See the note below |
 
 ### Memory and resource management
@@ -36,7 +37,7 @@ bash probe.sh
 | --- | --- | --- |
 | Garbage collection | ✅ | Mark-sweep, handles cycles, pluggable |
 | `IDisposable` / `using` | ✅ | Interface dispatch finds the concrete `Dispose` |
-| `IAsyncDisposable` / `await using` | ❌ | Needs `async` |
+| `IAsyncDisposable` / `await using` | ❌ | Unimplemented; `async` itself works |
 | `Span<T>`, `Memory<T>` | ❌ | Generic ref structs, and `stackalloc` needs `localloc` |
 
 ### Modern language features
@@ -65,26 +66,66 @@ bash probe.sh
 
 | Feature | RustCLR | Why |
 | --- | --- | --- |
-| LINQ | ❌ | `IEnumerable<T>`, `Where`, `Select` — all generic |
+| LINQ | ⚠️ **works, eager** | ~40 `Enumerable` operators natively; see the note below |
+| Generic collections | ✅ | `List`, `Dictionary`, `HashSet`, `Queue`, `Stack`, natively |
+| `foreach` over `IEnumerable<T>` | ✅ | Including `yield return` iterators and user enumerators |
 | Pattern matching, switch expressions | ✅ | Type, relational, logical and property patterns |
-| Records | ❌ | The generated `Equals` uses `EqualityComparer<T>` |
+| Records | ✅ | Needed `EqualityComparer<T>.Default`, which now exists |
 | Source generators | ✅ | Compile-time; the runtime sees ordinary IL |
 
 ---
 
-## One cause behind almost every ❌
+## What erasure still costs
 
-Nine of the eleven failures come from a single gap: **generic types are erased
-rather than instantiated.** `Span<T>`, `Task<T>`, `List<T>`,
-`EqualityComparer<T>` and `IEnumerable<T>` are all generic, so anything built on
-them cannot resolve.
+Generic type arguments are erased: `List<int>` and `List<string>` are one
+runtime type. That used to block everything on this page built on a generic
+type. It no longer does, because the collections are implemented natively over
+storage that is self-describing — a runtime value already knows whether it holds
+an integer or a reference, so one implementation serves every `T`.
 
-That is [Milestone 2](../Plan.md), and it is the highest-value work remaining —
-it is not eleven separate problems, it is one problem with eleven symptoms.
+What remains blocked is what genuinely needs the argument at run time:
+`Span<T>` and `Task<T>` are ref structs and state-machine types the runtime
+would have to model, and `Marshal.SizeOf<T>` needs a layout for a `T` it does
+not have. Those are [Milestone 3](../Plan.md) and [Milestone 4](../Plan.md)
+work, not one blocked milestone.
 
-Generic **methods** already work: an instantiation binds by its type argument,
-which is what made string interpolation, tuples, ranges and `Nullable<T>`
-possible. Generic **types** are the piece still missing.
+For user-written generic code, the measured effects of erasure — `typeof(T)`,
+`is T`, statics per instantiation — are tabulated in
+[limitations.md](limitations.md).
+
+---
+
+## LINQ is eager
+
+Every operator materialises its result at once instead of returning a lazy
+iterator. `Where(…).Select(…).ToList()` walks the source twice more than .NET
+would, and three behaviours differ: side effects inside a predicate happen at
+the LINQ call rather than at consumption; an infinite sequence never terminates;
+and a source mutated after the call is not reflected in the result.
+
+Ordering compares numbers and strings. Any other key type is **refused** with a
+clear error rather than sorted arbitrarily, and a custom `IComparer<T>` argument
+is accepted but ignored — the erased type argument is what a real comparer
+implementation would need.
+
+---
+
+## async is synchronous
+
+`await` works, and an async method's results, ordering and exception
+propagation match .NET exactly — including an exception thrown across an
+`await` and caught by the caller. What does not happen is *overlap*: a task runs
+to completion at the point it is created, because there is one interpreter
+thread. `Task.Run` invokes its delegate immediately; `Task.Delay` sleeps.
+
+The suspend-and-resume path is real, not bypassed: a `TaskCompletionSource`
+completed after its awaiter has suspended genuinely parks the state machine on
+the heap and resumes it on completion. That is what the conformance check
+`resumed continuation` exercises.
+
+What this costs is any program that depends on two tasks progressing together,
+and any wall-clock speedup from parallelism. It arrives with a re-entrant
+interpreter — see the note on threads below, which has the same cause.
 
 ---
 
@@ -105,8 +146,8 @@ programs run, so it is offered with this limitation stated here, in
 
 `rustclr-sched` already has the real substrate — a lock-free run queue, channels
 and a thread pool, all tested. What is missing is a re-entrant interpreter that
-several OS threads could drive at once. That arrives with
-[Milestone 3](../Plan.md).
+several OS threads could drive at once. That is the one piece both this and
+`async` are waiting on.
 
 ---
 

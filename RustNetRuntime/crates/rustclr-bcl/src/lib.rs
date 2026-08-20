@@ -20,12 +20,15 @@
 //! // `Console.WriteLine` now resolves.
 //! ```
 
+pub mod collections;
 pub mod console;
 pub mod interpolation;
+pub mod linq;
 pub mod numerics;
 pub mod ranges;
 pub mod runtime;
 pub mod strings;
+pub mod tasks;
 pub mod threading;
 pub mod support;
 
@@ -40,6 +43,9 @@ pub fn install(interp: &mut Interpreter) {
     strings::register(interp);
     numerics::register(interp);
     threading::register(interp);
+    collections::register(interp);
+    linq::register(interp);
+    tasks::register(interp);
 }
 
 /// The number of native bindings [`install`] provides.

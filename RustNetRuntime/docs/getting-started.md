@@ -9,7 +9,7 @@
 | | |
 | --- | --- |
 | Rust | 1.85 or newer (`rustup` recommended) |
-| .NET SDK | 9 or 10 — RustCLR consumes IL, so you still need Roslyn to compile C# |
+| .NET SDK | 10 — RustCLR consumes IL, so you still need Roslyn to compile C# |
 
 Check both:
 
@@ -35,7 +35,7 @@ Run the test suite to confirm the build is sound:
 cargo test --workspace
 ```
 
-You should see 111 tests pass.
+You should see 116 tests pass.
 
 ---
 
@@ -46,7 +46,7 @@ The repository ships a small fixture:
 ```bash
 cd tests/fixtures/HelloWorld
 dotnet build -c Release
-rustnet run bin/Release/net9.0/HelloWorld.dll
+rustnet run bin/Release/net10.0/HelloWorld.dll
 ```
 
 ```
@@ -59,7 +59,7 @@ That output came from a Rust runtime executing IL that Roslyn produced. Add
 `--stats` to see what it cost:
 
 ```bash
-rustnet run bin/Release/net9.0/HelloWorld.dll --stats
+rustnet run bin/Release/net10.0/HelloWorld.dll --stats
 ```
 
 ---
@@ -72,11 +72,11 @@ This is the interesting one — the same assembly on both runtimes:
 cd tests/fixtures/Conformance
 dotnet build -c Release
 
-dotnet bin/Release/net9.0/Conformance.dll
-rustnet run bin/Release/net9.0/Conformance.dll
+dotnet bin/Release/net10.0/Conformance.dll
+rustnet run bin/Release/net10.0/Conformance.dll
 ```
 
-Both print `checks=38 failures=0`. If they ever differ, that is a runtime bug
+Both print `checks=80 failures=0`. If they ever differ, that is a runtime bug
 and the differing check names it. `tests/fixtures/ModernSyntax/` is the same
 idea for modern C# features and prints `checks=35 failures=0`.
 
@@ -90,7 +90,7 @@ to find out is to ask:
 ```bash
 cd path/to/your/project
 dotnet build -c Release
-rustnet verify bin/Release/net9.0/YourApp.dll
+rustnet verify bin/Release/net10.0/YourApp.dll
 ```
 
 `verify` lists every member your program references that RustCLR cannot yet
@@ -98,11 +98,12 @@ supply, and every method whose IL fails verification. A clean report means it
 should run:
 
 ```bash
-rustnet run bin/Release/net9.0/YourApp.dll
+rustnet run bin/Release/net10.0/YourApp.dll
 ```
 
 If `verify` reports missing framework members, that is expected for anything
-using generics or `async` today — see [limitations.md](limitations.md).
+using `async`, `Span<T>` or a framework type RustBCL has not implemented yet —
+see [limitations.md](limitations.md). Generic collections and LINQ do run.
 
 ---
 
@@ -174,4 +175,5 @@ status bar picks up the runtime counters from the run.
 - [CodeGen guide](codegen.md) — the IDE in detail
 - [Toolchain reference](cli.md) — every `rustnet` command
 - [Architecture](architecture.md) — how the runtime is put together
+- [Advanced C# features](advanced-features.md) — the measured support matrix
 - [Limitations](limitations.md) — what does not work yet, and why

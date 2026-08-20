@@ -178,7 +178,7 @@ fn store_handle(
 ) -> ExecResult<()> {
     match args.first() {
         Some(Value::Ref(target)) => {
-            let target: ByRef = *target;
+            let target: ByRef = target.clone();
             interp.store_indirect_public(target, Value::Obj(handle))
         }
         // A handler passed by value cannot be written back to, which would make

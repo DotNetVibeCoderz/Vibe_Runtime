@@ -435,21 +435,66 @@ pub fn capabilities() -> Result<i32> {
     println!("  generics                     erased to object");
     println!("  generic methods              instantiations bind by type argument");
     println!("  reflection                   minimal");
+
     println!("
-Modern C#");
+Collections and LINQ");
+    println!("  List, Dictionary, HashSet    yes");
+    println!("  Queue, Stack, KeyValuePair   yes");
+    println!("  foreach over IEnumerable<T>  yes");
+    println!("  LINQ                         yes, but EAGER:");
+    println!("                               every operator materialises its result at");
+    println!("                               once. Side effects in a predicate happen at");
+    println!("                               the call, not at consumption, and an");
+    println!("                               infinite sequence never terminates.");
+    println!("  ordering keys                numbers and strings; other key types are");
+    println!("                               refused rather than ordered arbitrarily");
+    println!("  custom comparers             no - IEqualityComparer<T> arguments ignored");
+    println!("\nModern C#");
     println!("  string interpolation         yes");
     println!("  tuples                       yes (ValueTuple 1-8)");
     println!("  ranges and indices           yes (a[^1], a[1..4])");
     println!("  nullable value types         yes");
     println!("  init-only properties         yes");
-    println!("  records, patterns, switch    yes");
-    println!("  generic collections, LINQ    no - needs real generics");
+    println!("  primary constructors         yes");
+    println!("  collection expressions       arrays only (spread needs Span<T>)");
+    println!("  extension members (C# 14)    yes");
+    println!("  pattern matching, switch     yes");
+    println!("  records                      yes");
+    println!("  generic collections, LINQ    yes - see below");
+
+    println!("\nAsync and threading");
+    println!("  async / await                yes, but SYNCHRONOUS:");
+    println!("                               a task runs to completion where it is");
+    println!("                               created, so results, ordering and exception");
+    println!("                               propagation are correct but nothing ever");
+    println!("                               overlaps. Code relying on two tasks");
+    println!("                               interleaving will not interleave.");
+    println!("  Task, Task<T>, WhenAll       yes");
+    println!("  TaskCompletionSource         yes - a real suspend and resume");
+    println!("  Task Parallel Library        no - Parallel.For is unimplemented");
+    println!("  Thread, lock, Interlocked    yes, but SERIALISED:");
+    println!("                               Thread.Start runs the body on the calling");
+    println!("                               thread, and Join returns at once. Correct");
+    println!("                               for start-then-join; a program that needs");
+    println!("                               two threads to progress together will hang.");
+
+    println!("\nMemory and resources");
+    println!("  IDisposable, using           yes");
+    println!("  IAsyncDisposable             no - await using is unimplemented");
+    println!("  Span<T>, Memory<T>           no - generic ref structs");
+    println!("  stackalloc, unsafe pointers  no - localloc is unimplemented, and managed");
+    println!("                               references here are structural, not addresses");
+
+    println!("\nCompile-time features");
+    println!("  source generators            yes - the runtime only ever sees the IL");
+    println!("  interceptors                 yes - same reason");
     println!("\nExceptions");
     println!("  try / catch / finally        yes");
     println!("  exception filters            no");
     println!("\nInterop");
     println!("  P/Invoke                     yes, up to {} arguments", rustclr_interop::MAX_PINVOKE_ARGS);
     println!("  string marshalling           UTF-8 only");
+    println!("  struct marshalling           no - Marshal.SizeOf<T> is generic");
     println!("\nBase class library");
     println!("  native bindings registered   {}", interp.native_count());
 
@@ -464,6 +509,9 @@ Modern C#");
     ] {
         println!("  {}", m.name());
     }
+
+    println!("\nMeasured, not claimed: tests/fixtures/AdvancedFeatures/probe.sh runs each");
+    println!("feature on both runtimes and compares. Detail: docs/advanced-features.md");
 
     println!("\nBuilt by Gravicode Studios, led by Kang Fadhil.");
     Ok(0)

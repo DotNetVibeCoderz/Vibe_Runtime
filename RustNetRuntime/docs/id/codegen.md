@@ -87,7 +87,7 @@ ditolak kalau keluar dari sana. Ia menentukan *apa* yang diubah, bukan *di mana*
 Jack bekerja paling baik dengan tujuan dan batasan:
 
 > Tambahkan rolling median ke gateway. Tetap di dalam subset IL yang dijalankan
-> RustCLR — jangan pakai LINQ — lalu jalankan di RustCLR dan tunjukkan
+> RustCLR — jangan pakai async — lalu jalankan di RustCLR dan tunjukkan
 > keluarannya.
 
 Ia akan membaca berkasnya, menyunting, build, run, lalu memberi tahu berkas mana
@@ -161,8 +161,10 @@ library, lintas bidang bisnis, sains, edukasi, dan game.
 
 Panel kanan memperlihatkan persis berkas apa yang akan ditulis dan cara
 menjalankan hasilnya. Template bertanda *runs on RustCLR* ditulis agar tetap di
-dalam subset IL yang dieksekusi runtime saat ini — perulangan eksplisit
-menggantikan LINQ, array menggantikan koleksi generic.
+dalam subset IL yang dieksekusi runtime saat itu — perulangan eksplisit
+menggantikan LINQ, array menggantikan koleksi generic. Sejak Milestone 2
+keduanya sudah jalan, jadi batasannya kini lebih longgar daripada yang
+tersirat dari template yang ada.
 
 Katalog lengkap: [templates.md](../templates.md).
 

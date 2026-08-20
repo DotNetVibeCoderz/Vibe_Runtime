@@ -24,10 +24,10 @@ menghasilkan keluaran yang identik di kedua runtime:
 
 ```console
 $ dotnet Conformance.dll
-checks=38 failures=0
+checks=80 failures=0
 
 $ rustnet run Conformance.dll --stats
-checks=38 failures=0
+checks=80 failures=0
 
 ─── execution ──────────────────────────────
   wall clock                  10.505 ms
@@ -49,7 +49,7 @@ bersarang, pembagian nol, delegate, serta alokasi di bawah tekanan GC. Suite
 kedua, `tests/fixtures/ModernSyntax/`, melakukan hal sama untuk 35 fitur C#
 modern. Keduanya proyek C# biasa yang bisa Anda baca dan kembangkan.
 
-`cargo test --workspace` menjalankan 111 test di delapan crate.
+`cargo test --workspace` menjalankan 116 test di delapan crate.
 
 ---
 
@@ -154,7 +154,7 @@ Panduan lengkap: [docs/installation.md](docs/installation.md).
 
 ## Memulai
 
-**Prasyarat:** Rust 1.85+ dan .NET SDK 9 atau 10.
+**Prasyarat:** Rust 1.85+ dan .NET SDK 10.
 
 ```bash
 # Build runtime dan toolchain
@@ -163,7 +163,7 @@ cargo build --release
 # Kompilasi program C# dengan .NET SDK, lalu jalankan di RustCLR
 cd tests/fixtures/HelloWorld
 dotnet build -c Release
-../../../target/release/rustnet run bin/Release/net9.0/HelloWorld.dll
+../../../target/release/rustnet run bin/Release/net10.0/HelloWorld.dll
 ```
 
 ```bash
@@ -239,7 +239,46 @@ pattern matching, switch expression, `new` bertipe-target, local function, dan
 variabel `out`. `tests/fixtures/ModernSyntax/` menguji 35 di antaranya dan
 melaporkan `failures=0` di kedua runtime.
 
-**Belum jalan.** Generic di-*erase* menjadi `object`, bukan diinstansiasi.
+**Koleksi dan LINQ.** `List<T>`, `Dictionary<K,V>`, `HashSet<T>`, `Queue<T>`,
+dan `Stack<T>` diimplementasikan secara native, begitu pula LINQ — sekitar empat
+puluh operator `Enumerable`, termasuk `GroupBy` dan `OrderBy`/`ThenBy`.
+
+```csharp
+var totals = orders
+    .Where(o => o.Paid)
+    .GroupBy(o => o.Region)
+    .OrderBy(g => g.Key)
+    .ToDictionary(g => g.Key, g => g.Sum(o => o.Amount));
+```
+
+Itu jalan, byte demi byte sama dengan .NET. Begitu pula `foreach` atas
+`IEnumerable<T>`, atas iterator `yield return`, dan atas tipe apa pun yang
+mengikuti pola enumerator.
+
+Dua catatan, keduanya disebutkan `rustnet capabilities`: **LINQ bersifat eager**,
+bukan lazy, sehingga efek samping di dalam predikat terjadi saat pemanggilan,
+bukan saat konsumsi; dan pengurutan membandingkan angka dan string, serta
+menolak tipe kunci lain alih-alih mengurutkannya secara sembarang.
+
+**Fitur lanjutan C#.** 12 dari 21 fitur yang diuji menghasilkan keluaran identik
+di kedua runtime: garbage collection, `IDisposable`/`using`, threading dengan
+`lock` dan `Interlocked` (diserialkan — lihat dokumennya), primary constructor,
+collection expression atas array, extension members, P/Invoke, pattern matching,
+record, LINQ, source generator, dan interceptor.
+
+Sebagian besar celah yang tersisa berbagi satu penyebab: **argumen tipe generic
+di-*erase*, bukan diinstansiasi**, sehingga `async`/`await`, TPL, `Span<T>`, dan
+marshalling struct tidak bisa di-resolve. Union types dan closed hierarchies
+belum ada di .NET 10 sama sekali — compiler mengurainya, tetapi tipe BCL yang
+dibutuhkannya belum ada.
+
+Matriks lengkapnya, beserta alasan tiap baris:
+[docs/id/fitur-lanjutan.md](docs/id/fitur-lanjutan.md).
+
+
+**Belum jalan.** *Argumen* tipe generic di-*erase*, sehingga kode generic buatan
+pengguna yang membaca `T` saat runtime — `typeof(T)`, `is T`, static field per
+instansiasi — tidak berperilaku benar, dan comparer kustom diabaikan.
 Exception filter (`catch when`) belum dievaluasi. State machine `async`/`await`
 belum dijalankan scheduler. Reflection masih minimal. Belum ada penghasil kode
 native — `rustclr-jit` menyediakan antarmuka kompilasi dan verifier IL,
@@ -264,6 +303,7 @@ Cargo `embedded` melakukan build yang dioptimalkan untuk ukuran.
 - [Memulai](docs/id/memulai.md) · [English](docs/getting-started.md)
 - [Instalasi](docs/id/instalasi.md) · [English](docs/installation.md)
 - [Benchmark](docs/benchmarks.md)
+- [Fitur lanjutan C#](docs/id/fitur-lanjutan.md) · [English](docs/advanced-features.md)
 - [Arsitektur](docs/architecture.md)
 - [Runtime secara mendalam](docs/runtime.md)
 - [Panduan CodeGen](docs/id/codegen.md) · [English](docs/codegen.md)
@@ -277,7 +317,44 @@ Cargo `embedded` melakukan build yang dioptimalkan untuk ukuran.
 ## Berkontribusi
 
 Test adalah kontraknya. `cargo test --workspace` harus tetap hijau, dan fixture
-konformans harus terus melaporkan `failures=0` di kedua runtime. Ketika Anda
+konformans harus terus melaporkan `failures=0` di kedua runtime.
+
+**Koleksi dan LINQ.** `List<T>`, `Dictionary<K,V>`, `HashSet<T>`, `Queue<T>`,
+dan `Stack<T>` diimplementasikan secara native, begitu pula LINQ — sekitar empat
+puluh operator `Enumerable`, termasuk `GroupBy` dan `OrderBy`/`ThenBy`.
+
+```csharp
+var totals = orders
+    .Where(o => o.Paid)
+    .GroupBy(o => o.Region)
+    .OrderBy(g => g.Key)
+    .ToDictionary(g => g.Key, g => g.Sum(o => o.Amount));
+```
+
+Itu jalan, byte demi byte sama dengan .NET. Begitu pula `foreach` atas
+`IEnumerable<T>`, atas iterator `yield return`, dan atas tipe apa pun yang
+mengikuti pola enumerator.
+
+Dua catatan, keduanya disebutkan `rustnet capabilities`: **LINQ bersifat eager**,
+bukan lazy, sehingga efek samping di dalam predikat terjadi saat pemanggilan,
+bukan saat konsumsi; dan pengurutan membandingkan angka dan string, serta
+menolak tipe kunci lain alih-alih mengurutkannya secara sembarang.
+
+**Fitur lanjutan C#.** 12 dari 21 fitur yang diuji menghasilkan keluaran identik
+di kedua runtime: garbage collection, `IDisposable`/`using`, threading dengan
+`lock` dan `Interlocked` (diserialkan — lihat dokumennya), primary constructor,
+collection expression atas array, extension members, P/Invoke, pattern matching,
+record, LINQ, source generator, dan interceptor.
+
+Sebagian besar celah yang tersisa berbagi satu penyebab: **argumen tipe generic
+di-*erase*, bukan diinstansiasi**, sehingga `async`/`await`, TPL, `Span<T>`, dan
+marshalling struct tidak bisa di-resolve. Union types dan closed hierarchies
+belum ada di .NET 10 sama sekali — compiler mengurainya, tetapi tipe BCL yang
+dibutuhkannya belum ada.
+
+Matriks lengkapnya, beserta alasan tiap baris:
+[docs/id/fitur-lanjutan.md](docs/id/fitur-lanjutan.md).
+ Ketika Anda
 menambah kemampuan runtime, tambahkan pemeriksaan di
 `tests/fixtures/Conformance/Program.cs` yang gagal tanpa kemampuan itu.
 

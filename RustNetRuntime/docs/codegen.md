@@ -86,7 +86,7 @@ escapes. He decides *what* to change; he does not decide *where*.
 Jack works best with a goal and a constraint:
 
 > Add a rolling median to the gateway. Keep it inside the IL subset RustCLR
-> runs — no LINQ — then run it on RustCLR and show me the output.
+> runs — no async — then run it on RustCLR and show me the output.
 
 He will read the file, edit it, build, run, and tell you which files he touched.
 The line under his reply lists the tools he actually called, so you can see what

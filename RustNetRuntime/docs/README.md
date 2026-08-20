@@ -20,6 +20,7 @@
   exceptions, and the behaviour that is easy to get subtly wrong
 - [Toolchain reference](cli.md) — every `rustnet` command
 - [Benchmarks](benchmarks.md) — RustCLR against .NET, workload by workload
+- [Advanced C# features](advanced-features.md) — the measured support matrix
 - [Limitations](limitations.md) — what does not work yet, and why
 
 **CodeGen**
@@ -42,6 +43,7 @@
 - [Memulai](id/memulai.md) — build runtime, jalankan program pertama Anda di
   atasnya, siapkan CodeGen
 - [Instalasi](id/instalasi.md) — paket untuk Windows, Linux, dan macOS
+- [Fitur lanjutan C#](id/fitur-lanjutan.md) — matriks dukungan hasil pengukuran
 - [Panduan CodeGen](id/codegen.md) — IDE, alat-alat Jack, penyedia LLM,
   konfigurasi
 

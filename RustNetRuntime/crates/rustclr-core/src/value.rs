@@ -14,7 +14,7 @@ use rustclr_gc::Handle;
 /// Interior pointers are represented structurally rather than as raw addresses.
 /// A raw pointer into a GC heap would have to be updated by the collector and
 /// could dangle; this form is always safe to resolve and always current.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ByRef {
     /// A local variable of the frame identified by `frame`.
     Local { frame: u32, index: u32 },
@@ -26,6 +26,13 @@ pub enum ByRef {
     Static { type_id: TypeId, slot: u32 },
     /// An element of a single-dimension array.
     ArrayElement { array: Handle, index: u32 },
+    /// A field of a value-type instance that is itself addressed by `base`.
+    ///
+    /// `p.X` where `p` is a struct in a local has no heap object to point at,
+    /// so the pointer is a *path*: the pointer to `p`, plus the field slot.
+    /// Composing rather than flattening is what lets `a.b.c` work — and it is
+    /// the reason `ByRef` is not `Copy`.
+    StructField { base: Box<ByRef>, slot: u32 },
 }
 
 /// One evaluation-stack slot.
@@ -102,7 +109,7 @@ impl Value {
 
     pub fn as_byref(&self) -> Option<ByRef> {
         match self {
-            Value::Ref(r) => Some(*r),
+            Value::Ref(r) => Some(r.clone()),
             _ => None,
         }
     }
@@ -143,6 +150,12 @@ impl Value {
             Value::Obj(h) if !h.is_null() => out.push(*h),
             Value::Ref(ByRef::Field { object, .. }) => out.push(*object),
             Value::Ref(ByRef::ArrayElement { array, .. }) => out.push(*array),
+            // A pointer into a struct roots whatever its base roots: the
+            // struct may live in a field of a heap object that nothing else
+            // on the stack refers to.
+            Value::Ref(ByRef::StructField { base, .. }) => {
+                Value::Ref((**base).clone()).trace_handles(out)
+            }
             Value::Struct(s) => {
                 for f in &s.fields {
                     f.trace_handles(out);

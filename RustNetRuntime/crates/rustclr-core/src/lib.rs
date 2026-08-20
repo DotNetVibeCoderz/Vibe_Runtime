@@ -37,7 +37,7 @@ pub mod value;
 pub use error::{ClrExceptionKind, ExecResult, ExecutionError};
 pub use host::{CaptureHost, Host, SystemHost};
 pub use interp::{CompiledMethod, ExecutionStats, Frame, Interpreter, Limits, NativeFn};
-pub use loader::{CoreTypes, LoadedAssembly, Loader};
+pub use loader::{CoreTypes, LoadedAssembly, Loader, DEFAULT_COMPARER_FIELD};
 pub use objects::{
     ArrayStorage, ClrArray, ClrBox, ClrDelegate, ClrException, ClrObject, ClrString, DelegateTarget,
 };

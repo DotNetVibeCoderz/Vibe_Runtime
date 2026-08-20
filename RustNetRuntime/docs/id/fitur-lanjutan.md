@@ -20,7 +20,7 @@ bash probe.sh
 
 ## Matriksnya
 
-**10 dari 21 probe menghasilkan keluaran identik di kedua runtime.**
+**12 dari 21 probe menghasilkan keluaran identik di kedua runtime.**
 
 ### Asynchronous & Parallel Programming
 
@@ -65,27 +65,47 @@ bash probe.sh
 
 | Fitur | RustCLR | Alasan |
 | --- | --- | --- |
-| LINQ | ❌ | `IEnumerable<T>`, `Where`, `Select` — semuanya generic |
+| LINQ | ⚠️ **jalan, eager** | ~40 operator `Enumerable` secara native; lihat catatan di bawah |
+| Koleksi generic | ✅ | `List`, `Dictionary`, `HashSet`, `Queue`, `Stack`, secara native |
+| `foreach` atas `IEnumerable<T>` | ✅ | Termasuk iterator `yield return` dan enumerator buatan pengguna |
 | Pattern Matching, switch expression | ✅ | Pattern tipe, relasional, logis, dan property |
-| Records | ❌ | `Equals` bawaannya memakai `EqualityComparer<T>` |
+| Records | ✅ | Butuh `EqualityComparer<T>.Default`, yang kini sudah ada |
 | Source Generators | ✅ | Saat kompilasi; runtime hanya melihat IL biasa |
 
 ---
 
-## Satu penyebab di balik hampir semua ❌
+## Apa yang masih dibayar akibat *erasure*
 
-Sembilan dari sebelas kegagalan berasal dari satu celah yang sama: **tipe
-generic di-*erase*, bukan diinstansiasi.** `Span<T>`, `Task<T>`, `List<T>`,
-`EqualityComparer<T>`, dan `IEnumerable<T>` semuanya generic, sehingga apa pun
-yang dibangun di atasnya tidak bisa di-resolve.
+Argumen tipe generic di-*erase*: `List<int>` dan `List<string>` adalah satu tipe
+runtime yang sama. Dulu itu memblokir semua yang ada di halaman ini. Sekarang
+tidak lagi, karena koleksinya diimplementasikan secara native di atas
+penyimpanan yang mendeskripsikan dirinya sendiri — sebuah nilai runtime sudah
+tahu apakah ia memuat bilangan bulat atau referensi, sehingga satu implementasi
+melayani setiap `T`.
 
-Itulah [Milestone 2](../../Plan.md), dan itu pekerjaan tersisa dengan nilai
-tertinggi — ini bukan sebelas masalah terpisah, melainkan satu masalah dengan
-sebelas gejala.
+Yang masih terhalang adalah hal yang benar-benar membutuhkan argumennya saat
+runtime: `Span<T>` dan `Task<T>` adalah ref struct dan tipe state-machine yang
+harus dimodelkan runtime, dan `Marshal.SizeOf<T>` butuh tata letak untuk `T`
+yang tidak dimilikinya. Itu pekerjaan [Milestone 3](../../Plan.md) dan
+[Milestone 4](../../Plan.md).
 
-Metode generic **sudah** bekerja: sebuah instansiasi terikat berdasarkan
-argumen tipenya, dan itulah yang memungkinkan interpolasi string, tuple, range,
-serta `Nullable<T>`. Yang belum ada adalah **tipe** generic.
+Untuk kode generic buatan pengguna, dampak *erasure* yang terukur — `typeof(T)`,
+`is T`, static per instansiasi — ada di
+[limitations.md](../limitations.md).
+
+---
+
+## LINQ bersifat eager
+
+Setiap operator langsung mematerialkan hasilnya, bukan mengembalikan iterator
+yang malas. Tiga perilaku berbeda dari .NET: efek samping di dalam predikat
+terjadi saat pemanggilan LINQ, bukan saat konsumsi; sequence tak hingga tidak
+pernah berhenti; dan sumber yang diubah setelah pemanggilan tidak tercermin di
+hasilnya.
+
+Pengurutan membandingkan angka dan string. Tipe kunci lain **ditolak** dengan
+pesan yang jelas alih-alih diurutkan sembarangan, dan argumen `IComparer<T>`
+kustom diterima tetapi diabaikan.
 
 ---
 

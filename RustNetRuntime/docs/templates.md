@@ -4,8 +4,10 @@ Fourteen project templates, reachable from **File → New Project** in CodeGen o
 from Jack via `list_templates` and `create_project`.
 
 Every template compiles as written. Those marked **RustCLR** also run on the
-Rust runtime today — they stay inside the supported IL subset, which in practice
-means arrays instead of generic collections and explicit loops instead of LINQ.
+Rust runtime today. They were written to stay inside the IL subset RustCLR
+supported at the time — arrays rather than generic collections, explicit loops
+rather than LINQ. Both of those now run (see [Milestone 2](../Plan.md)), so the
+constraint on new templates is looser than the existing ones suggest.
 
 ---
 

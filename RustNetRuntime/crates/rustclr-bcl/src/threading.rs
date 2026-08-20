@@ -147,7 +147,7 @@ fn register_monitor(interp: &mut Interpreter) {
     // set or the generated `finally` will skip the Exit.
     interp.register_native("System.Threading.Monitor::Enter(object,bool&)", |i, a| {
         if let Some(Value::Ref(target)) = a.get(1) {
-            let slot: ByRef = *target;
+            let slot: ByRef = target.clone();
             i.store_indirect_public(slot, Value::I32(1))?;
         }
         Ok(None)
@@ -176,8 +176,8 @@ fn register_interlocked(interp: &mut Interpreter) {
         let Some(Value::Ref(slot)) = a.first() else {
             return Err(ExecutionError::null_reference());
         };
-        let slot: ByRef = *slot;
-        let previous = i.load_indirect_public(slot)?.as_i32().unwrap_or(0);
+        let slot: ByRef = slot.clone();
+        let previous = i.load_indirect_public(slot.clone())?.as_i32().unwrap_or(0);
         let replacement = arg_i32(i, a, 1)?;
         i.store_indirect_public(slot, Value::I32(replacement))?;
         Ok(Some(Value::I32(previous)))
@@ -192,8 +192,8 @@ fn atomic_update(
     let Some(Value::Ref(slot)) = args.first() else {
         return Err(ExecutionError::null_reference());
     };
-    let slot: ByRef = *slot;
-    let current = interp.load_indirect_public(slot)?.as_i32().unwrap_or(0);
+    let slot: ByRef = slot.clone();
+    let current = interp.load_indirect_public(slot.clone())?.as_i32().unwrap_or(0);
     let operand = arg_i32(interp, args, 1)?;
     let updated = combine(current, operand);
     interp.store_indirect_public(slot, Value::I32(updated))?;
@@ -208,9 +208,9 @@ fn atomic_update_by(
     let Some(Value::Ref(slot)) = args.first() else {
         return Err(ExecutionError::null_reference());
     };
-    let slot: ByRef = *slot;
+    let slot: ByRef = slot.clone();
     let updated = interp
-        .load_indirect_public(slot)?
+        .load_indirect_public(slot.clone())?
         .as_i32()
         .unwrap_or(0)
         .wrapping_add(delta);
@@ -237,6 +237,7 @@ fn register_type(interp: &mut Interpreter) {
         let right = arg(i, a, 1)?;
         Ok(Some(Value::I32((left.as_i64() != right.as_i64()) as i32)))
     });
+
 }
 
 // ── OperatingSystem ──────────────────────────────────────────────────────────

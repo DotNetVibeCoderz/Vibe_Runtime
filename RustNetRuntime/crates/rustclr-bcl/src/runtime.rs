@@ -3,6 +3,7 @@
 
 use crate::support::*;
 use rustclr_core::{ClrArray, ClrException, Interpreter, Value};
+use rustclr_gc::Handle;
 
 pub fn register(interp: &mut Interpreter) {
     register_object(interp);
@@ -63,6 +64,16 @@ fn register_compiler_services(interp: &mut Interpreter) {
     interp.register_native(
         "System.Runtime.CompilerServices.RuntimeHelpers::get_OffsetToStringData()",
         |_i, _a| Ok(Some(Value::I32(12))),
+    );
+    // A record's generated `PrintMembers` calls this before recursing. It is a
+    // guard, not an operation: on .NET it throws if the native stack is nearly
+    // exhausted. RustCLR's interpreter has no native stack to exhaust — managed
+    // recursion is bounded by an explicit frame budget that raises
+    // `StackOverflowException` — so the guarantee already holds and there is
+    // nothing to do here.
+    interp.register_native(
+        "System.Runtime.CompilerServices.RuntimeHelpers::EnsureSufficientExecutionStack()",
+        |_i, _a| Ok(None),
     );
 }
 
@@ -145,11 +156,7 @@ fn register_exceptions(interp: &mut Interpreter) {
     });
     interp.register_native("System.Exception::get_Message()", |i, a| {
         let h = arg_handle(i, a, 0)?;
-        let message = i
-            .heap
-            .get_as::<ClrException>(h)
-            .map(|e| e.message.clone())
-            .unwrap_or_default();
+        let message = exception_message(i, h);
         Ok(Some(string_value(i, &message)))
     });
     interp.register_native("System.Exception::get_StackTrace()", |i, a| {
@@ -182,6 +189,30 @@ fn register_exceptions(interp: &mut Interpreter) {
         interp.register_native(ctor0, |_i, _a| Ok(None));
         let ctor1 = Box::leak(format!("{name}::.ctor(string)").into_boxed_str()) as &str;
         interp.register_native(ctor1, |i, a| set_exception_message(i, a));
+        // `(message, innerException)` and `(paramName, message)` both carry the
+        // message first, which is the part a program reads back.
+        let ctor2 = Box::leak(format!("{name}::.ctor/2").into_boxed_str()) as &str;
+        interp.register_native(ctor2, |i, a| set_exception_message(i, a));
+    }
+}
+
+/// Reads an exception's message, whichever shape the instance has.
+///
+/// The runtime raises its own errors as `ClrException`, but `new
+/// SomeException("…")` goes through `newobj` like any other class and produces
+/// a plain object whose first field holds the message. Reading only the first
+/// shape is what made `e.Message` come back empty for every exception a program
+/// threw itself.
+pub fn exception_message(interp: &Interpreter, handle: Handle) -> String {
+    if let Some(e) = interp.heap.get_as::<ClrException>(handle) {
+        return e.message.clone();
+    }
+    match interp.heap.get_as::<rustclr_core::ClrObject>(handle) {
+        Some(o) => match o.fields.first() {
+            Some(Value::Obj(text)) => read_string(interp, *text),
+            _ => String::new(),
+        },
+        None => String::new(),
     }
 }
 
@@ -222,6 +253,13 @@ fn register_environment(interp: &mut Interpreter) {
     });
     interp.register_native("System.Environment::get_TickCount()", |i, _a| {
         Ok(Some(Value::I32(i.host.monotonic_millis() as i32)))
+    });
+    // An iterator method's state machine records the thread that created it, so
+    // that enumerating from another thread hands out a fresh instance. Managed
+    // threads are serialised here (see `capabilities`), so there is exactly one
+    // id — and returning it is what makes `yield return` work.
+    interp.register_native("System.Environment::get_CurrentManagedThreadId()", |_i, _a| {
+        Ok(Some(Value::I32(1)))
     });
     interp.register_native("System.Environment::get_ProcessorCount()", |_i, _a| {
         Ok(Some(Value::I32(

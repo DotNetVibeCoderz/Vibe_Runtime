@@ -95,7 +95,9 @@ result, and warns loudly if it finds only a debug build of `rustnet` — a debug
 interpreter is several times slower again and would make the comparison
 meaningless.
 
-The workloads live in `benchmarks/Benchmarks/Program.cs`. They stay inside the
-IL subset RustCLR executes — arrays and explicit loops, no LINQ, no generic
-collections — because a benchmark that only runs on one of the two runtimes
-measures nothing useful.
+The workloads live in `benchmarks/Benchmarks/Program.cs`. They use arrays and
+explicit loops — no LINQ, no generic collections — because a benchmark that only
+runs on one of the two runtimes measures nothing useful. That was a hard
+constraint when they were written; since Milestone 2 both would run, but keeping
+the workloads allocation-light is what makes them measure the interpreter rather
+than the collection implementations.

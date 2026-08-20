@@ -9,7 +9,7 @@
 | | |
 | --- | --- |
 | Rust | 1.85 atau lebih baru (disarankan lewat `rustup`) |
-| .NET SDK | 9 atau 10 — RustCLR mengonsumsi IL, jadi Roslyn tetap diperlukan untuk mengompilasi C# |
+| .NET SDK | 10 — RustCLR mengonsumsi IL, jadi Roslyn tetap diperlukan untuk mengompilasi C# |
 
 Periksa keduanya:
 
@@ -35,7 +35,7 @@ Jalankan suite test untuk memastikan hasil build-nya sehat:
 cargo test --workspace
 ```
 
-Anda mestinya melihat 111 test lulus.
+Anda mestinya melihat 116 test lulus.
 
 ---
 
@@ -46,7 +46,7 @@ Repositori ini menyertakan fixture kecil:
 ```bash
 cd tests/fixtures/HelloWorld
 dotnet build -c Release
-rustnet run bin/Release/net9.0/HelloWorld.dll
+rustnet run bin/Release/net10.0/HelloWorld.dll
 ```
 
 ```
@@ -59,7 +59,7 @@ Keluaran itu berasal dari runtime Rust yang mengeksekusi IL hasil Roslyn.
 Tambahkan `--stats` untuk melihat ongkosnya:
 
 ```bash
-rustnet run bin/Release/net9.0/HelloWorld.dll --stats
+rustnet run bin/Release/net10.0/HelloWorld.dll --stats
 ```
 
 ---
@@ -72,11 +72,11 @@ Ini bagian yang menarik — assembly yang sama di dua runtime:
 cd tests/fixtures/Conformance
 dotnet build -c Release
 
-dotnet bin/Release/net9.0/Conformance.dll
-rustnet run bin/Release/net9.0/Conformance.dll
+dotnet bin/Release/net10.0/Conformance.dll
+rustnet run bin/Release/net10.0/Conformance.dll
 ```
 
-Keduanya mencetak `checks=38 failures=0`. Kalau suatu saat berbeda, itu bug
+Keduanya mencetak `checks=80 failures=0`. Kalau suatu saat berbeda, itu bug
 runtime — dan pemeriksaan yang berbeda itu langsung menunjuk penyebabnya.
 `tests/fixtures/ModernSyntax/` melakukan hal serupa untuk fitur C# modern dan
 mencetak `checks=35 failures=0`.
@@ -91,7 +91,7 @@ tercepat mengetahuinya adalah bertanya:
 ```bash
 cd path/ke/proyek-anda
 dotnet build -c Release
-rustnet verify bin/Release/net9.0/AplikasiAnda.dll
+rustnet verify bin/Release/net10.0/AplikasiAnda.dll
 ```
 
 `verify` mencantumkan setiap anggota yang dirujuk program Anda tetapi belum bisa
@@ -99,12 +99,13 @@ disediakan RustCLR, serta setiap method yang IL-nya gagal verifikasi. Laporan
 bersih berarti program itu semestinya jalan:
 
 ```bash
-rustnet run bin/Release/net9.0/AplikasiAnda.dll
+rustnet run bin/Release/net10.0/AplikasiAnda.dll
 ```
 
 Kalau `verify` melaporkan anggota framework yang hilang, itu wajar untuk apa pun
-yang memakai generic atau `async` saat ini — lihat
-[limitations.md](../limitations.md).
+yang memakai `async`, `Span<T>`, atau tipe framework yang belum
+diimplementasikan RustBCL — lihat [limitations.md](../limitations.md). Koleksi
+generic dan LINQ sudah jalan.
 
 ---
 
@@ -177,4 +178,5 @@ tersebut.
 - [Panduan CodeGen](codegen.md) — IDE secara rinci
 - [Rujukan toolchain](../cli.md) — setiap perintah `rustnet`
 - [Arsitektur](../architecture.md) — bagaimana runtime disusun
+- [Fitur lanjutan C#](fitur-lanjutan.md) — matriks dukungan hasil pengukuran
 - [Batasan](../limitations.md) — apa yang belum jalan, dan alasannya

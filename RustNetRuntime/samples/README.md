@@ -33,8 +33,8 @@ by role, who joined in 2025, and which accounts are suspended.
 cd samples/UserDirectory
 dotnet build -c Release
 
-dotnet bin/Release/net9.0/UserDirectory.dll
-rustnet run bin/Release/net9.0/UserDirectory.dll
+dotnet bin/Release/net10.0/UserDirectory.dll
+rustnet run bin/Release/net10.0/UserDirectory.dll
 ```
 
 **The output is byte-for-byte identical on both runtimes.** That is the point of
@@ -69,15 +69,17 @@ have file access.
 
 ### Why no LINQ
 
-The program uses explicit loops and arrays. Generics are erased on RustCLR
-today, so `List<T>`, `Dictionary<K,V>` and LINQ do not work — see
-[docs/limitations.md](../docs/limitations.md). Writing it this way keeps it
-runnable on both runtimes, and the comments in the source say so at each point
-where LINQ would have been the obvious choice.
+The program uses explicit loops and arrays because, when it was written, generic
+collections and LINQ did not run on RustCLR. **They do now** — see
+[Milestone 2](../Plan.md) — so the constraint no longer applies, and the
+comments in the source marking "LINQ would be the obvious choice here" are a
+record of what changed rather than a live restriction.
 
-When [Milestone 2](../Plan.md) lands, this sample gains a LINQ variant rather
-than being rewritten — the difference between the two will be a useful record of
-what changed.
+The sample is left as it is on purpose. It exercises strings, arrays, object
+fields, boolean logic and integer parsing directly, which is exactly what makes
+it useful as a byte-for-byte comparison between the two runtimes; rewriting it
+in LINQ would move that coverage into the LINQ implementation and out of the
+sample. A LINQ variant alongside it is the better addition.
 
 ---
 

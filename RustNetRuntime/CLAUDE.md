@@ -2,11 +2,11 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Status: milestone 1 complete, and it works
+## Status: milestones 1 and 2 complete, and it works
 
-The runtime executes real Roslyn-compiled assemblies. `cargo test --workspace` runs 111 tests;
-the conformance fixture prints `checks=38 failures=0` on RustCLR, byte-identical to `dotnet`,
-and `ModernSyntax` prints `checks=35 failures=0`.
+The runtime executes real Roslyn-compiled assemblies. `cargo test --workspace` runs 116 tests;
+the conformance fixture prints `checks=80 failures=0` on RustCLR, byte-identical to `dotnet`,
+and `ModernSyntax` prints `checks=35 failures=0`. Generic collections and LINQ run.
 CodeGen builds and runs. Not a git repository.
 
 `requirements.md` is the single source of truth for scope. Read it before starting any work —
@@ -83,13 +83,13 @@ swappable modules — do not hard-wire either into the rest of `RustCLR`.
 
 ## Commands
 
-Rust `1.97.1` / cargo `1.97.1`, .NET SDK `10.0.400`. There is no `.sln`; the C# side is one
-project built by path.
+Rust `1.97.1` / cargo `1.97.1`, .NET SDK `10.0.400`; every project targets `net10.0`. There is no `.sln`;
+the C# side is one project built by path.
 
 ```bash
 # Runtime
 cargo build --release                      # produces target/release/rustnet
-cargo test --workspace                     # 111 tests; must stay green
+cargo test --workspace                     # 116 tests; must stay green
 cargo test -p rustclr-core                 # one crate
 cargo test -p rustclr-gc a_cycle_is        # one test by substring
 
@@ -107,8 +107,8 @@ Before claiming a runtime change works, run a real assembly through both runtime
 
 ```bash
 cd tests/fixtures/Conformance && dotnet build -c Release
-dotnet bin/Release/net9.0/Conformance.dll                    # expect: checks=38 failures=0
-../../../target/debug/rustnet.exe run bin/Release/net9.0/Conformance.dll
+dotnet bin/Release/net10.0/Conformance.dll                    # expect: checks=80 failures=0
+../../../target/debug/rustnet.exe run bin/Release/net10.0/Conformance.dll
 ```
 
 The same applies to `samples/UserDirectory`. Output must match byte for byte — a CRLF/LF
@@ -133,5 +133,6 @@ docs/            documentation and generated screenshots
   `docs/limitations.md` explains each with its reason. Do not quietly widen a claim.
 - **Refuse rather than guess.** Unsupported interop shapes, unresolvable tokens and unmatched
   exception filters all produce a clear error instead of a plausible-looking wrong answer.
-- **Templates marked `RunsOnRustClr = true` must actually run there** — no LINQ, no generic
-  collections, until Milestone 2 lands.
+- **Templates marked `RunsOnRustClr = true` must actually run there.** Generic collections
+  and LINQ landed with Milestone 2, so they are fair game; `async`/`await`, `Span<T>` and
+  exception filters are not.

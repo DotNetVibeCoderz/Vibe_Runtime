@@ -22,6 +22,13 @@ use rustclr_metadata::{
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// The static slot holding the cached `Default` instance of a comparer.
+///
+/// A record's compiler-generated `Equals` calls `EqualityComparer<T>.Default`
+/// once per field, so the instance is allocated once and kept here rather than
+/// reallocated on every comparison.
+pub const DEFAULT_COMPARER_FIELD: &str = "s_default";
+
 /// The framework types the runtime itself needs to reference.
 #[derive(Debug, Clone, Copy)]
 pub struct CoreTypes {
@@ -67,6 +74,14 @@ pub struct LoadedAssembly {
     /// whether any IL actually reaches one: an attribute constructor is
     /// referenced but never executed, and reporting it would be noise.
     pub unresolved_members: HashMap<u32, String>,
+    /// Explicit interface implementations: `(implementing type, interface
+    /// method)` to the method that implements it.
+    ///
+    /// A C# explicit implementation is emitted under a mangled name —
+    /// `System.Collections.Generic.IEnumerable<int>.GetEnumerator` — so
+    /// dispatch cannot find it by matching name and shape. The `MethodImpl`
+    /// table is the only thing that records the link.
+    pub method_impls: HashMap<(TypeId, MethodId), MethodId>,
     /// Signature blobs of `TypeSpec` rows, kept for generic instantiation.
     pub type_specs: HashMap<u32, TypeSig>,
     /// Initial data for fields with an RVA (array initialisers).
@@ -89,6 +104,9 @@ pub struct Loader {
     bcl: AssemblyId,
     /// Static-field storage, indexed by `FieldId`.
     statics: Vec<Value>,
+    /// Internal-call stubs synthesised for interface dispatch onto native
+    /// types, keyed by the receiver type and the native binding name.
+    interned_calls: HashMap<(TypeId, String), MethodId>,
 }
 
 impl Loader {
@@ -115,6 +133,7 @@ impl Loader {
             },
             bcl: AssemblyId(0),
             statics: Vec::new(),
+            interned_calls: HashMap::new(),
         };
         loader.install_core_types();
         loader
@@ -183,6 +202,7 @@ impl Loader {
             field_ref_by_row: HashMap::new(),
             method_spec_by_row: HashMap::new(),
             unresolved_members: HashMap::new(),
+            method_impls: HashMap::new(),
             type_specs: HashMap::new(),
             field_data: HashMap::new(),
             entry_point: None,
@@ -407,6 +427,381 @@ impl Loader {
             &["hasValue", "value"],
             bcl,
         );
+
+        self.register_generic_collections(&mut synth, object, bcl);
+    }
+
+    /// Registers the generic collection surface.
+    ///
+    /// These are the types almost every real C# program reaches for, and none
+    /// of them can be *managed* code here: their bodies live in CoreLib, which
+    /// this runtime does not load. So each is a native type whose storage is an
+    /// ordinary managed array — which means the collector traces the elements
+    /// with no special case, and a `List<int>` costs one `Value` per element
+    /// rather than a boxed object.
+    ///
+    /// Generic arity is recorded but not instantiated: `List<int>` and
+    /// `List<string>` share one `RuntimeType`. That is sound *here* because the
+    /// storage is `Value`, which already carries its own shape — an `I32` slot
+    /// and an `Obj` slot are distinguishable without a type argument.
+    fn register_generic_collections(
+        &mut self,
+        synth: &mut impl FnMut() -> Token,
+        object: TypeId,
+        bcl: AssemblyId,
+    ) {
+        const GENERIC: &str = "System.Collections.Generic";
+
+        // Interfaces. A `foreach` over an `IEnumerable<T>`-typed variable, and
+        // the `IEqualityComparer<T>` a generated record `Equals` reaches for,
+        // both need the interface itself to resolve before dispatch can run.
+        for (ns, name, arity) in [
+            (GENERIC, "IEnumerable`1", 1),
+            (GENERIC, "IEnumerator`1", 1),
+            (GENERIC, "ICollection`1", 1),
+            (GENERIC, "IList`1", 1),
+            (GENERIC, "IReadOnlyCollection`1", 1),
+            (GENERIC, "IReadOnlyList`1", 1),
+            (GENERIC, "ISet`1", 1),
+            (GENERIC, "IDictionary`2", 2),
+            (GENERIC, "IReadOnlyDictionary`2", 2),
+            (GENERIC, "IEqualityComparer`1", 1),
+            (GENERIC, "IComparer`1", 1),
+            ("System.Collections", "IEnumerable", 0),
+            ("System.Collections", "IEnumerator", 0),
+            ("System.Collections", "ICollection", 0),
+            ("System.Collections", "IList", 0),
+            ("System.Collections", "IStructuralEquatable", 0),
+            ("System", "IEquatable`1", 1),
+        ] {
+            let id = self.add_native_type(ns, name, TypeKind::Interface, None, synth());
+            self.registry.ty_mut(id).generic_param_count = arity;
+        }
+
+        // The collections themselves, each with the field slots its native
+        // implementation stores through.
+        //
+        // `Dictionary` and `HashSet` carry a bucket table and a chain array
+        // beside their entries so lookup is a hash probe, not a scan. Keeping
+        // those as managed `int[]`s costs nothing and keeps every byte of a
+        // collection's state on the traced heap.
+        for (name, arity, fields) in [
+            ("List`1", 1u32, &["_items"][..]),
+            ("Queue`1", 1, &["_items"]),
+            ("Stack`1", 1, &["_items"]),
+            ("HashSet`1", 1, &["_buckets", "_next", "_items"]),
+            ("Dictionary`2", 2, &["_buckets", "_next", "_keys", "_values"]),
+        ] {
+            let id = self.add_native_type_with_fields_of_kind(
+                GENERIC,
+                name,
+                TypeKind::Class,
+                Some(object),
+                synth(),
+                fields,
+                bcl,
+            );
+            self.registry.ty_mut(id).generic_param_count = arity;
+        }
+
+        // `Dictionary<K,V>.Keys` and `.Values` are views, not copies: each
+        // holds only its source, so a change to the dictionary is visible
+        // through a view already taken — as it is on .NET.
+        for name in ["Dictionary`2+KeyCollection", "Dictionary`2+ValueCollection"] {
+            let id = self.add_native_type_with_fields_of_kind(
+                GENERIC,
+                name,
+                TypeKind::Class,
+                Some(object),
+                synth(),
+                &["_source"],
+                bcl,
+            );
+            self.registry.ty_mut(id).generic_param_count = 2;
+        }
+
+        // Enumerators. On .NET each of these is a mutable struct, and `foreach`
+        // holds it in a local it takes the address of. Here they are classes:
+        // the local then holds a reference, `ldloca` produces a managed pointer
+        // to that local, and the native `MoveNext` writes its position to the
+        // heap object rather than back through the pointer. The observable
+        // behaviour is the same for `foreach`, which is the only way C# lets
+        // you obtain one.
+        for owner in [
+            "List`1",
+            "Queue`1",
+            "Stack`1",
+            "HashSet`1",
+            "Dictionary`2",
+            "Dictionary`2+KeyCollection",
+            "Dictionary`2+ValueCollection",
+        ] {
+            self.add_native_type_with_fields_of_kind(
+                GENERIC,
+                &format!("{owner}+Enumerator"),
+                TypeKind::Class,
+                Some(object),
+                synth(),
+                &["_source", "_index", "_current"],
+                bcl,
+            );
+        }
+
+        // `KeyValuePair<K,V>` is likewise a class here. `foreach` over a
+        // dictionary assigns it with `stloc` and reads it through `get_Key` and
+        // `get_Value`, none of which can tell the difference.
+        let kvp = self.add_native_type_with_fields_of_kind(
+            GENERIC,
+            "KeyValuePair`2",
+            TypeKind::Class,
+            Some(object),
+            synth(),
+            &["key", "value"],
+            bcl,
+        );
+        self.registry.ty_mut(kvp).generic_param_count = 2;
+
+        // The default comparers. A record's compiler-generated `Equals` calls
+        // `EqualityComparer<T>.Default` once per field, so the instance is
+        // cached in a static slot rather than reallocated on every comparison.
+        for (name, arity) in [("EqualityComparer`1", 1u32), ("Comparer`1", 1)] {
+            let id = self.add_native_type(GENERIC, name, TypeKind::Class, Some(object), synth());
+            self.registry.ty_mut(id).generic_param_count = arity;
+            self.add_native_static_field(id, DEFAULT_COMPARER_FIELD, synth());
+        }
+
+        self.register_linq(synth, object);
+        let value_type = self.core.value_type;
+        self.register_tasks(synth, object, value_type);
+    }
+
+    /// Registers the `Task` and `async`/`await` surface.
+    ///
+    /// An `async` method is not special to the runtime: Roslyn lowers it to an
+    /// ordinary state-machine type plus calls into a *builder*. Supporting
+    /// `await` therefore means implementing that builder, the awaiter it hands
+    /// out, and `Task` itself — after which the IL runs like any other.
+    fn register_tasks(
+        &mut self,
+        synth: &mut impl FnMut() -> Token,
+        object: TypeId,
+        value_type: TypeId,
+    ) {
+        const TASKS: &str = "System.Threading.Tasks";
+        const CS: &str = "System.Runtime.CompilerServices";
+
+        // The interfaces the lowering references. A state machine implements
+        // `IAsyncStateMachine` explicitly, which is why `MethodImpl` has to be
+        // read for `MoveNext` to be reachable.
+        for (ns, name) in [
+            (CS, "IAsyncStateMachine"),
+            (CS, "INotifyCompletion"),
+            (CS, "ICriticalNotifyCompletion"),
+            ("System.Threading.Tasks.Sources", "IValueTaskSource"),
+        ] {
+            self.add_native_type(ns, name, TypeKind::Interface, None, synth());
+        }
+
+        // `Task` carries its own completion state. Continuations are held in a
+        // managed array so a suspended state machine stays reachable to the
+        // collector for exactly as long as the task that will resume it.
+        let task_fields = &["_status", "_result", "_exception", "_continuations"];
+        let task = self.add_native_type_with_fields_of_kind(
+            TASKS,
+            "Task",
+            TypeKind::Class,
+            Some(object),
+            synth(),
+            task_fields,
+            self.bcl,
+        );
+        // `Task<T>` derives from `Task`, so a `Task<int>` assigned to a `Task`
+        // variable passes the cast checks the compiler emits.
+        let generic_task = self.add_native_type_with_fields_of_kind(
+            TASKS,
+            "Task`1",
+            TypeKind::Class,
+            Some(task),
+            synth(),
+            &[],
+            self.bcl,
+        );
+        self.registry.ty_mut(generic_task).generic_param_count = 1;
+
+        for (name, arity) in [("TaskCompletionSource", 0u32), ("TaskCompletionSource`1", 1)] {
+            let id = self.add_native_type_with_fields_of_kind(
+                TASKS,
+                name,
+                TypeKind::Class,
+                Some(object),
+                synth(),
+                &["_task"],
+                self.bcl,
+            );
+            self.registry.ty_mut(id).generic_param_count = arity;
+        }
+
+        for (name, arity) in [("ValueTask", 0u32), ("ValueTask`1", 1)] {
+            let id = self.add_native_type(TASKS, name, TypeKind::ValueType, Some(value_type), synth());
+            self.registry.ty_mut(id).generic_param_count = arity;
+        }
+        self.add_native_type(TASKS, "TaskFactory", TypeKind::Class, Some(object), synth());
+        self.add_native_type(TASKS, "Parallel", TypeKind::Class, Some(object), synth());
+        self.add_native_type(
+            TASKS,
+            "TaskCanceledException",
+            TypeKind::Class,
+            Some(self.core.exception),
+            synth(),
+        );
+        self.add_native_type(
+            "System",
+            "AggregateException",
+            TypeKind::Class,
+            Some(self.core.exception),
+            synth(),
+        );
+        self.add_native_type(
+            "System.Threading",
+            "CancellationToken",
+            TypeKind::ValueType,
+            Some(value_type),
+            synth(),
+        );
+        self.add_native_type(
+            "System.Threading",
+            "CancellationTokenSource",
+            TypeKind::Class,
+            Some(object),
+            synth(),
+        );
+
+        // Builders and awaiters. Each is a value type holding a single slot,
+        // which the native implementations write the task handle into — the
+        // same shape `DefaultInterpolatedStringHandler` uses.
+        for (name, arity) in [
+            ("AsyncTaskMethodBuilder", 0u32),
+            ("AsyncTaskMethodBuilder`1", 1),
+            ("AsyncVoidMethodBuilder", 0),
+            ("AsyncValueTaskMethodBuilder", 0),
+            ("AsyncValueTaskMethodBuilder`1", 1),
+            ("TaskAwaiter", 0),
+            ("TaskAwaiter`1", 1),
+            ("ConfiguredTaskAwaitable", 0),
+            ("ConfiguredTaskAwaitable`1", 1),
+            ("ConfiguredTaskAwaitable+ConfiguredTaskAwaiter", 0),
+            ("ConfiguredTaskAwaitable`1+ConfiguredTaskAwaiter", 1),
+            ("ConfiguredValueTaskAwaitable", 0),
+            ("ConfiguredValueTaskAwaitable`1", 1),
+            ("YieldAwaitable", 0),
+            ("YieldAwaitable+YieldAwaiter", 0),
+        ] {
+            let id =
+                self.add_native_type(CS, name, TypeKind::ValueType, Some(value_type), synth());
+            self.registry.ty_mut(id).generic_param_count = arity;
+        }
+    }
+
+    /// Registers the LINQ surface.
+    ///
+    /// `Enumerable` holds the operators; `Func` and `Action` are the delegate
+    /// shapes lambdas compile to; `Grouping` and `OrderedEnumerable` are the
+    /// concrete results this runtime returns from `GroupBy` and `OrderBy`,
+    /// standing in for the compiler-invisible types .NET returns.
+    fn register_linq(&mut self, synth: &mut impl FnMut() -> Token, object: TypeId) {
+        let multicast = self.core.multicast_delegate;
+
+        self.add_native_type("System.Linq", "Enumerable", TypeKind::Class, Some(object), synth());
+        self.add_native_type("System.Linq", "Queryable", TypeKind::Class, Some(object), synth());
+
+        // A lambda compiles to `newobj Func`n::.ctor(object, native int)`, so
+        // the delegate type has to resolve before the lambda can be built.
+        for arity in 1..=9usize {
+            let id = self.add_native_type(
+                "System",
+                &format!("Func`{arity}"),
+                TypeKind::Delegate,
+                Some(multicast),
+                synth(),
+            );
+            self.registry.ty_mut(id).generic_param_count = arity as u32;
+        }
+        for arity in 1..=8usize {
+            let id = self.add_native_type(
+                "System",
+                &format!("Action`{arity}"),
+                TypeKind::Delegate,
+                Some(multicast),
+                synth(),
+            );
+            self.registry.ty_mut(id).generic_param_count = arity as u32;
+        }
+        for arity in 1..=3usize {
+            let id = self.add_native_type(
+                "System",
+                &format!("Predicate`{arity}"),
+                TypeKind::Delegate,
+                Some(multicast),
+                synth(),
+            );
+            self.registry.ty_mut(id).generic_param_count = arity as u32;
+        }
+        for (name, arity) in [("Comparison`1", 1u32), ("Converter`2", 2)] {
+            let id =
+                self.add_native_type("System", name, TypeKind::Delegate, Some(multicast), synth());
+            self.registry.ty_mut(id).generic_param_count = arity;
+        }
+
+        for (name, arity) in [("IGrouping`2", 2u32), ("IOrderedEnumerable`1", 1), ("ILookup`2", 2)] {
+            let id = self.add_native_type("System.Linq", name, TypeKind::Interface, None, synth());
+            self.registry.ty_mut(id).generic_param_count = arity;
+        }
+
+        let grouping = self.add_native_type_with_fields_of_kind(
+            "System.Linq",
+            "Grouping`2",
+            TypeKind::Class,
+            Some(object),
+            synth(),
+            &["_key", "_items"],
+            self.bcl,
+        );
+        self.registry.ty_mut(grouping).generic_param_count = 2;
+
+        // Ordering keys are kept per level rather than folded into one sort, so
+        // `ThenBy` refines the previous ordering instead of replacing it.
+        let ordered = self.add_native_type_with_fields_of_kind(
+            "System.Linq",
+            "OrderedEnumerable`1",
+            TypeKind::Class,
+            Some(object),
+            synth(),
+            &["_items", "_levels", "_descending"],
+            self.bcl,
+        );
+        self.registry.ty_mut(ordered).generic_param_count = 1;
+    }
+
+    /// Adds a static field to a natively implemented type, with storage.
+    fn add_native_static_field(&mut self, type_id: TypeId, name: &str, token: Token) {
+        let field_id = self.registry.add_field(
+            FieldInfo {
+                id: FieldId::INVALID,
+                name: name.to_string(),
+                declaring_type: type_id,
+                token,
+                signature: TypeSig::Object,
+                field_type: TypeId::INVALID,
+                is_static: true,
+                is_literal: false,
+                slot: 0,
+                offset: None,
+                constant: None,
+            },
+            self.bcl,
+        );
+        self.ensure_static_slot(field_id);
+        self.registry.ty_mut(type_id).static_fields.push(field_id);
     }
 
     /// Registers a native value type that carries instance fields.
@@ -423,7 +818,31 @@ impl Loader {
         field_names: &[&str],
         assembly: AssemblyId,
     ) -> TypeId {
-        let type_id = self.add_native_type(namespace, name, TypeKind::ValueType, base, token);
+        self.add_native_type_with_fields_of_kind(
+            namespace,
+            name,
+            TypeKind::ValueType,
+            base,
+            token,
+            field_names,
+            assembly,
+        )
+    }
+
+    /// As [`Self::add_native_type_with_fields`], for a type that is not a
+    /// value type — the generic collections are classes with backing storage.
+    #[allow(clippy::too_many_arguments)]
+    fn add_native_type_with_fields_of_kind(
+        &mut self,
+        namespace: &str,
+        name: &str,
+        kind: TypeKind,
+        base: Option<TypeId>,
+        token: Token,
+        field_names: &[&str],
+        assembly: AssemblyId,
+    ) -> TypeId {
+        let type_id = self.add_native_type(namespace, name, kind, base, token);
 
         for (slot, field_name) in field_names.iter().enumerate() {
             let field_token = Token::new(TableId::Field, token.row() * 16 + slot as u32 + 1);
@@ -530,6 +949,7 @@ impl Loader {
             field_ref_by_row: HashMap::new(),
             method_spec_by_row: HashMap::new(),
             unresolved_members: HashMap::new(),
+            method_impls: HashMap::new(),
             type_specs: HashMap::new(),
             field_data: HashMap::new(),
             entry_point: image.entry_point(),
@@ -573,8 +993,7 @@ impl Loader {
 
         // --- pass 2: resolve TypeRefs ----------------------------------------
         for row in 1..=md.row_count(TableId::TypeRef) {
-            let tr = md.type_ref(row).map_err(ExecutionError::Metadata)?;
-            let full = tr.full_name();
+            let full = type_ref_full_name(&md, row).map_err(ExecutionError::Metadata)?;
             // Framework types bind to RustBCL; anything else must already be
             // loaded, or is recorded as unresolved and reported on first use.
             if let Some(target) = self.registry.find_type_by_name(&full) {
@@ -942,6 +1361,34 @@ impl Loader {
             assembly.method_spec_by_row.insert(row, specialised.unwrap_or(method));
         }
 
+        // --- pass 10: explicit interface implementations ----------------------
+        // Without this, a type that implements an interface explicitly — every
+        // `yield return` state machine, among others — appears to implement
+        // nothing, because the body's name is mangled.
+        for row in 1..=md.row_count(TableId::MethodImpl) {
+            let mi = md.method_impl(row).map_err(ExecutionError::Metadata)?;
+            let Some(class) = assembly.type_by_row.get(&mi.class.row()).copied() else { continue };
+            let body = match mi.body.table() {
+                Some(TableId::MethodDef) => assembly.method_by_row.get(&mi.body.row()).copied(),
+                Some(TableId::MemberRef) => {
+                    assembly.member_ref_by_row.get(&mi.body.row()).copied()
+                }
+                _ => None,
+            };
+            let declaration = match mi.declaration.table() {
+                Some(TableId::MethodDef) => {
+                    assembly.method_by_row.get(&mi.declaration.row()).copied()
+                }
+                Some(TableId::MemberRef) => {
+                    assembly.member_ref_by_row.get(&mi.declaration.row()).copied()
+                }
+                _ => None,
+            };
+            if let (Some(body), Some(declaration)) = (body, declaration) {
+                assembly.method_impls.insert((class, declaration), body);
+            }
+        }
+
         self.by_name.insert(name, id);
         self.assemblies.push(assembly);
 
@@ -1081,6 +1528,63 @@ impl Loader {
         })
     }
 
+    /// The explicit implementation of `declared` on `type_id`, if there is one.
+    ///
+    /// Searched across every loaded assembly because the implementing type and
+    /// the interface need not come from the same one.
+    pub fn explicit_implementation(
+        &self,
+        type_id: TypeId,
+        declared: MethodId,
+    ) -> Option<MethodId> {
+        for base in self.registry.base_chain(type_id) {
+            for assembly in &self.assemblies {
+                if let Some(m) = assembly.method_impls.get(&(base, declared)) {
+                    return Some(*m);
+                }
+            }
+        }
+        None
+    }
+
+    /// Binds `name` on `type_id` to a native implementation, on demand.
+    ///
+    /// Interface dispatch onto a natively implemented type has no managed
+    /// method to find: `List<T>` carries no `MethodDef` for
+    /// `IEnumerable<T>::GetEnumerator`, because it carries no managed body at
+    /// all. Rather than let the call fall back to the interface's own stub —
+    /// which would run the wrong implementation, or none — this synthesises the
+    /// missing link on first use and caches it, so the second call is a lookup.
+    pub fn intern_internal_call(
+        &mut self,
+        type_id: TypeId,
+        name: &str,
+        signature: MethodSig,
+        qualified_name: String,
+    ) -> MethodId {
+        let cache_key = (type_id, qualified_name.clone());
+        if let Some(id) = self.interned_calls.get(&cache_key) {
+            return *id;
+        }
+        let flags = if signature.has_this { 0 } else { method_attributes::STATIC };
+        let token = Token::new(TableId::MemberRef, self.registry.method_count() as u32 + 1);
+        let id = self.registry.add_method(MethodInfo {
+            id: MethodId::INVALID,
+            name: name.to_string(),
+            declaring_type: type_id,
+            token,
+            assembly: self.bcl,
+            qualified_name,
+            signature,
+            flags,
+            impl_flags: method_impl_attributes::INTERNAL_CALL,
+            kind: MethodKind::InternalCall,
+            vtable_slot: None,
+        });
+        self.interned_calls.insert(cache_key, id);
+        id
+    }
+
     /// Resolves a method token (`MethodDef`, `MemberRef` or `MethodSpec`).
     pub fn resolve_method_token(
         &self,
@@ -1177,21 +1681,62 @@ fn type_sigs_match(a: &TypeSig, b: &TypeSig) -> bool {
     }
 }
 
+/// The name a `TypeRef` row binds under, nesting included.
+///
+/// A nested type carries an empty namespace and names its enclosing type
+/// through `ResolutionScope`, so `List`1/Enumerator` arrives as a bare
+/// `Enumerator` — which would collide with every other `Enumerator` in every
+/// other collection. Walking the scope produces `Outer+Nested`, matching the
+/// name the runtime registers native nested types under.
+fn type_ref_full_name(
+    md: &rustclr_metadata::Metadata<'_>,
+    row: u32,
+) -> rustclr_metadata::Result<String> {
+    let tr = md.type_ref(row)?;
+    if tr.resolution_scope.table() == Some(TableId::TypeRef) {
+        // Bounded by the row count: a scope chain cannot be longer than the
+        // table, and a cyclic one would otherwise spin here forever.
+        let mut names = vec![tr.name.to_string()];
+        let mut scope = tr.resolution_scope;
+        for _ in 0..md.row_count(TableId::TypeRef) {
+            let Some(TableId::TypeRef) = scope.table() else { break };
+            let outer = md.type_ref(scope.row())?;
+            names.push(outer.full_name());
+            if outer.resolution_scope.table() != Some(TableId::TypeRef) {
+                break;
+            }
+            scope = outer.resolution_scope;
+        }
+        names.reverse();
+        return Ok(names.join("+"));
+    }
+    Ok(tr.full_name())
+}
+
 /// Names the declaring scope of an unresolvable member reference.
 ///
 /// The point is a message a person can act on, so a `TypeRef` is rendered by
-/// name rather than as a raw token.
+/// name rather than as a raw token, and a generic instantiation by the name of
+/// its open definition — `List`1` says what is missing, `<generic
+/// instantiation>` does not.
 fn describe_member_scope(md: &rustclr_metadata::Metadata<'_>, class: Token) -> String {
     match class.table() {
-        Some(TableId::TypeRef) => md
-            .type_ref(class.row())
-            .map(|t| t.full_name())
-            .unwrap_or_else(|_| class.to_string()),
+        Some(TableId::TypeRef) => {
+            type_ref_full_name(md, class.row()).unwrap_or_else(|_| class.to_string())
+        }
         Some(TableId::TypeDef) => md
             .type_def(class.row())
             .map(|t| t.full_name())
             .unwrap_or_else(|_| class.to_string()),
-        Some(TableId::TypeSpec) => "<generic instantiation>".to_string(),
+        Some(TableId::TypeSpec) => md
+            .type_spec(class.row())
+            .ok()
+            .and_then(|ts| SignatureParser::new(ts.signature).parse_type_spec().ok())
+            .map(|sig| match sig {
+                TypeSig::GenericInst { definition, .. } => describe_member_scope(md, definition),
+                other => format!("{other:?}"),
+            })
+            .unwrap_or_else(|| "<generic instantiation>".to_string()),
         _ => class.to_string(),
     }
 }

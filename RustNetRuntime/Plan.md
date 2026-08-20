@@ -1,7 +1,7 @@
 # Plan
 
-The roadmap for RustNetRuntime. Milestone 1 is done; everything below it is
-ordered by what unblocks the most real programs.
+The roadmap for RustNetRuntime. Milestones 1 to 3 are done; everything below
+them is ordered by what unblocks the most real programs.
 
 ---
 
@@ -9,8 +9,8 @@ ordered by what unblocks the most real programs.
 
 **Goal:** take an assembly Roslyn produced and run it correctly.
 
-Done. `tests/fixtures/Conformance/` reports `checks=37 failures=0` on RustCLR,
-identical to `dotnet`. 108 tests pass across the workspace.
+Done. `tests/fixtures/Conformance/` reports `failures=0` on RustCLR, identical
+to `dotnet`, and has grown with every capability since.
 
 | Delivered | |
 | --- | --- |
@@ -26,36 +26,77 @@ identical to `dotnet`. 108 tests pass across the workspace.
 
 ---
 
-## Milestone 2 — Generics
+## Milestone 2 — Generics ✅
 
 **Why first:** almost every non-trivial C# program uses `List<T>` or
-`Dictionary<K,V>`. Generics are erased to `object` today, which is the single
-largest gap between "runs a test program" and "runs real code".
+`Dictionary<K,V>`, and until this landed that was the single largest gap
+between "runs a test program" and "runs real code".
 
-- Instantiate generic types rather than erasing them: one `RuntimeType` per
-  closed construction, with a shared open definition.
-- Resolve `MethodSpec` tokens to instantiated methods.
-- Generic virtual dispatch and constrained calls on value types.
-- Then implement `List<T>`, `Dictionary<K,V>`, `Queue<T>`, `Stack<T>` and
-  `IEnumerable<T>` in RustBCL.
+Done. `tests/fixtures/Conformance/` reports `checks=80 failures=0` on RustCLR,
+identical to `dotnet`; the advanced-feature matrix went from 10 of 21 probes to
+12 of 21, gaining records and LINQ.
 
-**Done when:** a conformance program using generic collections and `foreach`
-over `IEnumerable<T>` reports `failures=0`.
+| Delivered | |
+| --- | --- |
+| Generic collections | `List<T>`, `Dictionary<K,V>`, `HashSet<T>`, `Queue<T>`, `Stack<T>`, `KeyValuePair<K,V>` |
+| Enumeration | `foreach` over any of them, over `IEnumerable<T>`, and over user iterators |
+| LINQ | ~40 `Enumerable` operators, including `GroupBy` and `OrderBy`/`ThenBy` |
+| Comparers | `EqualityComparer<T>.Default` and `Comparer<T>.Default` — which is what makes records work |
+| Nested type names | `List`1+Enumerator` resolves instead of colliding with every other `Enumerator` |
+| `constrained.` on reference types | ECMA-335 III.2.1's other half, which every `foreach` needs |
+| Interior pointers into value types | `ByRef::StructField`, so `p.X` where `p` is a struct local has an address |
+
+**The approach, and what it does not do.** Generic *types* are still erased:
+`List<int>` and `List<string>` share one `RuntimeType`. That is sound for the
+collections because their storage is `Value`, which already carries its own
+shape — an `I32` slot and an `Obj` slot are distinguishable without a type
+argument. What it does *not* give is user-written generic code that depends on
+`T` at run time: `default(T)`, `typeof(T)`, or a generic type with a static
+field per instantiation. Real instantiation — one `RuntimeType` per closed
+construction — is still the eventual answer, and is now a smaller job than it
+was, because the collections no longer depend on it.
+
+Also still open: custom `IEqualityComparer<T>`/`IComparer<T>` arguments are
+accepted and ignored, LINQ is eager rather than lazy, and ordering compares
+numbers and strings only. Each is stated in `rustnet capabilities` and
+`docs/limitations.md`.
 
 ---
 
-## Milestone 3 — Tasks and async
+## Milestone 3 — Tasks and async ✅
 
-The scheduler exists (`rustclr-sched`: lock-free queue, channels, thread pool);
-nothing drives managed state machines through it yet.
+Done for the language feature. `tests/fixtures/Conformance/` reports
+`checks=90 failures=0` on RustCLR, identical to `dotnet`, and the
+advanced-feature matrix went from 12 of 21 probes to 13, gaining `async-await`.
 
-- Recognise compiler-generated `IAsyncStateMachine` types.
-- `Task`, `Task<T>`, `TaskCompletionSource` and the awaiter pattern in RustBCL.
-- Drive `MoveNext` from the thread pool; continuations onto the run queue.
-- `Thread`, `Monitor` (`lock`), `Interlocked`.
+| Delivered | |
+| --- | --- |
+| `Task`, `Task<T>` | Status, result, exception, continuations — all on the traced heap |
+| The builders | `AsyncTaskMethodBuilder`, its generic and void and `ValueTask` forms |
+| Awaiters | `TaskAwaiter`, `ConfiguredTaskAwaitable`, `YieldAwaitable` |
+| Statics | `Run`, `Delay`, `Yield`, `FromResult`, `CompletedTask`, `WhenAll`, `WhenAny`, `Wait` |
+| `TaskCompletionSource` | Including a genuine suspend and resume |
 
-**Done when:** a program that awaits several tasks and joins their results
-produces the same output on both runtimes.
+**An `async` method is not special to the runtime.** Roslyn lowers it to an
+ordinary struct plus calls into a builder; implementing that builder is the
+whole of `await` support, and the state machine is IL the interpreter already
+ran. Suspension copies the machine into a one-field heap cell and resumes it
+through a managed pointer — which only works because `ByRef::StructField` and
+the `MethodImpl` table landed in Milestone 2.
+
+**Asynchrony is synchronous.** There is one interpreter thread, so a task runs
+to completion where it is created. Results, ordering and exception propagation
+match .NET exactly; what is absent is *overlap*. This is the same honesty as
+`Thread`, and for the same reason.
+
+Still open, and the reason this milestone is not the end of the story:
+
+- **Real concurrency.** `rustclr-sched` has the substrate — a lock-free run
+  queue, channels, a thread pool, all tested. What is missing is a re-entrant
+  interpreter several OS threads can drive at once. Until then `Task.Run` and
+  `Thread.Start` both run their body inline.
+- **TPL**: `Parallel.For`, `Parallel.ForEach`.
+- **`IAsyncDisposable` / `await using`**, and `IAsyncEnumerable<T>`.
 
 ---
 

@@ -88,8 +88,9 @@ public static class Program
     /// <summary>
     /// Distinct teams or roles, in first-seen order.
     ///
-    /// No HashSet here — it is generic, and generics are erased on RustCLR
-    /// today. A linear scan over fifteen rows costs nothing.
+    /// No HashSet here: when this was written, generic collections did not run
+    /// on RustCLR. They do now — a linear scan over fifteen rows simply costs
+    /// nothing, so there is no reason to change it.
     /// </summary>
     private static string[] Distinct(User[] users, bool byTeam)
     {
