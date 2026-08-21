@@ -149,6 +149,27 @@ pub fn install(interp: &mut Interpreter) {
     reflection::register(interp);
 }
 
+/// Registers the bindings a console program needs, and no more.
+///
+/// `Console`, `String`, `Math`, interpolated strings and the object/runtime
+/// basics — 314 bindings against [`install`]'s 821. No generic collections, no
+/// LINQ, no reflection, no tasks.
+///
+/// This exists for boards that cannot hold the whole binding table. Registering
+/// all of RustBCL costs 260,702 bytes of peak allocation and this subset costs
+/// 192,045, which on a part with 192 KB of RAM is the difference between
+/// running a program and not running one.
+///
+/// It is also what `rustnet run --bcl minimal` installs, so a program can be
+/// checked against a small board's limits on a desktop, before it is flashed.
+pub fn install_minimal(interp: &mut Interpreter) {
+    runtime::register(interp);
+    console::register(interp);
+    interpolation::register(interp);
+    strings::register(interp);
+    numerics::register(interp);
+}
+
 /// The number of native bindings [`install`] provides.
 pub fn binding_count() -> usize {
     let mut probe = Interpreter::with_host(Box::new(rustclr_core::CaptureHost::new()));

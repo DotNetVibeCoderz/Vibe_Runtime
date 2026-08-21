@@ -39,6 +39,43 @@ newtype_id!(/// Index into the field arena.
     FieldId);
 newtype_id!(/// Index into the loaded-assembly table.
     AssemblyId);
+newtype_id!(/// Index into the property arena.
+    PropertyId);
+
+/// A property: a name and the accessors the `MethodSemantics` table pairs
+/// with it.
+///
+/// The runtime does not *execute* properties — C# compiles `p.X` to a call to
+/// `get_X`, and that has always worked. This exists so reflection can answer
+/// `GetProperties()` and `GetValue()`, which need to know that `get_X` and
+/// `set_X` are two halves of one member rather than two unrelated methods.
+///
+/// Reconstructed from metadata rather than guessed from method names: a method
+/// called `get_Total` is not necessarily an accessor, and a property whose
+/// accessors were renamed by an obfuscator still pairs correctly here.
+#[derive(Debug, Clone)]
+pub struct PropertyInfo {
+    pub id: PropertyId,
+    pub name: String,
+    pub declaring_type: TypeId,
+    pub getter: Option<MethodId>,
+    pub setter: Option<MethodId>,
+}
+
+impl PropertyInfo {
+    pub fn can_read(&self) -> bool {
+        self.getter.is_some()
+    }
+    pub fn can_write(&self) -> bool {
+        self.setter.is_some()
+    }
+    /// Static when its accessors are — a property has no storage of its own.
+    pub fn is_static(&self, registry: &TypeRegistry) -> bool {
+        self.getter
+            .or(self.setter)
+            .is_some_and(|m| registry.method(m).is_static())
+    }
+}
 
 /// What kind of type this is, which decides copy semantics and layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,6 +238,14 @@ pub struct MethodInfo {
     pub vtable_slot: Option<u32>,
     /// Fully qualified `Namespace.Type::Method` key, used for native lookup.
     pub qualified_name: String,
+    /// Declared parameter names, in signature order.
+    ///
+    /// From the `Param` table, which is separate from the signature: a
+    /// signature carries types, and only this carries what the author called
+    /// them. Empty for a method loaded from a source that has no `Param` rows
+    /// — a native binding, or an assembly compiled without them — and
+    /// reflection says `argN` there rather than inventing one.
+    pub param_names: Vec<String>,
 }
 
 impl MethodInfo {
@@ -253,6 +298,8 @@ pub struct RuntimeType {
     pub instance_fields: Vec<FieldId>,
     pub static_fields: Vec<FieldId>,
     pub methods: Vec<MethodId>,
+    /// Properties declared on this type, in metadata order.
+    pub properties: Vec<PropertyId>,
     /// Virtual dispatch table; index is the slot, value is the implementation.
     pub vtable: Vec<MethodId>,
     /// For arrays and pointers.
@@ -300,6 +347,7 @@ pub struct TypeRegistry {
     types: Vec<RuntimeType>,
     methods: Vec<MethodInfo>,
     fields: Vec<FieldInfo>,
+    properties: Vec<PropertyInfo>,
     /// `full_name` to id, for the current load set.
     by_name: HashMap<String, TypeId>,
     /// `(assembly, metadata token)` to id, the authoritative key.
@@ -323,6 +371,57 @@ impl TypeRegistry {
     }
     pub fn field_count(&self) -> usize {
         self.fields.len()
+    }
+    pub fn property_count(&self) -> usize {
+        self.properties.len()
+    }
+
+    /// Interns a property and links it to its declaring type.
+    pub fn add_property(
+        &mut self,
+        name: String,
+        declaring_type: TypeId,
+        getter: Option<MethodId>,
+        setter: Option<MethodId>,
+    ) -> PropertyId {
+        let id = PropertyId(self.properties.len() as u32);
+        self.properties.push(PropertyInfo { id, name, declaring_type, getter, setter });
+        self.types[declaring_type.index()].properties.push(id);
+        id
+    }
+
+    pub fn property(&self, id: PropertyId) -> &PropertyInfo {
+        &self.properties[id.index()]
+    }
+
+    /// Properties on a type and everything it inherits from.
+    ///
+    /// Walks the base chain because `GetProperties()` reports inherited members,
+    /// and a derived type's own list holds only what it declares. A name
+    /// declared twice reports the most-derived one, which is what hiding means.
+    pub fn properties_of(&self, ty: TypeId) -> Vec<PropertyId> {
+        let mut found: Vec<PropertyId> = Vec::new();
+        let mut seen: Vec<&str> = Vec::new();
+        let mut current = Some(ty);
+        while let Some(id) = current {
+            let t = &self.types[id.index()];
+            for &property in &t.properties {
+                let name = self.properties[property.index()].name.as_str();
+                if !seen.contains(&name) {
+                    seen.push(name);
+                    found.push(property);
+                }
+            }
+            current = t.base;
+        }
+        found
+    }
+
+    /// A property by name, searching the base chain.
+    pub fn find_property(&self, ty: TypeId, name: &str) -> Option<PropertyId> {
+        self.properties_of(ty)
+            .into_iter()
+            .find(|p| self.properties[p.index()].name == name)
     }
 
     pub fn add_type(&mut self, mut ty: RuntimeType) -> TypeId {

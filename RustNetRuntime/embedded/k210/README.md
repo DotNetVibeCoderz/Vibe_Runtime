@@ -7,7 +7,7 @@ The second RISC-V board and the first 64-bit one; the ESP32-C3 is RV32IMC. It
 prints the same report as every other board.
 
 **It executes IL.** The K210 has 6 MB of SRAM against a peak need of 261 KB,
-so it is the one board of the five with room to spare: it gets the full set of
+so it is the one board of the seven with room to spare: it gets the full set of
 RustBCL bindings without anything being trimmed. See
 [docs/limitations.md](../../docs/limitations.md).
 

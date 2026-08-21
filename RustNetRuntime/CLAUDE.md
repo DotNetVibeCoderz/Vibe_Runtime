@@ -5,16 +5,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Status: milestones 1-3 and 5 complete, 4 and 6 partly done, and it works
 
 The runtime executes real Roslyn-compiled assemblies. `cargo test --workspace` runs 163 tests;
-the conformance fixture prints `checks=136 failures=0` on RustCLR, byte-identical to `dotnet`,
+the conformance fixture prints `checks=176 failures=0` on RustCLR, byte-identical to `dotnet`,
 and `ModernSyntax` prints `checks=35 failures=0`. Generic collections, LINQ and
 `async`/`await` all run, hot integer methods compile to x86-64 machine code (with small
 callees inlined), and reflection works on real `System.Type` objects.
 
 **The whole runtime builds without `std`, and the interpreter runs on a microcontroller** —
-an ESP32-C3 executes `HelloWorld.Main` with all 766 RustBCL bindings, printing bytes
+an ESP32-C3 executes `HelloWorld.Main` with all 821 RustBCL bindings, printing bytes
 identical to `dotnet`. `bash tests/embedded.sh` checks metadata, gc, core and bcl on four
 bare-metal targets. Memory is the binding constraint there: 260,702 bytes peak with every
-binding, 192,045 with a console-only subset, and each firmware picks from its heap budget.
+binding, 192,045 with a console-only subset, and each firmware picks from its heap budget —
+the Nucleo-F401RE's 96 KB clears neither, which it reports rather than faulting.
 
 CodeGen builds and runs. Not a git repository.
 
@@ -100,16 +101,18 @@ the C# side is one project built by path.
 cargo build --release                      # produces target/release/rustnet
 cargo test --workspace                     # 163 tests; must stay green
 bash tests/embedded.sh                     # 4 crates x 4 bare-metal targets; must stay green
-bash tests/firmware.sh                     # five board firmwares; must stay green
+bash tests/firmware.sh                     # seven board firmwares; must stay green
 cargo test -p rustclr-core                 # one crate
 cargo test -p rustclr-gc a_cycle_is        # one test by substring
 
 # CodeGen
 dotnet build src/CodeGen -c Release
 dotnet run --project src/CodeGen
+dotnet run --project src/CodeGen -- --verify-templates   # every template on both runtimes
 
 # Screenshots for README and docs — re-run after any UI change
-dotnet run --project src/CodeGen -c Release -- --screenshot docs/images
+dotnet run --project src/CodeGen
+dotnet run --project src/CodeGen -- --verify-templates   # every template on both runtimes -c Release -- --screenshot docs/images
 ```
 
 ### The check that matters
@@ -118,7 +121,7 @@ Before claiming a runtime change works, run a real assembly through both runtime
 
 ```bash
 cd tests/fixtures/Conformance && dotnet build -c Release
-dotnet bin/Release/net10.0/Conformance.dll                    # expect: checks=136 failures=0
+dotnet bin/Release/net10.0/Conformance.dll                    # expect: checks=176 failures=0
 ../../../target/debug/rustnet.exe run bin/Release/net10.0/Conformance.dll
 ```
 
@@ -143,7 +146,7 @@ docs/            documentation and generated screenshots
 - **State limitations plainly.** `rustnet capabilities` prints them from the runtime, and
   `docs/limitations.md` explains each with its reason. Do not quietly widen a claim.
 - **Refuse rather than guess.** Unsupported interop shapes, unresolvable tokens and unmatched
-  exception filters all produce a clear error instead of a plausible-looking wrong answer.
+  unsupported IL opcodes all produce a clear error instead of a plausible-looking wrong answer.
 - **Templates marked `RunsOnRustClr = true` must actually run there.** Generic collections
   and LINQ landed with Milestone 2 and `async`/`await` with Milestone 3, so all three are
-  fair game; `Span<T>`, TPL and exception filters are not.
+  fair game, as are exception filters; `Span<T>` and TPL are not.

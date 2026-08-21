@@ -126,6 +126,36 @@ public sealed class BuildService(ProjectService projects, ProcessRunner runner)
         return result;
     }
 
+    /// <summary>
+    /// Runs the built assembly against the reduced binding set.
+    ///
+    /// The same 300 bindings a 192 KB board carries. A program that fails here
+    /// will fail on that board, and finding out on a desktop costs seconds
+    /// rather than a build-and-flash cycle.
+    /// </summary>
+    public async Task<ProcessResult> RunOnMinimalBclAsync(
+        AppSettings settings,
+        Action<string> log,
+        CancellationToken cancellationToken = default)
+    {
+        var assembly = projects.FindOutputAssembly(Configuration);
+        if (assembly is null)
+        {
+            log("Build the project first.");
+            return new ProcessResult(-1, "", "no assembly", TimeSpan.Zero);
+        }
+
+        var rustnet = ResolveRustNet(settings);
+        log($"$ {Path.GetFileName(rustnet)} run --bcl minimal \"{Path.GetFileName(assembly)}\"");
+        return await runner.RunAsync(
+            rustnet,
+            ["run", "--bcl", "minimal", assembly],
+            Path.GetDirectoryName(assembly),
+            log,
+            log,
+            cancellationToken).ConfigureAwait(false);
+    }
+
     /// <summary>Runs `rustnet verify`, which reports what RustCLR cannot resolve.</summary>
     public async Task<ProcessResult> VerifyOnRustClrAsync(
         AppSettings settings,

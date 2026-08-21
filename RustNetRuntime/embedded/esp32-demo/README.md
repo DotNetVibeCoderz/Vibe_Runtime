@@ -20,7 +20,7 @@ It does two things on the chip:
 | Runs the collector | Allocates, builds a reference cycle, drops the root, collects, and fills a fixed heap to its ceiling |
 
 **It executes IL**, and this is the board it was verified on. On the C3 the
-loader builds a type registry, RustBCL registers all 766 of its native
+loader builds a type registry, RustBCL registers all 821 of its native
 bindings, and the interpreter runs `HelloWorld.Main` — printing the same bytes
 `dotnet` prints on a desktop, CRLF included, with the same instruction and call
 counts. Capture: [docs/logs/esp32c3-interpreter.log](../../docs/logs/esp32c3-interpreter.log).

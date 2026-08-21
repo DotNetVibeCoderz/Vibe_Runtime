@@ -26,8 +26,8 @@
 use crate::collections::{field, set_field};
 use crate::support::*;
 use rustclr_core::{
-    ClrArray, ClrExceptionKind, ExecResult, ExecutionError, FieldId, Interpreter, MethodId,
-    TypeId, TypeKind, Value,
+    AssemblyId, ClrArray, ClrExceptionKind, ExecResult, ExecutionError, FieldId, Interpreter,
+    MethodId, PropertyId, TypeId, TypeKind, Value,
 };
 use rustclr_gc::Handle;
 
@@ -200,6 +200,30 @@ fn register_type(interp: &mut Interpreter) {
             None => Ok(Some(Value::Null)),
         }
     });
+
+    // Properties. C# compiles `p.X` to a call to `get_X`, so none of this is
+    // needed to *run* a property — it is needed to reflect over one, which
+    // means knowing that `get_X` and `set_X` are halves of one member. The
+    // loader reconstructs that from `PropertyMap` and `MethodSemantics` rather
+    // than guessing it from method names.
+    for member in ["GetProperties()", "GetProperties/1"] {
+        interp.register_native(key(TYPE, member), |i, a| {
+            let declaring = described(i, a, 0)?;
+            let ids: Vec<u32> =
+                i.loader.registry.properties_of(declaring).iter().map(|p| p.0).collect();
+            Ok(Some(id_array(i, "PropertyInfo", declaring, &ids)))
+        });
+    }
+    for member in ["GetProperty(string)", "GetProperty/1", "GetProperty/2"] {
+        interp.register_native(key(TYPE, member), |i, a| {
+            let declaring = described(i, a, 0)?;
+            let name = arg_string_or_empty(i, a, 1)?;
+            match i.loader.registry.find_property(declaring, &name) {
+                Some(id) => Ok(Some(new_member(i, "PropertyInfo", id.0, declaring))),
+                None => Ok(Some(Value::Null)),
+            }
+        });
+    }
 
     interp.register_native(key(TYPE, "GetFields()"), |i, a| {
         let id = described(i, a, 0)?;
@@ -451,6 +475,36 @@ fn same_member(interp: &mut Interpreter, args: &[Value]) -> ExecResult<bool> {
         && field(interp, a, 1) == field(interp, b, 1))
 }
 
+/// A parameter's declared name, or `argN` when the metadata has none.
+///
+/// The `Param` table is separate from the signature and a method may omit rows
+/// for parameters it did not name — a native binding has none at all. Falling
+/// back to a positional name says "not recorded" rather than inventing one.
+fn parameter_name(interp: &Interpreter, method: MethodId, position: usize) -> String {
+    interp
+        .loader
+        .registry
+        .method(method)
+        .param_names
+        .get(position)
+        .filter(|n| !n.is_empty())
+        .cloned()
+        .unwrap_or_else(|| format!("arg{position}"))
+}
+
+/// Packs a method id and a parameter position into one member id.
+///
+/// A parameter has no id of its own in the registry — it is the *n*th entry of
+/// a method's signature — so the pair is what identifies it. 8 bits of position
+/// is more than the 256-argument limit any real method comes near.
+fn pack_parameter(method: MethodId, position: usize) -> u32 {
+    (method.0 << 8) | (position as u32 & 0xFF)
+}
+
+fn unpack_parameter(packed: u32) -> (MethodId, usize) {
+    (MethodId(packed >> 8), (packed & 0xFF) as usize)
+}
+
 /// The id a member handle carries.
 fn member_id(interp: &mut Interpreter, args: &[Value]) -> ExecResult<u32> {
     let handle = arg(interp, args, 0)?
@@ -539,6 +593,145 @@ fn register_members(interp: &mut Interpreter) {
         interp.register_native(key(full, "Invoke/2"), invoke_method);
         interp.register_native(key(full, "Invoke/3"), invoke_method);
     }
+
+    // `MethodBase.GetParameters()`. The names are not here — those live in the
+    // `Param` table, which the loader does not read — so a `ParameterInfo`
+    // reports its position and its type, and `get_Name` answers `argN`. That is
+    // a narrowing rather than a guess: nothing invents a name that was in the
+    // metadata and got lost.
+    for type_name in ["MethodInfo", "ConstructorInfo", "MethodBase"] {
+        let full: &'static str = Box::leak(format!("{REFLECT}.{type_name}").into_boxed_str());
+        interp.register_native(key(full, "GetParameters()"), |i, a| {
+            let id = MethodId(member_id(i, a)?);
+            let info = i.loader.registry.method(id);
+            let declaring = info.declaring_type;
+            let count = info.signature.params.len();
+            // The id a `ParameterInfo` carries packs the method and the
+            // position, because a parameter has no id of its own in the
+            // registry and the pair is what identifies it.
+            let ids: Vec<u32> = (0..count).map(|n| pack_parameter(id, n)).collect();
+            Ok(Some(id_array(i, "ParameterInfo", declaring, &ids)))
+        });
+    }
+
+    let parameter: &'static str = Box::leak(format!("{REFLECT}.ParameterInfo").into_boxed_str());
+    interp.register_native(key(parameter, "get_Position()"), |i, a| {
+        let (_, position) = unpack_parameter(member_id(i, a)?);
+        Ok(Some(Value::I32(position as i32)))
+    });
+    interp.register_native(key(parameter, "get_Name()"), |i, a| {
+        let (method, position) = unpack_parameter(member_id(i, a)?);
+        let name = parameter_name(i, method, position);
+        Ok(Some(string_value(i, &name)))
+    });
+    interp.register_native(key(parameter, "get_ParameterType()"), |i, a| {
+        let (method, position) = unpack_parameter(member_id(i, a)?);
+        let info = i.loader.registry.method(method);
+        let assembly = info.assembly;
+        let signature = info.signature.params.get(position).cloned();
+        let resolved = signature
+            .and_then(|sig| i.loader.resolve_type_sig(i.loader.assembly(assembly), &sig))
+            .unwrap_or_else(|| i.loader.core().object);
+        let handle = i.type_object(resolved);
+        Ok(Some(Value::Obj(handle)))
+    });
+    interp.register_native(key(parameter, "ToString()"), |i, a| {
+        let (method, position) = unpack_parameter(member_id(i, a)?);
+        let name = parameter_name(i, method, position);
+        Ok(Some(string_value(i, &name)))
+    });
+
+    let property: &'static str = Box::leak(format!("{REFLECT}.PropertyInfo").into_boxed_str());
+    interp.register_native(key(property, "get_Name()"), |i, a| {
+        let id = PropertyId(member_id(i, a)?);
+        let name = i.loader.registry.property(id).name.clone();
+        Ok(Some(string_value(i, &name)))
+    });
+    interp.register_native(key(property, "ToString()"), |i, a| {
+        let id = PropertyId(member_id(i, a)?);
+        let name = i.loader.registry.property(id).name.clone();
+        Ok(Some(string_value(i, &name)))
+    });
+    interp.register_native(key(property, "get_CanRead()"), |i, a| {
+        let id = PropertyId(member_id(i, a)?);
+        Ok(Some(Value::I32(i.loader.registry.property(id).can_read() as i32)))
+    });
+    interp.register_native(key(property, "get_CanWrite()"), |i, a| {
+        let id = PropertyId(member_id(i, a)?);
+        Ok(Some(Value::I32(i.loader.registry.property(id).can_write() as i32)))
+    });
+    interp.register_native(key(property, "get_DeclaringType()"), |i, a| {
+        let id = PropertyId(member_id(i, a)?);
+        let declaring = i.loader.registry.property(id).declaring_type;
+        let handle = i.type_object(declaring);
+        Ok(Some(Value::Obj(handle)))
+    });
+    interp.register_native(key(property, "get_PropertyType()"), |i, a| {
+        let id = PropertyId(member_id(i, a)?);
+        let property = i.loader.registry.property(id);
+        // The type comes from whichever accessor exists: a getter's return
+        // type, or a setter's last parameter.
+        let resolved = match (property.getter, property.setter) {
+            (Some(getter), _) => {
+                let info = i.loader.registry.method(getter);
+                let assembly = info.assembly;
+                let sig = info.signature.return_type.clone();
+                i.loader.resolve_type_sig(i.loader.assembly(assembly), &sig)
+            }
+            (None, Some(setter)) => {
+                let info = i.loader.registry.method(setter);
+                let assembly = info.assembly;
+                let sig = info.signature.params.last().cloned();
+                sig.and_then(|s| i.loader.resolve_type_sig(i.loader.assembly(assembly), &s))
+            }
+            (None, None) => None,
+        };
+        let handle = i.type_object(resolved.unwrap_or_else(|| i.loader.core().object));
+        Ok(Some(Value::Obj(handle)))
+    });
+    for member in ["GetValue(object)", "GetValue/1", "GetValue/2"] {
+        interp.register_native(key(property, member), |i, a| {
+            let id = PropertyId(member_id(i, a)?);
+            let property = i.loader.registry.property(id);
+            let Some(getter) = property.getter else {
+                return Err(ExecutionError::exception(
+                    ClrExceptionKind::InvalidOperation,
+                    format!("property {} has no getter", property.name),
+                ));
+            };
+            let is_static = i.loader.registry.method(getter).is_static();
+            let target = arg(i, a, 1).unwrap_or(Value::Null);
+            let args = if is_static { Vec::new() } else { vec![target] };
+            i.invoke(getter, args)
+        });
+    }
+    for member in ["SetValue(object,object)", "SetValue/2", "SetValue/3"] {
+        interp.register_native(key(property, member), |i, a| {
+            let id = PropertyId(member_id(i, a)?);
+            let property = i.loader.registry.property(id);
+            let Some(setter) = property.setter else {
+                return Err(ExecutionError::exception(
+                    ClrExceptionKind::InvalidOperation,
+                    format!("property {} has no setter", property.name),
+                ));
+            };
+            let is_static = i.loader.registry.method(setter).is_static();
+            let target = arg(i, a, 1).unwrap_or(Value::Null);
+            let mut value = arg(i, a, 2).unwrap_or(Value::Null);
+            // A boxed primitive must be unboxed before it reaches a setter that
+            // takes one, or every later read comes back zero — the same trap
+            // `MethodInfo.Invoke` fell into.
+            // A boxed primitive must be unboxed before it reaches a setter
+            // that takes one, or every later read comes back zero — the same
+            // trap `MethodInfo.Invoke` fell into.
+            value = unbox(i, value);
+            let args = if is_static { vec![value] } else { vec![target, value] };
+            i.invoke(setter, args)?;
+            Ok(None)
+        });
+    }
+
+    register_assembly(interp);
 
     let field_type: &'static str = Box::leak(format!("{REFLECT}.FieldInfo").into_boxed_str());
     interp.register_native(key(field_type, "get_Name()"), |i, a| {
@@ -971,4 +1164,157 @@ mod tests {
         assert!(!assignable(&i, string_type, object_type), "not the other way");
         assert!(assignable(&i, string_type, string_type));
     }
+}
+
+
+// ── System.Reflection.Assembly ───────────────────────────────────────────────
+
+/// `Assembly`, `Module` and `AssemblyName`.
+///
+/// Each is an object holding an assembly id in field 0 — the same shape a
+/// `MethodInfo` uses for a method id. They are three types rather than one
+/// because `Type.Assembly` and `Type.Module` are distinct properties in C#, and
+/// returning the wrong one would compile and then misbehave.
+///
+/// What is here is enumeration: the types an assembly declares, its name, and
+/// finding a type by name within it. What is *not* here is loading an assembly
+/// at run time — `Assembly.Load` needs a search path and a resolver, and on a
+/// microcontroller there is no filesystem to search.
+fn register_assembly(interp: &mut Interpreter) {
+    let assembly_type: &'static str = Box::leak(format!("{REFLECT}.Assembly").into_boxed_str());
+    let module_type: &'static str = Box::leak(format!("{REFLECT}.Module").into_boxed_str());
+    let name_type: &'static str = Box::leak(format!("{REFLECT}.AssemblyName").into_boxed_str());
+
+    // The assembly whose code is running. Not the entry assembly: a method in a
+    // library reports the library, which is what `GetExecutingAssembly` means.
+    interp.register_native(key(assembly_type, "GetExecutingAssembly()"), |i, _a| {
+        let current = i.current_assembly();
+        Ok(Some(match current {
+            Some(id) => new_assembly(i, "Assembly", id),
+            None => Value::Null,
+        }))
+    });
+    interp.register_native(key(assembly_type, "GetEntryAssembly()"), |i, _a| {
+        // The one with an entry point — not assembly 0, which is RustBCL's
+        // synthetic assembly and was the first thing this returned.
+        let id = i.loader.assemblies().iter().find(|a| a.entry_point.is_some()).map(|a| a.id);
+        Ok(Some(match id {
+            Some(id) => new_assembly(i, "Assembly", id),
+            None => Value::Null,
+        }))
+    });
+
+    for (type_name, member) in [
+        (assembly_type, "get_FullName()"),
+        (assembly_type, "ToString()"),
+        (name_type, "get_FullName()"),
+        (name_type, "ToString()"),
+    ] {
+        interp.register_native(key(type_name, member), |i, a| {
+            let id = assembly_of(i, a)?;
+            let assembly = i.loader.assembly(id);
+            let text = format!("{}, Version={}", assembly.name, assembly.version);
+            Ok(Some(string_value(i, &text)))
+        });
+    }
+    for (type_name, member) in [(assembly_type, "get_Name()"), (name_type, "get_Name()")] {
+        interp.register_native(key(type_name, member), |i, a| {
+            let id = assembly_of(i, a)?;
+            let name = i.loader.assembly(id).name.clone();
+            Ok(Some(string_value(i, &name)))
+        });
+    }
+    // `Module.Name` is the *file* name, extension included — .NET answers
+    // `Conformance.dll` where the assembly is `Conformance`. It comes from the
+    // `Module` table rather than from the assembly name plus a guessed suffix.
+    for member in ["get_Name()", "ToString()"] {
+        interp.register_native(key(module_type, member), |i, a| {
+            let id = assembly_of(i, a)?;
+            let name = i.loader.assembly(id).module_name.clone();
+            Ok(Some(string_value(i, &name)))
+        });
+    }
+    interp.register_native(key(assembly_type, "GetName()"), |i, a| {
+        let id = assembly_of(i, a)?;
+        Ok(Some(new_assembly(i, "AssemblyName", id)))
+    });
+
+    // Every type the assembly declares, in load order.
+    interp.register_native(key(assembly_type, "GetTypes()"), |i, a| {
+        let id = assembly_of(i, a)?;
+        let ids: Vec<TypeId> = i.loader.assembly(id).type_by_row.values().copied().collect();
+        // `type_by_row` is a map, so its iteration order is not the metadata's.
+        // Sorting by id restores load order, which is what `GetTypes` reports
+        // and what makes two runs of the same program agree.
+        let mut ids = ids;
+        ids.sort_by_key(|t| t.0);
+        let values: Vec<Value> =
+            ids.iter().map(|t| Value::Obj(i.type_object(*t))).collect();
+        Ok(Some(value_array(i, values)))
+    });
+    for member in ["GetType(string)", "GetType/1", "GetType/2"] {
+        interp.register_native(key(assembly_type, member), |i, a| {
+            let id = assembly_of(i, a)?;
+            let wanted = arg_string_or_empty(i, a, 1)?;
+            let found = i
+                .loader
+                .assembly(id)
+                .type_by_row
+                .values()
+                .copied()
+                .find(|t| i.loader.registry.ty(*t).full_name() == wanted);
+            Ok(Some(match found {
+                Some(t) => Value::Obj(i.type_object(t)),
+                None => Value::Null,
+            }))
+        });
+    }
+
+    // `Type.Assembly` and `Type.Module`, which is how most code reaches one.
+    const TYPE: &str = "System.Type";
+    interp.register_native(key(TYPE, "get_Assembly()"), |i, a| {
+        let described = described(i, a, 0)?;
+        let id = i.loader.registry.ty(described).assembly;
+        Ok(Some(new_assembly(i, "Assembly", id)))
+    });
+    interp.register_native(key(TYPE, "get_Module()"), |i, a| {
+        let described = described(i, a, 0)?;
+        let id = i.loader.registry.ty(described).assembly;
+        Ok(Some(new_assembly(i, "Module", id)))
+    });
+}
+
+/// An `Assembly`, `Module` or `AssemblyName` handle over an assembly id.
+fn new_assembly(interp: &mut Interpreter, type_name: &str, id: AssemblyId) -> Value {
+    let Some(type_id) = interp
+        .loader
+        .registry
+        .find_type_by_name(&format!("{REFLECT}.{type_name}"))
+    else {
+        return Value::Null;
+    };
+    let handle = interp.alloc_object(type_id);
+    set_field(interp, handle, 0, Value::I32(id.0 as i32));
+    Value::Obj(handle)
+}
+
+/// The assembly an `Assembly`-shaped handle refers to.
+fn assembly_of(interp: &mut Interpreter, args: &[Value]) -> ExecResult<AssemblyId> {
+    let handle = arg(interp, args, 0)?
+        .as_handle()
+        .filter(|h| !h.is_null())
+        .ok_or_else(ExecutionError::null_reference)?;
+    Ok(AssemblyId(field(interp, handle, 0).as_i32().unwrap_or(0) as u32))
+}
+
+/// Wraps values in a managed array.
+fn value_array(interp: &mut Interpreter, values: Vec<Value>) -> Value {
+    let array = interp.alloc_value_array(0);
+    if let Some(a) = interp.heap.get_as_mut::<ClrArray>(array) {
+        if let Some(v) = a.storage.values_mut() {
+            *v = values;
+            a.dimensions = vec![v.len() as u32];
+        }
+    }
+    Value::Obj(array)
 }

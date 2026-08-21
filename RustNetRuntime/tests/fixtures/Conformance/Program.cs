@@ -71,6 +71,18 @@ sealed class Tag
     public int Echo(int n) { return n * 2; }
 }
 
+/// A type with properties, for reflection to walk.
+///
+/// `Celsius` is read-write, `Fahrenheit` is computed and read-only, and
+/// `Origin` is static — three shapes `GetProperties` has to tell apart.
+sealed class Reading
+{
+    public double Celsius { get; set; }
+    public double Fahrenheit { get { return Celsius * 9 / 5 + 32; } }
+    public static string Origin { get; set; } = "lab";
+    public int Scale(int by, int offset) { return (int)Celsius * by + offset; }
+}
+
 sealed class Node
 {
     public int Value;
@@ -332,6 +344,95 @@ static class Program
         return state;
     }
 
+    /// Exception filters: `catch when`, which runs managed code mid-unwind.
+    ///
+    /// The filter is evaluated *before* the stack below it is discarded, which
+    /// is the property that makes `when` different from testing inside the
+    /// catch block and rethrowing.
+    static int FilterSelects(int code)
+    {
+        try
+        {
+            throw new InvalidOperationException("code=" + code);
+        }
+        catch (InvalidOperationException e) when (e.Message.EndsWith("=7"))
+        {
+            return 7;
+        }
+        catch (InvalidOperationException)
+        {
+            return 0;
+        }
+    }
+
+    /// A filter that reads a local of the frame it is unwinding.
+    static int FilterSeesLocals(int threshold)
+    {
+        int seen = threshold * 2;
+        try
+        {
+            throw new InvalidOperationException("boom");
+        }
+        catch (InvalidOperationException) when (seen > 5)
+        {
+            return seen;
+        }
+        catch (InvalidOperationException)
+        {
+            return -1;
+        }
+    }
+
+    /// Filters run in order, and the first to accept wins.
+    static string FilterOrder()
+    {
+        string log = "";
+        try
+        {
+            try
+            {
+                throw new InvalidOperationException("x");
+            }
+            catch (InvalidOperationException) when (Note(ref log, "inner-false", false))
+            {
+                log += "|inner-ran";
+            }
+        }
+        catch (InvalidOperationException) when (Note(ref log, "outer-true", true))
+        {
+            log += "|outer-ran";
+        }
+        return log;
+    }
+
+    static bool Note(ref string log, string label, bool verdict)
+    {
+        log += (log.Length == 0 ? "" : "|") + label;
+        return verdict;
+    }
+
+    /// A filter that throws declines, and the original exception continues.
+    static int FilterThatThrows()
+    {
+        try
+        {
+            throw new InvalidOperationException("original");
+        }
+        catch (InvalidOperationException) when (Boom())
+        {
+            return -1;
+        }
+        catch (InvalidOperationException e)
+        {
+            return e.Message == "original" ? 1 : 0;
+        }
+    }
+
+    static bool Boom()
+    {
+        throw new InvalidOperationException("from the filter");
+    }
+
     static int NestedCatch()
     {
         int v = 0;
@@ -410,6 +511,28 @@ static class Program
 
         // strings
         CheckStr("concat", "a" + "b" + "c", "abc");
+
+        // `string + char` is not `String.Concat(string, string)`. Roslyn on
+        // .NET 10 lowers it through `ReadOnlySpan<char>`, so an ordinary line
+        // of string building fails on a runtime that has no span at all.
+        string built = "";
+        for (int i = 0; i < 3; i++) built += "xyz"[i];
+        CheckStr("string plus char", built, "xyz");
+        CheckStr("char plus string", 'a' + "bc", "abc");
+        CheckStr("char in a longer chain", "n=" + 'q' + "!" , "n=q!");
+
+        // Number formatting switches to scientific notation outside a band, and
+        // Rust's formatter never does. A solver printing a small residual
+        // disagreed on every line before this was matched.
+        CheckStr("double fixed band", (0.0001).ToString(), "0.0001");
+        CheckStr("double small goes scientific", (0.00001).ToString(), "1E-05");
+        CheckStr("double tiny keeps digits", (2.9199043183325557E-10).ToString(),
+            "2.9199043183325557E-10");
+        CheckStr("double large stays fixed", (1e16).ToString(), "10000000000000000");
+        CheckStr("double very large goes scientific", (1e17).ToString(), "1E+17");
+        CheckStr("double negative exponent signs", (-3.5e-8).ToString(), "-3.5E-08");
+        CheckStr("char upper invariant", char.ToUpperInvariant('q').ToString(), "Q");
+        CheckStr("split on a char", string.Join("|", "a b c".Split(' ')), "a|b|c");
         CheckStr("upper", "hello".ToUpper(), "HELLO");
         CheckStr("sub", "abcdef".Substring(2, 3), "cde");
         CheckEq("len", "hello".Length, 5);
@@ -456,6 +579,12 @@ static class Program
         // exceptions
         CheckEq("try/catch/finally", TryCatchFinally(), 111);
         CheckEq("nested catch", NestedCatch(), 21);
+        CheckEq("filter selects a handler", FilterSelects(7), 7);
+        CheckEq("filter declines to the next clause", FilterSelects(3), 0);
+        CheckEq("filter reads the unwinding frame's locals", FilterSeesLocals(4), 8);
+        CheckStr("filters run in order, first accept wins", FilterOrder(),
+            "inner-false|outer-true|outer-ran");
+        CheckEq("a throwing filter declines", FilterThatThrows(), 1);
         CheckEq("divzero", DivideSafely(10, 0), -1);
         CheckEq("divok", DivideSafely(10, 2), 5);
 
@@ -632,6 +761,58 @@ static class Program
         CheckEq("jit inlined call in a loop", BlendLoop(64), 14752);
 
         // reflection
+        // Properties. C# compiles `r.Celsius` to `get_Celsius`, so none of this
+        // is needed to run one — it is needed to reflect over one, which means
+        // knowing the accessors are halves of a single member.
+        var reading = new Reading { Celsius = 20 };
+        var celsius = typeof(Reading).GetProperty("Celsius");
+        CheckStr("property name", celsius.Name, "Celsius");
+        CheckStr("property type", celsius.PropertyType.Name, "Double");
+        Check("property can read", celsius.CanRead);
+        Check("property can write", celsius.CanWrite);
+        Check("computed property is read-only",
+            !typeof(Reading).GetProperty("Fahrenheit").CanWrite);
+        CheckStr("property declaring type", celsius.DeclaringType.Name, "Reading");
+
+        celsius.SetValue(reading, 100.0);
+        CheckEq("property set then read back", (int)reading.Celsius, 100);
+        CheckEq("property GetValue", (int)(double)celsius.GetValue(reading), 100);
+        CheckEq("computed property GetValue",
+            (int)(double)typeof(Reading).GetProperty("Fahrenheit").GetValue(reading), 212);
+
+        var origin = typeof(Reading).GetProperty("Origin");
+        CheckStr("static property GetValue", (string)origin.GetValue(null), "lab");
+
+        int propertyCount = 0;
+        foreach (var prop in typeof(Reading).GetProperties()) propertyCount++;
+        CheckEq("GetProperties counts them", propertyCount, 3);
+
+        CheckStr("missing property is null",
+            typeof(Reading).GetProperty("Nope") == null ? "null" : "found", "null");
+
+        // Parameters.
+        var scale = typeof(Reading).GetMethod("Scale");
+        var parameters = scale.GetParameters();
+        CheckEq("parameter count", parameters.Length, 2);
+        CheckEq("parameter position", parameters[1].Position, 1);
+        CheckStr("parameter type", parameters[0].ParameterType.Name, "Int32");
+        CheckStr("parameter name", parameters[0].Name, "by");
+        CheckStr("second parameter name", parameters[1].Name, "offset");
+
+        // Assembly and module.
+        var asm = typeof(Reading).Assembly;
+        CheckStr("type reports its assembly", asm.GetName().Name, "Conformance");
+        CheckStr("executing assembly",
+            System.Reflection.Assembly.GetExecutingAssembly().GetName().Name, "Conformance");
+        Check("assembly declares types", asm.GetTypes().Length > 5);
+        CheckStr("assembly finds a type by name",
+            asm.GetType("Conformance.Reading").Name, "Reading");
+        CheckStr("missing type is null",
+            asm.GetType("Conformance.Nope") == null ? "null" : "found", "null");
+        CheckStr("module name is the file name", typeof(Reading).Module.Name, "Conformance.dll");
+        CheckStr("entry assembly",
+            System.Reflection.Assembly.GetEntryAssembly().GetName().Name, "Conformance");
+
         CheckStr("typeof name", typeof(Tag).Name, "Tag");
         CheckStr("typeof full name", typeof(Tag).FullName, "Conformance.Tag");
         Check("typeof identity", typeof(Tag) == typeof(Tag));

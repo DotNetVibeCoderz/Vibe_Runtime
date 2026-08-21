@@ -1,0 +1,204 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="clr-namespace:CodeGen.ViewModels"
+        x:Class="CodeGen.Views.DevicesWindow"
+        x:DataType="vm:DevicesViewModel"
+        Title="Devices · RustCLR"
+        Width="1020" Height="680"
+        MinWidth="860" MinHeight="560"
+        WindowStartupLocation="CenterOwner"
+        Background="{StaticResource Graphite}"
+        Foreground="{StaticResource Bone}">
+
+  <!--
+    The panel is organised around one idea: a board's identity here *is* its
+    memory budget. Whether a C# program runs on it, and how much of RustBCL it
+    can hold, is decided by two measured numbers — 192,045 and 260,702 bytes.
+
+    So the signature element is a gauge, drawn to one scale across every row,
+    with those two thresholds engraved on it like gradations on a machinist's
+    rule. A reader can compare two boards by eye and see *why* one runs a
+    program and the other does not, rather than being told a tier name.
+
+    Colour is load-bearing, not decorative: patina clears both marks, amber
+    clears the first, ember clears neither. No new palette — these are the
+    theme's existing accents used semantically.
+  -->
+  <Window.Styles>
+    <Style Selector="TextBlock.field">
+      <Setter Property="FontFamily" Value="{StaticResource MachineFace}" />
+      <Setter Property="FontSize" Value="11" />
+      <Setter Property="Foreground" Value="{StaticResource Muted}" />
+    </Style>
+    <Style Selector="TextBlock.value">
+      <Setter Property="FontFamily" Value="{StaticResource MachineFace}" />
+      <Setter Property="FontSize" Value="12" />
+      <Setter Property="Foreground" Value="{StaticResource Bone}" />
+    </Style>
+    <Style Selector="TextBlock.note">
+      <Setter Property="FontFamily" Value="{StaticResource HumanFace}" />
+      <Setter Property="FontSize" Value="12" />
+      <Setter Property="Foreground" Value="{StaticResource Muted}" />
+      <Setter Property="TextWrapping" Value="Wrap" />
+    </Style>
+  </Window.Styles>
+
+  <Grid RowDefinitions="Auto,*,Auto">
+
+    <!-- Header: the scan control and what the last scan found. -->
+    <Border Grid.Row="0" Classes="panel-header" Padding="16,12">
+      <Grid ColumnDefinitions="*,Auto">
+        <StackPanel Grid.Column="0" Spacing="3">
+          <TextBlock Text="DEVICES" Classes="panel-label" />
+          <TextBlock Text="{Binding Summary}" Classes="note" />
+          <TextBlock Text="{Binding PortsLine}" Classes="field" />
+        </StackPanel>
+        <Button Grid.Column="1" Classes="accent"
+                Content="Scan"
+                Command="{Binding ScanCommand}"
+                IsEnabled="{Binding !IsBusy}"
+                VerticalAlignment="Center" />
+      </Grid>
+    </Border>
+
+    <Grid Grid.Row="1" ColumnDefinitions="440,*">
+
+      <!-- The gauge column. One scale, every board. -->
+      <Border Grid.Column="0" BorderBrush="{StaticResource Rule}" BorderThickness="0,0,1,0">
+        <ScrollViewer>
+          <StackPanel Margin="16,12,16,16" Spacing="2">
+
+            <!-- Legend: what the two gradations mean. -->
+            <Grid Margin="0,0,0,10" ColumnDefinitions="Auto,*">
+              <TextBlock Grid.Column="0" Classes="field" Text="RUNTIME NEEDS" VerticalAlignment="Center" />
+              <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="12" Margin="10,0,0,0">
+                <StackPanel Orientation="Horizontal" Spacing="5">
+                  <Border Width="8" Height="8" Background="{StaticResource Amber}" VerticalAlignment="Center" />
+                  <TextBlock Classes="field" Text="{Binding MinimalLabel}" />
+                </StackPanel>
+                <StackPanel Orientation="Horizontal" Spacing="5">
+                  <Border Width="8" Height="8" Background="{StaticResource Patina}" VerticalAlignment="Center" />
+                  <TextBlock Classes="field" Text="{Binding FullLabel}" />
+                </StackPanel>
+              </StackPanel>
+            </Grid>
+
+            <ListBox ItemsSource="{Binding Boards}"
+                     SelectedItem="{Binding Selected}"
+                     Background="Transparent"
+                     BorderThickness="0">
+              <ListBox.ItemTemplate>
+                <DataTemplate x:DataType="vm:DeviceViewModel">
+                  <StackPanel Spacing="5" Margin="0,7,0,7">
+
+                    <Grid ColumnDefinitions="*,Auto">
+                      <TextBlock Grid.Column="0" Text="{Binding Name}"
+                                 FontFamily="{StaticResource MachineFace}"
+                                 FontSize="13" Foreground="{StaticResource Bone}" />
+                      <TextBlock Grid.Column="1" Text="{Binding StateLabel}"
+                                 FontFamily="{StaticResource MachineFace}" FontSize="11"
+                                 Foreground="{Binding StateBrush}" />
+                    </Grid>
+
+                    <!--
+                      The gauge. A fixed-width track so rows compare, the
+                      board's heap filled against it, and two hairlines where
+                      the thresholds fall. The bar's colour is the answer.
+                    -->
+                    <Panel Height="16" HorizontalAlignment="Left" Width="260">
+                      <Border Background="{StaticResource Graphite}" Height="8"
+                              VerticalAlignment="Center" />
+                      <Border Background="{Binding TierBrush}"
+                              Height="8" Width="{Binding FillWidth}"
+                              HorizontalAlignment="Left" VerticalAlignment="Center" />
+                      <!-- The gradations stand taller than the bar and are cut
+                           in the panel's own background, so they stay legible
+                           whether the fill has reached them or passed them. -->
+                      <Border Background="{StaticResource Graphite}" Width="1" Height="16"
+                              HorizontalAlignment="Left" VerticalAlignment="Center"
+                              Margin="{Binding MinimalMarkerMargin}" />
+                      <Border Background="{StaticResource Graphite}" Width="1" Height="16"
+                              HorizontalAlignment="Left" VerticalAlignment="Center"
+                              Margin="{Binding FullMarkerMargin}" />
+                      <Border Background="{StaticResource Amber}" Width="1" Height="4"
+                              HorizontalAlignment="Left" VerticalAlignment="Bottom"
+                              Margin="{Binding MinimalMarkerMargin}" />
+                      <Border Background="{StaticResource Patina}" Width="1" Height="4"
+                              HorizontalAlignment="Left" VerticalAlignment="Bottom"
+                              Margin="{Binding FullMarkerMargin}" />
+                    </Panel>
+
+                    <TextBlock Text="{Binding BudgetLine}" Classes="field" TextWrapping="Wrap" />
+                  </StackPanel>
+                </DataTemplate>
+              </ListBox.ItemTemplate>
+            </ListBox>
+          </StackPanel>
+        </ScrollViewer>
+      </Border>
+
+      <!-- Detail and actions for the selected board. -->
+      <ScrollViewer Grid.Column="1">
+        <StackPanel Margin="20,16,20,20" Spacing="16"
+                    DataContext="{Binding Selected}"
+                    x:DataType="vm:DeviceViewModel">
+
+          <StackPanel Spacing="4">
+            <TextBlock Text="{Binding Name}"
+                       FontFamily="{StaticResource MachineFace}"
+                       FontSize="18" Foreground="{StaticResource Bone}" />
+            <TextBlock Text="{Binding Detail}" Classes="note" />
+          </StackPanel>
+
+          <Border Classes="panel" Padding="14">
+            <Grid ColumnDefinitions="120,*" RowDefinitions="Auto,Auto,Auto,Auto,Auto,Auto">
+              <TextBlock Grid.Row="0" Grid.Column="0" Classes="field" Text="CHIP" />
+              <TextBlock Grid.Row="0" Grid.Column="1" Classes="value" Text="{Binding Chip}" />
+
+              <TextBlock Grid.Row="1" Grid.Column="0" Classes="field" Text="CORE" />
+              <TextBlock Grid.Row="1" Grid.Column="1" Classes="value" Text="{Binding Core}" />
+
+              <TextBlock Grid.Row="2" Grid.Column="0" Classes="field" Text="TARGET" />
+              <TextBlock Grid.Row="2" Grid.Column="1" Classes="value" Text="{Binding Target}" />
+
+              <TextBlock Grid.Row="3" Grid.Column="0" Classes="field" Text="MEMORY" />
+              <TextBlock Grid.Row="3" Grid.Column="1" Classes="value" Text="{Binding RamLabel}" />
+
+              <TextBlock Grid.Row="4" Grid.Column="0" Classes="field" Text="CONSOLE" />
+              <TextBlock Grid.Row="4" Grid.Column="1" Classes="value"
+                         Text="{Binding Console}" TextWrapping="Wrap" />
+
+              <TextBlock Grid.Row="5" Grid.Column="0" Classes="field" Text="FIRMWARE" />
+              <TextBlock Grid.Row="5" Grid.Column="1" Classes="value" Text="{Binding FirmwareLine}" />
+            </Grid>
+          </Border>
+
+          <!-- What the chip said about itself, once asked. -->
+          <Border Classes="panel" Padding="14" IsVisible="{Binding Identity, Converter={x:Static ObjectConverters.IsNotNull}}">
+            <StackPanel Spacing="6">
+              <TextBlock Classes="field" Text="REPORTED BY THE BOARD" />
+              <TextBlock Text="{Binding Identity}" Classes="value" TextWrapping="Wrap" />
+            </StackPanel>
+          </Border>
+        </StackPanel>
+      </ScrollViewer>
+    </Grid>
+
+    <!-- Actions. Reading is separated from writing, deliberately. -->
+    <Border Grid.Row="2" Background="{StaticResource Slate}"
+            BorderBrush="{StaticResource Rule}" BorderThickness="0,1,0,0"
+            Padding="16,12">
+      <Grid ColumnDefinitions="*,Auto">
+        <TextBlock Grid.Column="0" Classes="note" VerticalAlignment="Center"
+                   Text="Identify and Flash both reset the board. Deploy compiles the open project into the firmware image — these boards have no filesystem to copy a program onto." />
+        <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8">
+          <Button Content="Identify" Command="{Binding IdentifyCommand}" IsEnabled="{Binding !IsBusy}" />
+          <Button Content="Monitor" Command="{Binding MonitorCommand}" IsEnabled="{Binding !IsBusy}" />
+          <Button Content="Flash firmware" Command="{Binding FlashFirmwareCommand}" IsEnabled="{Binding !IsBusy}" />
+          <Button Classes="accent" Content="Deploy project"
+                  Command="{Binding DeployApplicationCommand}" IsEnabled="{Binding !IsBusy}" />
+        </StackPanel>
+      </Grid>
+    </Border>
+  </Grid>
+</Window>

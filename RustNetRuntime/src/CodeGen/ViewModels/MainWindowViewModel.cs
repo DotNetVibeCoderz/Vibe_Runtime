@@ -19,6 +19,7 @@ public interface IWorkspaceDialogs
     Task<IReadOnlyList<string>> PickImagesAsync();
     Task<NewProjectRequest?> NewProjectAsync();
     Task ShowSettingsAsync(AppSettings settings);
+    Task ShowDevicesAsync(DevicesViewModel devices);
     Task<int?> AskLineNumberAsync(int maxLine);
     Task ShowMessageAsync(string title, string message);
 }
@@ -599,6 +600,47 @@ public sealed partial class MainWindowViewModel : ObservableObject
         SelectedModel = Settings.Active.Model;
         ShowLineNumbers = Settings.ShowLineNumbers;
         Status = "Settings saved";
+    }
+
+    /// <summary>
+    /// Opens the Devices panel.
+    ///
+    /// It shares this view model's log sink, so a flash reports into the same
+    /// place a build does — one running account of what the IDE did.
+    /// </summary>
+    [RelayCommand]
+    private async Task OpenDevicesAsync()
+    {
+        if (Dialogs is null) return;
+
+        var devices = new DeviceService(_runner) { RepositoryRoot = FindRepositoryRoot() };
+        var model = new DevicesViewModel(devices, _builds, _projects, Settings, Log);
+        LogPanelVisible = true;
+        await Dialogs.ShowDevicesAsync(model);
+    }
+
+    /// <summary>
+    /// Walks up from the open project, then from the executable, looking for
+    /// the runtime repository.
+    ///
+    /// `embedded/` and `crates/` together are the signature — either alone
+    /// appears in plenty of unrelated trees.
+    /// </summary>
+    private string? FindRepositoryRoot()
+    {
+        foreach (var start in (string?[])[_projects.CurrentProjectPath, AppContext.BaseDirectory])
+        {
+            if (start is null) continue;
+            for (var directory = new DirectoryInfo(start); directory is not null; directory = directory.Parent)
+            {
+                if (Directory.Exists(Path.Combine(directory.FullName, "embedded"))
+                    && Directory.Exists(Path.Combine(directory.FullName, "crates")))
+                {
+                    return directory.FullName;
+                }
+            }
+        }
+        return null;
     }
 
     [RelayCommand] private void ToggleChat() => ChatPanelVisible = !ChatPanelVisible;

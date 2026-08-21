@@ -24,10 +24,10 @@ handling — produces identical output on both runtimes:
 
 ```console
 $ dotnet Conformance.dll
-checks=136 failures=0
+checks=176 failures=0
 
 $ rustnet run Conformance.dll --stats
-checks=136 failures=0
+checks=176 failures=0
 
 ─── execution ──────────────────────────────
   wall clock                  10.505 ms
@@ -76,9 +76,32 @@ work identically whichever you pick.
 
 ![The New Project dialog, showing templates with a live preview of what will be created](docs/images/codegen-new-project.png)
 
-Fourteen templates spanning console, web, desktop, mobile, IoT and library
+Twenty templates spanning console, web, desktop, mobile, IoT and library
 projects, across business, science, education and games. Templates marked *runs
-on RustCLR* stay inside the IL subset the runtime executes today.
+on RustCLR* stay inside the IL subset the runtime executes today, and the eight
+IoT ones additionally stay inside the bindings a small board can hold.
+
+That claim is checked rather than asserted. `CodeGen --verify-templates`
+scaffolds every template, builds it, runs it on both runtimes and compares the
+output byte for byte — running the board-targeted ones against `--bcl minimal`,
+the same 314 bindings a 192 KB board carries. It found three templates using a
+span-based `string + char` concat that RustCLR does not implement, and two
+genuine runtime gaps behind them.
+
+![Devices, showing each board's heap against the two memory thresholds](docs/images/codegen-devices.png)
+
+**Devices** (`Ctrl+D`) finds attached boards, reports what they are, and puts
+firmware or your program on one. Each board is drawn against the two numbers
+that decide what it can run — 192,045 bytes for console, strings and maths, and
+260,702 for every binding — so a board's tier reads as arithmetic rather than as
+a label. The Nucleo-F401RE's bar stopping short of the first mark is the whole
+explanation for why it cannot run a C# program.
+
+Deploy compiles the open project *into* the firmware image: these boards have no
+filesystem to copy an assembly onto, so `RUSTCLR_APP` tells the firmware's build
+script which assembly to embed. For a board on the reduced binding set, the
+program is run against those limits on the desktop first — a failure there means
+it would fail on the board, and nothing is flashed.
 
 ![Settings, with every value stored in app.config](docs/images/codegen-settings.png)
 
@@ -333,8 +356,7 @@ The full matrix, with why each row lands where it does:
 bodies both execute inline, so results are right but there is no parallelism.
 Generic type *arguments* are erased, so user generic code that reads `T` at run
 time — `typeof(T)`, `is T`, a static field per instantiation — does not behave
-correctly, and custom comparers are ignored. Exception filters (`catch when`)
-are not evaluated. The native code generator takes only
+correctly, and custom comparers are ignored. The native code generator takes only
 integer methods — 11.0× faster where it applies, and inlining lets it accept
 calls to small helpers, but it declines anything using arrays, which is most of
 a real program.
@@ -354,14 +376,14 @@ The **whole runtime builds without `std`** — `rustclr-metadata`, `rustclr-gc`,
 combinations.
 
 **C# runs on a microcontroller.** On an ESP32-C3 — RISC-V, 400 KB of SRAM, no
-operating system — the loader builds a type registry, RustBCL registers all 766
+operating system — the loader builds a type registry, RustBCL registers all 821
 of its native bindings, and the interpreter executes `HelloWorld.Main`:
 
 ```
 -- il interpreter --
 heap budget      294912 bytes
 bcl tier         full (260702 bytes needed)
-native bindings  766
+native bindings  821
 
 --- program output ---
 Hello from RustCLR
@@ -397,9 +419,16 @@ allocator.
 | [ESP32-WROOM-32](embedded/esp32-demo) | Xtensa LX6 | 520 K | full | builds; last flashed pre-interpreter |
 | [Meadow F7](embedded/meadow-f7) | Cortex-M7 | 384 K | full | builds; last flashed pre-interpreter |
 | [Maix Go K210](embedded/k210) | RISC-V 64 | 6 M | full | builds; never flashed — no board |
+| [Netduino 3 WiFi](embedded/stm32f4) | Cortex-M4F | 256 K | minimal | builds; never flashed — no board |
 | [Pico](embedded/rp2040) | Cortex-M0+ | 256 K | minimal | builds; never flashed — no board |
+| [Nucleo-F401RE](embedded/stm32f4) | Cortex-M4F | 96 K | **none** | builds; never flashed — no board |
 
-All five share one demonstration ([embedded/demo-common](embedded/demo-common))
+The last row is the honest end of the range: 96 KB is below the floor by more
+than half, so that board reads assemblies and collects garbage but does not run
+them — and its image is 21 KB rather than 282 KB, because LTO strips an
+interpreter the constant says can never be reached.
+
+All seven share one demonstration ([embedded/demo-common](embedded/demo-common))
 and `bash tests/firmware.sh` builds them. Only the first row has run on
 hardware since the interpreter landed; earlier metadata-and-GC captures:
 [Xtensa](docs/logs/esp32-wroom32.log) · [RISC-V](docs/logs/esp32c3.log) ·

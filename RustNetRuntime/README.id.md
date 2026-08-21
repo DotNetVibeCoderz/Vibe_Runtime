@@ -24,10 +24,10 @@ menghasilkan keluaran yang identik di kedua runtime:
 
 ```console
 $ dotnet Conformance.dll
-checks=136 failures=0
+checks=176 failures=0
 
 $ rustnet run Conformance.dll --stats
-checks=136 failures=0
+checks=176 failures=0
 
 ─── execution ──────────────────────────────
   wall clock                  10.505 ms
@@ -76,9 +76,36 @@ persis apa pun pilihan Anda.
 
 ![Dialog New Project, menampilkan template dengan pratinjau langsung](docs/images/codegen-new-project.png)
 
-Empat belas template yang mencakup proyek console, web, desktop, mobile, IoT,
+Dua puluh template yang mencakup proyek console, web, desktop, mobile, IoT,
 dan library, lintas bidang bisnis, sains, edukasi, dan game. Template bertanda
-*runs on RustCLR* berada dalam subset IL yang sudah dieksekusi runtime saat ini.
+*runs on RustCLR* berada dalam subset IL yang sudah dieksekusi runtime saat ini,
+dan delapan template IoT-nya juga berada dalam himpunan binding yang muat di
+papan kecil.
+
+Klaim itu diperiksa, bukan sekadar dinyatakan. `CodeGen --verify-templates`
+membuat setiap template, membangunnya, menjalankannya di kedua runtime, dan
+membandingkan keluarannya byte demi byte — template yang menyasar papan
+dijalankan dengan `--bcl minimal`, yaitu 300 binding yang sama seperti pada
+papan 192 KB. Pemeriksaan itu menemukan tiga template yang memakai
+`string + char` berbasis span yang belum diimplementasikan RustCLR, dan dua
+celah runtime yang sebenarnya di baliknya.
+
+![Devices, menampilkan heap tiap papan terhadap dua ambang memori](docs/images/codegen-devices.png)
+
+**Devices** (`Ctrl+D`) menemukan papan yang tersambung, melaporkan identitasnya,
+dan memasang firmware atau program Anda ke sana. Tiap papan digambar terhadap
+dua angka yang menentukan apa yang bisa dijalankannya — 192.045 byte untuk
+console, string, dan matematika, serta 260.702 byte untuk seluruh binding —
+sehingga tier sebuah papan terbaca sebagai aritmetika, bukan sekadar label.
+Batang Nucleo-F401RE yang berhenti sebelum tanda pertama adalah seluruh
+penjelasan mengapa papan itu tidak bisa menjalankan program C#.
+
+Deploy mengompilasi proyek yang terbuka **ke dalam** image firmware: papan-papan
+ini tidak punya filesystem untuk menyalin assembly, jadi `RUSTCLR_APP` memberi
+tahu build script firmware assembly mana yang harus disematkan. Untuk papan
+dengan himpunan binding tereduksi, programnya dijalankan lebih dulu terhadap
+batas itu di desktop — gagal di sana berarti gagal juga di papan, dan tidak ada
+yang di-flash.
 
 ![Settings, dengan setiap nilai tersimpan di app.config](docs/images/codegen-settings.png)
 
@@ -336,7 +363,6 @@ Matriks lengkapnya, beserta alasan tiap baris:
 paralelisme. *Argumen* tipe generic di-*erase*, sehingga kode generic buatan
 pengguna yang membaca `T` saat runtime — `typeof(T)`, `is T`, static field per
 instansiasi — tidak berperilaku benar, dan comparer kustom diabaikan.
-Exception filter (`catch when`) belum dievaluasi.
 Penghasil kode native hanya menangani metode bilangan bulat — 11,0× lebih cepat
 di tempat ia berlaku, dan kini juga menerima pemanggilan ke metode pembantu
 kecil lewat *inlining*, tetapi tetap menolak apa pun yang memakai array, yang
@@ -358,14 +384,14 @@ belas kombinasinya.
 
 **C# berjalan di mikrokontroler.** Di sebuah ESP32-C3 — RISC-V, SRAM 400 KB,
 tanpa sistem operasi — loader membangun type registry, RustBCL mendaftarkan
-seluruh 766 native binding-nya, dan interpreter mengeksekusi
+seluruh 821 native binding-nya, dan interpreter mengeksekusi
 `HelloWorld.Main`:
 
 ```
 -- il interpreter --
 heap budget      294912 bytes
 bcl tier         full (260702 bytes needed)
-native bindings  766
+native bindings  821
 
 --- program output ---
 Hello from RustCLR
@@ -402,9 +428,17 @@ menyatakannya dalam satu baris teks alih-alih mati di dalam allocator.
 | [ESP32-WROOM-32](embedded/esp32-demo) | Xtensa LX6 | 520 K | penuh | terbangun; flash terakhir sebelum interpreter |
 | [Meadow F7](embedded/meadow-f7) | Cortex-M7 | 384 K | penuh | terbangun; flash terakhir sebelum interpreter |
 | [Maix Go K210](embedded/k210) | RISC-V 64 | 6 M | penuh | terbangun; belum pernah di-flash — tidak ada papan |
+| [Netduino 3 WiFi](embedded/stm32f4) | Cortex-M4F | 256 K | minimal | terbangun; belum pernah di-flash — tidak ada papan |
 | [Pico](embedded/rp2040) | Cortex-M0+ | 256 K | minimal | terbangun; belum pernah di-flash — tidak ada papan |
+| [Nucleo-F401RE](embedded/stm32f4) | Cortex-M4F | 96 K | **tidak ada** | terbangun; belum pernah di-flash — tidak ada papan |
 
-Kelimanya berbagi satu demonstrasi
+Baris terakhir adalah ujung jujur dari rentang ini: 96 KB berada di bawah
+ambang batas lebih dari separuh, sehingga papan itu membaca assembly dan
+mengumpulkan sampah tetapi tidak menjalankannya — dan image-nya 21 KB, bukan
+282 KB, karena LTO membuang interpreter yang menurut konstantanya tidak akan
+pernah terjangkau.
+
+Ketujuhnya berbagi satu demonstrasi
 ([embedded/demo-common](embedded/demo-common)) dan `bash tests/firmware.sh`
 membangun semuanya. Hanya baris pertama yang sudah berjalan di perangkat keras
 sejak interpreter mendarat; rekaman metadata-dan-GC sebelumnya:

@@ -28,7 +28,7 @@ rustnet run <assembly> [--stats] [--trace] [--max-instructions N]
 
 ```console
 $ rustnet run Conformance.dll --stats --jit-threshold 1
-checks=136 failures=0
+checks=176 failures=0
 
 ─── execution ──────────────────────────────
   wall clock                  88.147 ms

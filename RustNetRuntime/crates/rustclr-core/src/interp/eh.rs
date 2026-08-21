@@ -92,10 +92,16 @@ impl Interpreter {
                             catch_target = Some(clause.handler_offset);
                         }
                     }
-                    HandlerKind::Filter(_) => {
-                        // Filters need to run managed code mid-unwind. Treating
-                        // them as non-matching is a documented narrowing of the
-                        // spec rather than silently wrong behaviour.
+                    HandlerKind::Filter(filter_offset) => {
+                        // A filter is managed code that runs *during* the
+                        // unwind, before any frame below is discarded — which
+                        // is the whole reason `catch when` can inspect state
+                        // that a catch block would arrive too late to see.
+                        if catch_target.is_none()
+                            && self.run_filter(filter_offset, exception_object)?
+                        {
+                            catch_target = Some(clause.handler_offset);
+                        }
                     }
                     HandlerKind::Finally | HandlerKind::Fault => {
                         // A finally already executing for this exception must
@@ -136,6 +142,76 @@ impl Interpreter {
         }
 
         Err(error)
+    }
+
+    /// Runs a filter block and reports whether it selected its handler.
+    ///
+    /// ECMA-335 III.19: the filter starts with the exception on the evaluation
+    /// stack and ends at `endfilter`, which leaves an `int32` —
+    /// `exception_execute_handler` (1) to take the exception, anything else to
+    /// keep searching.
+    ///
+    /// The filter runs in a frame of its own rather than by rewinding the
+    /// current one. It shares the method and the arguments, and takes a copy of
+    /// the locals which `endfilter` writes back — so a filter both reads and
+    /// writes the frame it is unwinding, which is what the spec says and what
+    /// `catch (E e) when (Log(ref buffer))` depends on. A filter that throws
+    /// skips the write-back, because its locals are then in an unknown state.
+    ///
+    /// A filter that throws is contained here: the spec says such an exception
+    /// is swallowed and the filter treated as declining, and letting it escape
+    /// would replace the exception being dispatched with one from the code
+    /// asking about it.
+    fn run_filter(&mut self, filter_offset: u32, exception: Handle) -> ExecResult<bool> {
+        if self.frames.len() >= self.limits.max_frames {
+            // Out of stack while unwinding. Declining is the safe answer: it
+            // keeps the original exception travelling.
+            return Ok(false);
+        }
+
+        let base = self.frames.len();
+        let template = self.frame_ref();
+        let mut frame = Frame {
+            method: template.method,
+            assembly: template.assembly,
+            id: self.next_frame_id,
+            code: template.code.clone(),
+            args: template.args.clone(),
+            locals: template.locals.clone(),
+            stack: Vec::with_capacity(4),
+            pc: 0,
+            pending_finallies: Vec::new(),
+            finally_resume: None,
+            in_flight: None,
+            constrained: None,
+            pending_newobj: None,
+            pending_newobj_is_cell: false,
+            is_filter: true,
+        };
+        self.next_frame_id = self.next_frame_id.wrapping_add(1).max(1);
+        frame.stack.push(Value::Obj(exception));
+        self.frames.push(frame);
+
+        // Position at the filter, then run it to its `endfilter`. The floor
+        // makes that `endfilter` hand its value back here instead of pushing it
+        // onto the frame underneath.
+        if self.branch_to(filter_offset).is_err() {
+            self.frames.truncate(base);
+            return Ok(false);
+        }
+
+        let previous_floor = core::mem::replace(&mut self.frame_floor, base);
+        let outcome = self.run_until(base);
+        self.frame_floor = previous_floor;
+        self.frames.truncate(base);
+
+        match outcome {
+            Ok(Some(value)) => Ok(value.as_i32().unwrap_or(0) == 1),
+            Ok(None) => Ok(false),
+            // Per the spec, an exception escaping a filter means the filter
+            // declines; the exception already in flight keeps going.
+            Err(_) => Ok(false),
+        }
     }
 
     /// Whether a `catch` clause's type token matches the thrown exception.

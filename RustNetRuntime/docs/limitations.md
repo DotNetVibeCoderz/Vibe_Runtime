@@ -110,17 +110,24 @@ runs the body on the calling thread and `Join` returns at once. See
 
 ---
 
-## Exception filters are not evaluated
+## Exception filters are evaluated
 
-**What happens:** `catch (Exception e) when (e.Message.Contains("x"))` is treated
-as non-matching. The exception passes it by rather than being caught.
+`catch (Exception e) when (e.Message.Contains("x"))` runs its filter during the
+unwind and takes the exception when the filter returns 1, exactly as ECMA-335
+III.19 describes. Filters run outermost-last in table order, the first to accept
+wins, and a filter that throws declines — the exception already in flight keeps
+travelling rather than being replaced by one from the code asking about it.
 
-**Why it is like this:** a filter runs managed code during the first unwind pass,
-before the stack is unwound. That needs a re-entrant execution mode mid-dispatch.
-Treating filters as non-matching lets the exception escape to an outer handler —
-noisy, but correct — rather than swallowing it, which would be silently wrong.
+A filter runs in a frame of its own that shares the unwinding frame's method and
+arguments and takes a copy of its locals, written back at `endfilter`. That
+write-back is what makes `catch (E e) when (Log(ref buffer))` work: the `ref`
+points into the filter's copy, and without it the append would vanish and the
+filter would look as though it never ran.
 
-`try`/`catch`/`finally` without a filter works, including nesting, rethrow, and
+**One narrowing remains.** A filter that throws skips the write-back, because its
+locals are then in a state nothing has reasoned about.
+
+`try`/`catch`/`finally` works alongside this, including nesting, rethrow, and
 `finally` blocks running during unwind.
 
 ---
@@ -180,6 +187,35 @@ This is [Milestone 4](../Plan.md).
 
 ---
 
+## `Span<T>` is not implemented, but string building through it is
+
+`Span<T>` and `Memory<T>` are generic ref structs. Slicing, indexing and
+`stackalloc` all refuse, and the `span` row of the
+[feature matrix](advanced-features.md) still fails.
+
+**One path is implemented, because ordinary C# goes through it.** On .NET 10,
+`string + char` does not reach `String.Concat(string, string)` — Roslyn lowers
+it to:
+
+```text
+call     ReadOnlySpan<char> String::op_Implicit(string)
+newobj   ReadOnlySpan<char>::.ctor(ref char)
+call     string String::Concat(ReadOnlySpan<char>, ReadOnlySpan<char>)
+```
+
+So a line like `text += "0123456789ABCDEF"[nibble]`, which never mentions
+`Span`, failed with *no implementation for System.String::op_Implicit*. Three of
+CodeGen's own templates hit it.
+
+Those three members are implemented, and **a span over characters is represented
+by the string it stands for**. That is sound for this path and only this path:
+the span is read-only, it is over `char`, and the only thing that consumes it is
+`Concat`. Nothing indexes, slices or writes through one — and the members that
+would are deliberately left unregistered, so a program that does more with a
+span still refuses rather than half-working.
+
+---
+
 ## Reflection works, except for attributes
 
 **What works.** `System.Type` is a real object, interned one per runtime type,
@@ -189,7 +225,10 @@ so `typeof(T) == typeof(T)` is reference equality as .NET guarantees.
 Type t = value.GetType();
 Console.WriteLine(t.Name + " : " + t.BaseType.Name);
 foreach (FieldInfo f in t.GetFields()) Console.WriteLine(f.Name);
+foreach (PropertyInfo p in t.GetProperties()) Console.WriteLine(p.Name + " " + p.CanWrite);
+t.GetProperty("Celsius").SetValue(value, 100.0);
 MethodInfo m = t.GetMethod("Compute");
+Console.WriteLine(m.GetParameters().Length);
 object result = m.Invoke(value, new object[] { 21 });
 object made = Activator.CreateInstance(typeof(Widget));
 ```
@@ -197,8 +236,35 @@ object made = Activator.CreateInstance(typeof(Widget));
 All of that runs: names and namespaces, base types, the `IsValueType` /
 `IsClass` / `IsInterface` / `IsEnum` / `IsArray` / `IsPrimitive` / `IsAbstract` /
 `IsSealed` family, `IsAssignableFrom`, `IsInstanceOfType`, member enumeration,
-`MethodInfo.Invoke`, `FieldInfo` get and set, and `Activator.CreateInstance`. A
-boxed value reports the type it holds rather than `System.Object`.
+`MethodInfo.Invoke`, `FieldInfo` get and set, `PropertyInfo` get and set, and
+`Activator.CreateInstance`. A boxed value reports the type it holds rather than
+`System.Object`.
+
+**Properties come from metadata, not from method names.** C# compiles `p.X` to a
+call to `get_X`, so nothing is needed to *run* a property — what reflection needs
+is to know the accessors are halves of one member, and the loader reads
+`PropertyMap` and `MethodSemantics` to find out. A method called `get_Total` is
+not necessarily an accessor, and a property whose accessors were renamed still
+pairs correctly.
+
+**Parameter names come from the `Param` table**, which is separate from the
+signature: a signature carries types, and only that table carries what the
+author called them. A method with no rows there — a native binding, or an
+assembly compiled without them — reports `arg0`, `arg1` and so on rather than
+inventing a name.
+
+**`Assembly` and `Module` enumerate.** `GetExecutingAssembly`,
+`GetEntryAssembly`, `GetTypes`, `GetType(name)`, `GetName`, `Type.Assembly` and
+`Type.Module` all work. `Module.Name` reports the file name with its extension,
+read from the `Module` table rather than assembled from the assembly name and a
+guessed suffix — .NET answers `Conformance.dll` where the assembly is
+`Conformance`, and a byte-for-byte comparison notices the difference.
+
+**`Assembly.Load` is not here.** Loading an assembly by name needs a search path
+and a resolver, and on a microcontroller there is no filesystem to search.
+
+**Constructing a generic type at run time** is still absent, and that is
+blocked by generic erasure rather than by reflection.
 
 **Custom attributes are decoded**, including constructor arguments, named
 fields and named properties:
@@ -257,13 +323,13 @@ so it is refused rather than mis-encoded.
 
 **C# executes on a microcontroller.** On an ESP32-C3 (RISC-V, 400 KB SRAM,
 no operating system) the loader builds a type registry, RustBCL registers all
-766 of its native bindings, and the interpreter runs `HelloWorld.Main`:
+821 of its native bindings, and the interpreter runs `HelloWorld.Main`:
 
 ```
 -- il interpreter --
 heap budget      294912 bytes
 bcl tier         full (260702 bytes needed)
-native bindings  766
+native bindings  821
 types registered 204
 
 --- program output ---
@@ -312,19 +378,43 @@ console, strings and maths only. `Tier::for_budget` compares those against the
 board's heap and picks; a board that clears neither says so in a line of text
 instead of dying inside the allocator.
 
-| Board | Core | RAM | Heap given | Tier | State |
+| Board | Core | RAM | Heap | Tier | State |
 | --- | --- | ---: | ---: | --- | --- |
 | ESP32-C3 | RISC-V 32 | 400 K | 288 K | full | **executes IL on hardware** |
 | ESP32-WROOM-32 | Xtensa LX6 | 520 K | 176 K + 96 K | full | builds; last flashed pre-interpreter |
 | Meadow F7 Micro | Arm Cortex-M7 | 384 K | 288 K | full | builds; last flashed pre-interpreter |
-| Sipeed Maix Go K210 | RISC-V 64 | 6 M | 1 M | full | **builds; never flashed** — no board |
-| Raspberry Pi Pico | Arm Cortex-M0+ | 256 K | 192 K | minimal | **builds; never flashed** — no board |
+| Sipeed Maix Go K210 | RISC-V 64 | 6 M | 1 M | full | builds; never flashed — no board |
+| Netduino 3 WiFi | Arm Cortex-M4F | 192 K + 64 K CCM | 192 K | minimal | builds; never flashed — no board |
+| Raspberry Pi Pico | Arm Cortex-M0+ | 256 K | 192 K | minimal | builds; never flashed — no board |
+| Nucleo-F401RE | Arm Cortex-M4F | 96 K | 64 K | **none** | builds; never flashed — no board |
 
 Only the first row has been run on hardware since the interpreter landed. The
 rest are builds, and are worth reading as exactly that.
 
-**The WROOM-32 needs two heap regions to get there**, which is the most
-instructive thing in that table. Its main `dram_seg` tops out at 176 KB — found
+**One board cannot run a program at all, and that is reported rather than
+discovered.** The Nucleo-F401RE has 96 KB of RAM against a 192,045-byte floor.
+No arrangement of that memory loads the runtime, so the firmware prints the
+shortfall and carries on with the metadata reader and the collector. It also
+does not pay flash for what it cannot use: `Tier::for_budget` is a `const fn`
+over a constant, so LTO proves the `Full` and `Minimal` arms unreachable and
+strips the loader and all 821 bindings — 21 KB of `.text` against the F427VI's
+282 KB from the same source file.
+
+**Two boards reach their tier only by using memory their part does not offer
+by default**, which is the most instructive thing in that table.
+
+The **Netduino 3 WiFi** advertises 256 KB of RAM in two pieces that are not
+adjacent: 192 KB of DMA-reachable SRAM at `0x20000000`, and 64 KB of CCM at
+`0x10000000` that the core can reach but DMA cannot. Giving the allocator only
+the first leaves 192 KB *minus* `.data`, `.bss` and the stack — and the floor is
+192,045 bytes, so a few kilobytes of statics decides it. So the roles are
+swapped: `.data`, `.bss` and the stack go to CCM (this firmware does no DMA,
+which is the only thing CCM cannot do), and the whole 192 KB of SRAM becomes the
+heap in one unbroken piece. `cortex-m-rt`'s `link.x` hardcodes `> RAM`, so
+naming CCM `RAM` is what moves them. 196,608 bytes clears the floor by 4,563 —
+a real margin, but thin enough to re-measure if RustBCL grows.
+
+The **WROOM-32** has the same shape of problem. Its main `dram_seg` tops out at 176 KB — found
 by bisecting until the link succeeded — which is below even the reduced binding
 set. The ESP32 has a second bank of 98,768 bytes past the ROM's data and stacks
 that the linker will not place ordinary statics in; `esp-alloc` accepts regions

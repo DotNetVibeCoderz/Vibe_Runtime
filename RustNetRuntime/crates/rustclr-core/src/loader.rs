@@ -52,6 +52,12 @@ pub struct LoadedAssembly {
     pub id: AssemblyId,
     pub name: String,
     pub version: String,
+    /// The `Module` table's name — the file name, extension included.
+    ///
+    /// Distinct from `name`, which is the *assembly* name and has no
+    /// extension. `Module.Name` reports this one, and .NET answers
+    /// `Conformance.dll` where the assembly is `Conformance`.
+    pub module_name: String,
     /// Where it was loaded from. There is no filesystem without `std`, so
     /// on a microcontroller an assembly arrives as bytes and has no path.
     #[cfg(feature = "std")]
@@ -68,6 +74,8 @@ pub struct LoadedAssembly {
     pub type_ref_by_row: HashMap<u32, TypeId>,
     /// Resolved `MemberRef` rows.
     pub member_ref_by_row: HashMap<u32, MethodId>,
+    /// `Property` table row to registry id.
+    pub property_by_row: HashMap<u32, PropertyId>,
     /// `MemberRef` rows that name a field rather than a method.
     pub field_ref_by_row: HashMap<u32, FieldId>,
     /// Resolved `MethodSpec` rows — a generic instantiation mapped to the open
@@ -216,6 +224,9 @@ impl Loader {
             id: bcl,
             name: "RustBCL".into(),
             version: "0.1.0.0".into(),
+            // Synthetic: there is no file, and saying so is better than
+            // inventing `RustBCL.dll` for something that was never on disk.
+            module_name: "<RustBCL>".into(),
             #[cfg(feature = "std")]
             path: None,
             user_strings: Vec::new(),
@@ -224,6 +235,7 @@ impl Loader {
             field_by_row: HashMap::new(),
             type_ref_by_row: HashMap::new(),
             member_ref_by_row: HashMap::new(),
+            property_by_row: HashMap::new(),
             field_ref_by_row: HashMap::new(),
             method_spec_by_row: HashMap::new(),
             unresolved_members: HashMap::new(),
@@ -454,6 +466,30 @@ impl Loader {
             bcl,
         );
 
+        // `ReadOnlySpan<char>`, and only far enough for string building.
+        //
+        // Registering the type is what lets a `MemberRef` mentioning it
+        // *resolve*: `s + c` compiles to
+        // `String.Concat(ReadOnlySpan<char>, ReadOnlySpan<char>)`, and without
+        // a type of this name the whole member reference fails long before any
+        // native implementation is consulted.
+        //
+        // One field, holding the string the span stands for. That is a
+        // representation for the concatenation path in `rustclr-bcl`, not a
+        // span implementation: nothing indexes or slices one, and the members
+        // that would are deliberately not registered. See
+        // `register_span_concat` there, and `docs/limitations.md`.
+        for name in ["ReadOnlySpan`1", "Span`1"] {
+            self.add_native_type_with_fields(
+                "System",
+                name,
+                Some(value_type),
+                synth(),
+                &["_text"],
+                bcl,
+            );
+        }
+
         self.register_generic_collections(&mut synth, object, bcl);
     }
 
@@ -646,7 +682,23 @@ impl Loader {
         // `MemberInfo` comes first because `System.Type` derives from it — that
         // is what makes `typeof(T).Name` a virtual call on `MemberInfo`, and
         // the hierarchy has to say so or dispatch resolves to the wrong body.
-        for name in ["MemberInfo", "MethodInfo", "ConstructorInfo", "FieldInfo", "PropertyInfo"] {
+        // `Assembly` and `Module` hold an assembly id and nothing else. They
+        // are separate types because `Type.Assembly` and `Type.Module` are
+        // separate properties in C#, and a program that asks for one and gets
+        // the other would compile and then misbehave.
+        for name in ["Assembly", "Module", "AssemblyName"] {
+            self.add_native_type_with_fields_of_kind(
+                REFLECT,
+                name,
+                TypeKind::Class,
+                Some(object),
+                synth(),
+                &["_assembly"],
+                self.bcl,
+            );
+        }
+
+        for name in ["MemberInfo", "MethodInfo", "ConstructorInfo", "FieldInfo", "PropertyInfo", "ParameterInfo"] {
             self.add_native_type_with_fields_of_kind(
                 REFLECT,
                 name,
@@ -1000,6 +1052,7 @@ impl Loader {
             instance_fields: Vec::new(),
             static_fields: Vec::new(),
             methods: Vec::new(),
+            properties: Vec::new(),
             vtable: Vec::new(),
             element_type: None,
             underlying: None,
@@ -1044,6 +1097,13 @@ impl Loader {
             String::new()
         };
 
+        // The `Module` table always has exactly one row for a single-file
+        // assembly, and it carries the file name with its extension.
+        let module_name = md
+            .module(1)
+            .map(|m| m.name.to_string())
+            .unwrap_or_else(|_| format!("{name}.dll"));
+
         let references: Vec<String> = (1..=md.row_count(TableId::AssemblyRef))
             .filter_map(|r| md.assembly_ref(r).ok().map(|a| a.name.to_string()))
             .collect();
@@ -1051,6 +1111,7 @@ impl Loader {
         let mut assembly = LoadedAssembly {
             id,
             name: name.clone(),
+            module_name,
             version,
             #[cfg(feature = "std")]
             path: image.path().map(|p| p.to_path_buf()),
@@ -1060,6 +1121,7 @@ impl Loader {
             field_by_row: HashMap::new(),
             type_ref_by_row: HashMap::new(),
             member_ref_by_row: HashMap::new(),
+            property_by_row: HashMap::new(),
             field_ref_by_row: HashMap::new(),
             method_spec_by_row: HashMap::new(),
             unresolved_members: HashMap::new(),
@@ -1089,6 +1151,7 @@ impl Loader {
                 instance_fields: Vec::new(),
                 static_fields: Vec::new(),
                 methods: Vec::new(),
+                properties: Vec::new(),
                 vtable: Vec::new(),
                 element_type: None,
                 underlying: None,
@@ -1291,12 +1354,30 @@ impl Loader {
                     }))
                 };
 
+                // Parameter names live in the `Param` table, not the signature.
+                // `sequence` is 1-based with 0 reserved for the return value,
+                // and a method may omit rows for parameters it did not name.
+                let mut param_names = vec![String::new(); sig.params.len()];
+                if let Ok(range) = md.params_of(method_row) {
+                    for param_row in range {
+                        let Ok(param) = md.param(param_row) else { continue };
+                        if param.sequence == 0 {
+                            continue;
+                        }
+                        let index = param.sequence as usize - 1;
+                        if let Some(slot) = param_names.get_mut(index) {
+                            *slot = param.name.to_string();
+                        }
+                    }
+                }
+
                 let method_id = self.registry.add_method(MethodInfo {
                     id: MethodId::INVALID,
                     name: m.name.to_string(),
                     declaring_type: type_id,
                     token: Token::new(TableId::MethodDef, method_row),
                     assembly: id,
+                    param_names,
                     qualified_name: native_key_typed(&declaring_name, m.name, &sig),
                     signature: sig,
                     flags: m.flags,
@@ -1419,6 +1500,7 @@ impl Loader {
                         declaring_type: parent,
                         token: Token::new(TableId::MemberRef, row),
                         assembly: id,
+                        param_names: Vec::new(),
                         qualified_name: native_key_typed(&declaring_name, mr.name, &sig),
                         signature: sig,
                         flags,
@@ -1502,6 +1584,66 @@ impl Loader {
             if let (Some(body), Some(declaration)) = (body, declaration) {
                 assembly.method_impls.insert((class, declaration), body);
             }
+        }
+
+        // --- pass 10b: properties ---------------------------------------------
+        // C# compiles `p.X` to a call to `get_X`, so nothing here is needed to
+        // *run* a property. It is needed to reflect over one: `GetProperties()`
+        // has to know that `get_X` and `set_X` are two halves of one member.
+        //
+        // `PropertyMap` gives each type a run of `Property` rows, delimited the
+        // way every metadata list is — this row's start to the next row's start,
+        // or the end of the table for the last. `MethodSemantics` then attaches
+        // accessors to them.
+        let property_rows = md.row_count(TableId::Property);
+        let map_rows = md.row_count(TableId::PropertyMap);
+        let mut property_owner: HashMap<u32, TypeId> = HashMap::new();
+        for row in 1..=map_rows {
+            let map = md.property_map(row).map_err(ExecutionError::Metadata)?;
+            let Some(owner) = assembly.type_by_row.get(&map.parent.row()).copied() else {
+                continue;
+            };
+            let end = if row < map_rows {
+                md.property_map(row + 1).map_err(ExecutionError::Metadata)?.property_list
+            } else {
+                property_rows + 1
+            };
+            for property in map.property_list..end {
+                property_owner.insert(property, owner);
+            }
+        }
+
+        // Accessors, keyed by the property row they belong to.
+        let mut getters: HashMap<u32, MethodId> = HashMap::new();
+        let mut setters: HashMap<u32, MethodId> = HashMap::new();
+        for row in 1..=md.row_count(TableId::MethodSemantics) {
+            let sem = md.method_semantics(row).map_err(ExecutionError::Metadata)?;
+            // `association` is a `HasSemantics` coded index; events share the
+            // table and are not properties.
+            if sem.association.table() != Some(TableId::Property) {
+                continue;
+            }
+            let Some(method) = assembly.method_by_row.get(&sem.method.row()).copied() else {
+                continue;
+            };
+            if sem.semantics & rustclr_metadata::rows::method_semantics::GETTER != 0 {
+                getters.insert(sem.association.row(), method);
+            }
+            if sem.semantics & rustclr_metadata::rows::method_semantics::SETTER != 0 {
+                setters.insert(sem.association.row(), method);
+            }
+        }
+
+        for row in 1..=property_rows {
+            let Some(owner) = property_owner.get(&row).copied() else { continue };
+            let property = md.property(row).map_err(ExecutionError::Metadata)?;
+            let id = self.registry.add_property(
+                property.name.to_string(),
+                owner,
+                getters.get(&row).copied(),
+                setters.get(&row).copied(),
+            );
+            assembly.property_by_row.insert(row, id);
         }
 
         // --- pass 11: custom attributes ---------------------------------------
@@ -1725,6 +1867,8 @@ impl Loader {
             declaring_type: type_id,
             token,
             assembly: self.bcl,
+            // A synthesised internal call has no `Param` rows to read.
+            param_names: Vec::new(),
             qualified_name,
             signature,
             flags,

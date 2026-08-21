@@ -59,8 +59,10 @@ use embedded_alloc::LlffHeap;
 use stm32f4xx_hal::{pac, prelude::*};
 
 /// The assembly to read, compiled by Roslyn for `net10.0` and linked into
-/// flash. 4,608 bytes — small enough that the whole image sits in the binary.
-static HELLO_WORLD: &[u8] = include_bytes!("HelloWorld.dll");
+/// flash. `HelloWorld.dll` by default — 4,608 bytes, small enough that the
+/// whole image sits in the binary — or whatever `RUSTCLR_APP` named at
+/// build time. See `build.rs`.
+static HELLO_WORLD: &[u8] = include_bytes!(env!("RUSTCLR_APP_PATH"));
 
 #[cfg(feature = "nucleo-f401re")]
 const BOARD: &str = "Nucleo-F401RE (STM32F401RE, Cortex-M4F)";

@@ -12,8 +12,23 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 /// Builds an interpreter with the full runtime installed.
 fn runtime(args: Vec<String>) -> Interpreter {
+    runtime_with_bcl(args, false)
+}
+
+/// The runtime, with either the whole BCL or the subset a small board can hold.
+///
+/// `minimal` is not a smaller *runtime* — the loader and interpreter are
+/// identical. It registers 314 native bindings instead of 821, which is what a
+/// board with 192 KB of RAM can afford. Running a program this way on a desktop
+/// is how to find out it calls `List<T>` before flashing it to something that
+/// cannot answer.
+fn runtime_with_bcl(args: Vec<String>, minimal: bool) -> Interpreter {
     let mut interp = Interpreter::with_host(Box::new(SystemHost::with_args(args)));
-    rustclr_bcl::install(&mut interp);
+    if minimal {
+        rustclr_bcl::install_minimal(&mut interp);
+    } else {
+        rustclr_bcl::install(&mut interp);
+    }
     interp
 }
 
@@ -27,8 +42,15 @@ pub fn run(
     jit: bool,
     jit_threshold: Option<u32>,
     inline: bool,
+    minimal_bcl: bool,
 ) -> Result<i32> {
-    let mut interp = runtime(args);
+    let mut interp = runtime_with_bcl(args, minimal_bcl);
+    if minimal_bcl {
+        eprintln!(
+            "[rustnet] --bcl minimal: {} native bindings, the set a 192 KB board can hold",
+            interp.native_count()
+        );
+    }
     if let Some(budget) = max_instructions {
         interp.limits.max_instructions = Some(budget);
     }
@@ -527,7 +549,7 @@ pub fn build(project: &str, configuration: &str, then_run: bool) -> Result<i32> 
         .ok_or("build succeeded but no output assembly was found under bin/")?;
 
     println!("Running {} on RustCLR…\n", assembly.display());
-    run(&assembly.to_string_lossy(), Vec::new(), false, false, None, true, None, true)
+    run(&assembly.to_string_lossy(), Vec::new(), false, false, None, true, None, true, false)
 }
 
 /// Finds the first `.dll` under a build output directory.
@@ -581,8 +603,20 @@ pub fn capabilities() -> Result<i32> {
     println!("  reflection                   System.Type is a real object:");
     println!("                               name, namespace, base type, IsValueType and");
     println!("                               friends, IsAssignableFrom, GetMethods,");
-    println!("                               GetFields, MethodInfo.Invoke, FieldInfo");
-    println!("                               get/set, Activator.CreateInstance.");
+    println!("                               GetFields, GetProperties, GetProperty,");
+    println!("                               MethodInfo.Invoke, MethodBase.GetParameters,");
+    println!("                               FieldInfo get/set, PropertyInfo get/set,");
+    println!("                               Activator.CreateInstance.");
+    println!("                               Parameter names come from the Param table;");
+    println!("                               a method with no rows there reports argN");
+    println!("                               rather than inventing one.");
+    println!("                               Assembly and Module: GetExecutingAssembly,");
+    println!("                               GetEntryAssembly, GetTypes, GetType(name),");
+    println!("                               GetName, Type.Assembly and Type.Module.");
+    println!("                               Assembly.Load is NOT here: it needs a search");
+    println!("                               path, and a chip has no filesystem.");
+    println!("                               Constructing a generic type at run time is");
+    println!("                               blocked by erasure, not by reflection.");
     println!("                               typeof(T) on a generic parameter is REFUSED:");
     println!("                               the argument was erased, so there is no type");
     println!("                               to name and a guess would look plausible.");
@@ -636,7 +670,15 @@ Collections and LINQ");
     println!("\nMemory and resources");
     println!("  IDisposable, using           yes");
     println!("  IAsyncDisposable             no - await using is unimplemented");
-    println!("  Span<T>, Memory<T>           no - generic ref structs");
+    println!("  Span<T>, Memory<T>           no - generic ref structs. Slicing,");
+    println!("                               indexing and stackalloc all refuse.");
+    println!("                               ONE PATH IS IMPLEMENTED: `string + char`");
+    println!("                               lowers through ReadOnlySpan<char> on");
+    println!("                               .NET 10, so op_Implicit, the one-element");
+    println!("                               ctor and Concat over spans exist and a");
+    println!("                               span over chars is the string it stands");
+    println!("                               for. That is a representation for string");
+    println!("                               building, not a span type.");
     println!("  stackalloc, unsafe pointers  no - localloc is unimplemented, and managed");
     println!("                               references here are structural, not addresses");
 
@@ -645,7 +687,8 @@ Collections and LINQ");
     println!("  interceptors                 yes - same reason");
     println!("\nExceptions");
     println!("  try / catch / finally        yes");
-    println!("  exception filters            no");
+    println!("  exception filters            yes - `catch when` runs mid-unwind;");
+    println!("                               a throwing filter declines");
     println!("\nInterop");
     println!("  P/Invoke                     yes, up to {} arguments", rustclr_interop::MAX_PINVOKE_ARGS);
     println!("  string marshalling           UTF-8 only");
@@ -676,16 +719,25 @@ Collections and LINQ");
     println!("                               plainly when neither fits.");
     println!("  ahead-of-time compilation    no - needs Arm and RISC-V backends, which");
     println!("                               emit code but have never executed any");
-    println!("  board firmwares              five, one shared demonstration:");
+    println!("  board firmwares              seven, one shared demonstration:");
     println!("                               ESP32-WROOM-32 (Xtensa), ESP32-C3 (RV32),");
-    println!("                               Meadow F7 (Cortex-M7), Pico (Cortex-M0+),");
-    println!("                               Maix Go K210 (RV64). tests/firmware.sh");
+    println!("                               Meadow F7 (M7), Maix Go K210 (RV64),");
+    println!("                               Netduino 3 WiFi / STM32F427VI (M4F),");
+    println!("                               Pico (M0+), Nucleo-F401RE (M4F).");
+    println!("                               tests/firmware.sh builds all of them.");
+    println!("  below the floor              the Nucleo-F401RE has 96 KB and cannot load");
+    println!("                               the runtime at any tier. It reports that");
+    println!("                               and runs metadata + GC. Its image is 21 KB");
+    println!("                               of .text against 282 KB for the same source");
+    println!("                               on the F427VI: the tier is a const fn over a");
+    println!("                               constant, so LTO strips what cannot run.");
     println!("  run on real hardware         ESP32-C3 executes IL. The Xtensa and");
     println!("                               Cortex-M7 boards were last flashed before");
     println!("                               the interpreter landed, so their captures");
-    println!("                               show metadata and GC only. The Pico and");
-    println!("                               K210 images build but were never flashed -");
-    println!("                               no board was connected. Runs: docs/logs/.");
+    println!("                               show metadata and GC only. The K210, both");
+    println!("                               STM32F4 boards and the Pico build but were");
+    println!("                               never flashed - no board was connected.");
+    println!("                               Captured runs: docs/logs/.");
 
     println!("\nArchitectures recognised in PE headers");
     for m in [

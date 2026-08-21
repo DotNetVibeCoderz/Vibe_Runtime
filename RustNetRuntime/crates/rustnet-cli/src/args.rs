@@ -21,6 +21,8 @@ pub enum Command {
         jit_threshold: Option<u32>,
         /// Splice small static callees into their callers. On by default.
         inline: bool,
+        /// Install only the bindings a small board can hold.
+        minimal_bcl: bool,
     },
     /// Summarise an assembly's metadata.
     Info { assembly: String, verbose: bool },
@@ -70,6 +72,7 @@ pub fn parse(argv: &[String]) -> Result<Command, ParseError> {
             let mut jit = true;
             let mut jit_threshold = None;
             let mut inline = true;
+            let mut minimal_bcl = false;
             let mut rest = argv[1..].iter();
 
             while let Some(a) = rest.next() {
@@ -78,6 +81,20 @@ pub fn parse(argv: &[String]) -> Result<Command, ParseError> {
                     "--trace" => trace = true,
                     "--no-jit" => jit = false,
                     "--no-inline" => inline = false,
+                    "--bcl" => {
+                        let v = rest.next().ok_or_else(|| {
+                            ParseError("--bcl needs `full` or `minimal`".into())
+                        })?;
+                        match v.as_str() {
+                            "minimal" => minimal_bcl = true,
+                            "full" => minimal_bcl = false,
+                            other => {
+                                return Err(ParseError(format!(
+                                    "--bcl takes `full` or `minimal`, not `{other}`"
+                                )))
+                            }
+                        }
+                    }
                     "--jit-threshold" => {
                         let v = rest.next().ok_or_else(|| {
                             ParseError("--jit-threshold needs a value".into())
@@ -114,6 +131,7 @@ pub fn parse(argv: &[String]) -> Result<Command, ParseError> {
                 jit,
                 jit_threshold,
                 inline,
+                minimal_bcl,
             })
         }
 
@@ -187,11 +205,14 @@ USAGE
 
 COMMANDS
     run <assembly> [--stats] [--trace] [--max-instructions N]
-                   [--no-jit] [--no-inline] [--jit-threshold N] [-- args...]
+                   [--no-jit] [--no-inline] [--bcl full|minimal]
+                   [--jit-threshold N] [-- args...]
         Execute an assembly's entry point on RustCLR. Hot methods the code
         generator can take are compiled to machine code; --no-jit interprets
         everything and --no-inline compiles without splicing small callees.
-        All three must produce identical output.
+        All three must produce identical output. --bcl minimal installs only
+        the bindings a small board can hold, so a program can be checked
+        against those limits before it is flashed.
 
     info <assembly> [--verbose]
         Summarise types, methods and references.

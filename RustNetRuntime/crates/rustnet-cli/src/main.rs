@@ -39,6 +39,7 @@ fn main() -> ExitCode {
             jit,
             jit_threshold,
             inline,
+            minimal_bcl,
         } => commands::run(
             &assembly,
             args,
@@ -48,6 +49,7 @@ fn main() -> ExitCode {
             jit,
             jit_threshold,
             inline,
+            minimal_bcl,
         ),
         Command::Info { assembly, verbose } => commands::info(&assembly, verbose),
         Command::Disasm { assembly, filter } => commands::disasm(&assembly, filter.as_deref()),

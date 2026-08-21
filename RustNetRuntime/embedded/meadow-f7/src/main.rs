@@ -50,8 +50,10 @@ use embedded_alloc::LlffHeap;
 mod usb;
 
 /// The assembly to read, compiled by Roslyn for `net10.0` and linked into
-/// flash. 4,608 bytes — small enough that the whole image sits in the binary.
-static HELLO_WORLD: &[u8] = include_bytes!("HelloWorld.dll");
+/// flash. `HelloWorld.dll` by default — 4,608 bytes, small enough that the
+/// whole image sits in the binary — or whatever `RUSTCLR_APP` named at
+/// build time. See `build.rs`.
+static HELLO_WORLD: &[u8] = include_bytes!(env!("RUSTCLR_APP_PATH"));
 
 /// The board, for the banner.
 const BOARD: &str = "Meadow F7 Micro v1.0 (STM32F777, Cortex-M7)";

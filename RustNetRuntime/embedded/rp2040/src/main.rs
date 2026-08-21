@@ -47,7 +47,7 @@ pub static BOOT2: [u8; 256] = rp2040_boot2::BOOT_LOADER_W25Q080;
 
 /// The assembly to read, compiled by Roslyn for `net10.0` and linked into
 /// flash.
-static HELLO_WORLD: &[u8] = include_bytes!("HelloWorld.dll");
+static HELLO_WORLD: &[u8] = include_bytes!(env!("RUSTCLR_APP_PATH"));
 
 const BOARD: &str = "Raspberry Pi RP2040 (Cortex-M0+)";
 

@@ -44,7 +44,7 @@ use rustclr_metadata::{Image, TableId};
 /// | --- | ---: |
 /// | loader, 202 pre-registered framework types | 127 K |
 /// | managed heap slot table | 21 K |
-/// | RustBCL, 766 native bindings | 106 K |
+/// | RustBCL, 821 native bindings | 106 K |
 /// | loading and running `HelloWorld` | 6 K |
 /// | **peak** | **260,702** |
 pub const FULL_BCL_BYTES: usize = 260_702;
@@ -52,7 +52,7 @@ pub const FULL_BCL_BYTES: usize = 260_702;
 /// Peak allocation with only the bindings a console program needs.
 ///
 /// `System.Object`, `Console`, `String`, `Math` and interpolated strings — 300
-/// bindings instead of 766. No LINQ, no collections, no reflection, no tasks.
+/// bindings instead of 821. No LINQ, no collections, no reflection, no tasks.
 /// That is 68 KB less, which is the difference between running and not running
 /// on a board with 256 KB of usable RAM.
 pub const MINIMAL_BCL_BYTES: usize = 192_045;
@@ -101,7 +101,7 @@ impl Tier {
 ///
 /// Measured rather than guessed: a slot costs 41 bytes, so 512 slots is 21 KB.
 /// The rest of the budget is the runtime itself — 127 KB for the loader's 202
-/// pre-registered framework types, and 106 KB for RustBCL's 766 native
+/// pre-registered framework types, and 106 KB for RustBCL's 821 native
 /// bindings. `HelloWorld` uses exactly one slot; the other 511 are headroom.
 pub const EXEC_SLOTS: usize = 512;
 
@@ -267,16 +267,10 @@ fn execute_assembly<W: Write>(out: &mut W, assembly: &[u8], heap_bytes: usize) {
     interp.heap = Heap::embedded(EXEC_SLOTS);
     match tier {
         Tier::Full => rustclr_bcl::install(&mut interp),
-        Tier::Minimal => {
-            // Pay for what you use. Each module registers independently, so a
-            // board short on RAM can take the half of RustBCL a console
-            // program actually calls.
-            rustclr_bcl::runtime::register(&mut interp);
-            rustclr_bcl::console::register(&mut interp);
-            rustclr_bcl::strings::register(&mut interp);
-            rustclr_bcl::numerics::register(&mut interp);
-            rustclr_bcl::interpolation::register(&mut interp);
-        }
+        // Pay for what you use. `install_minimal` is the same subset
+        // `rustnet run --bcl minimal` installs, so a program can be checked
+        // against this board's limits on a desktop before it is flashed.
+        Tier::Minimal => rustclr_bcl::install_minimal(&mut interp),
         Tier::None => unreachable!("returned above"),
     }
     let _ = writeln!(out, "native bindings  {}", interp.native_count());

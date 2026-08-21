@@ -165,6 +165,17 @@ fn find_to_string(interp: &Interpreter, type_id: rustclr_core::TypeId) -> Option
 
 /// Formats a double the way .NET's default `ToString()` does: shortest
 /// round-trippable form, with no trailing `.0` for integral values.
+///
+/// The part that is easy to miss is **when .NET switches to scientific
+/// notation**, because Rust never does. `2.9199043183325557e-10` prints here as
+/// `0.00000000029199043183325557` and on .NET as `2.9199043183325557E-10`, and
+/// a program that prints a small residual — a solver reporting `f(x)`, say —
+/// disagrees on every line without either runtime being wrong about the value.
+///
+/// .NET's rule: fixed-point while the decimal exponent is in `[-4, 17)`,
+/// scientific outside it, with the exponent signed and at least two digits.
+/// Those bounds were read off the reference runtime rather than reasoned about
+/// — the first attempt guessed 15 and `1e15` disagreed.
 pub fn format_double(f: f64) -> String {
     if f.is_nan() {
         return "NaN".into();
@@ -175,8 +186,33 @@ pub fn format_double(f: f64) -> String {
     if f == crate::fmath::trunc(f) && crate::fmath::abs(f) < 1e15 {
         return format!("{}", f as i64);
     }
-    let s = format!("{f}");
-    s
+    match scientific_parts(&format!("{f:e}")) {
+        Some((mantissa, exponent)) if !(-4..17).contains(&exponent) => {
+            dotnet_scientific(&mantissa, exponent)
+        }
+        _ => format!("{f}"),
+    }
+}
+
+/// Splits Rust's `{:e}` rendering into its mantissa and decimal exponent.
+///
+/// Rust writes `2.9199043183325557e-10`; .NET wants those two halves put back
+/// together differently.
+fn scientific_parts(rendered: &str) -> Option<(String, i32)> {
+    let at = rendered.find('e')?;
+    let mantissa = rendered[..at].to_string();
+    let exponent = rendered[at + 1..].parse::<i32>().ok()?;
+    Some((mantissa, exponent))
+}
+
+/// `2.9199043183325557` and `-10` become `2.9199043183325557E-10`.
+///
+/// Capital `E`, an explicit sign, and at least two exponent digits — all three
+/// are what .NET emits, and all three show up in a byte-for-byte comparison.
+fn dotnet_scientific(mantissa: &str, exponent: i32) -> String {
+    let sign = if exponent < 0 { '-' } else { '+' };
+    let magnitude = exponent.unsigned_abs();
+    format!("{mantissa}E{sign}{magnitude:02}")
 }
 
 /// Formats a float, which .NET renders with single precision.
@@ -190,7 +226,14 @@ pub fn format_single(f: f32) -> String {
     if f == crate::fmath::trunc_f32(f) && crate::fmath::abs_f32(f) < 1e7 {
         return format!("{}", f as i64);
     }
-    format!("{f}")
+    // Same switch as `format_double`, at the narrower band single precision
+    // uses: .NET keeps `1e8` fixed and takes `1e9` to scientific.
+    match scientific_parts(&format!("{f:e}")) {
+        Some((mantissa, exponent)) if !(-4..9).contains(&exponent) => {
+            dotnet_scientific(&mantissa, exponent)
+        }
+        _ => format!("{f}"),
+    }
 }
 
 /// Allocates a managed `char[]` from a string.

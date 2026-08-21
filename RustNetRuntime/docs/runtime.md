@@ -147,10 +147,13 @@ exception as the sole stack entry, or pop the frame and continue.
 **On `endfinally`** — advance the queue: run the next `finally`, branch to the
 pending `leave` target, or resume propagating the in-flight exception.
 
-Exception filters are the gap. Evaluating one means running managed code
-mid-unwind, before the stack has been unwound. They are treated as non-matching,
-which lets the exception reach an outer handler — noisy but correct, rather than
-silently swallowed.
+**On a filter clause** — run the filter block before deciding. This is managed
+code executing mid-unwind, so it gets a frame of its own on top of the frame
+being unwound, sharing that frame's method and arguments and taking a copy of
+its locals. `endfilter` writes those locals back and hands its `int32` verdict
+to the unwind through the same frame-floor mechanism a native-to-managed call
+uses. A filter that throws declines rather than replacing the exception in
+flight.
 
 ---
 

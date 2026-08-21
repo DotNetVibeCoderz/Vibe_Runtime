@@ -35,7 +35,7 @@ use embedded_alloc::LlffHeap;
 use riscv_rt::entry;
 
 /// The assembly to read, compiled by Roslyn for `net10.0`.
-static HELLO_WORLD: &[u8] = include_bytes!("HelloWorld.dll");
+static HELLO_WORLD: &[u8] = include_bytes!(env!("RUSTCLR_APP_PATH"));
 
 const BOARD: &str = "Kendryte K210 (RV64GC, Sipeed Maix Go)";
 

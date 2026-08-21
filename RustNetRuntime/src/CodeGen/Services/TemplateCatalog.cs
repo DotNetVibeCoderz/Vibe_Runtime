@@ -1174,6 +1174,692 @@ public static class TemplateCatalog
             ],
         });
 
+        // ── IoT: written for the reduced binding set ───────────────────────
+        //
+        // Everything below stays inside `Console`, `String`, `Math` and plain
+        // arrays. No generic collections, no LINQ, no reflection — because a
+        // board with 192 KB of RAM cannot hold the bindings for them, and a
+        // template that will not run on the board it was written for is worse
+        // than no template. `MinimumTier = Minimal` records that, and the
+        // Deploy dialog uses it to say which boards each one fits.
+
+        templates.Add(new ProjectTemplate
+        {
+            Id = "iot-blink",
+            Name = "Blink Scheduler",
+            Summary =
+                "A cooperative timer wheel driving LED patterns. The smallest useful "
+                + "embedded shape: no allocation after start-up, no blocking delays.",
+            Category = TemplateCategory.IoT,
+            Domain = TemplateDomain.Education,
+            MinimumTier = BclTier.Minimal,
+            RunHint = "rustnet run bin/Release/net10.0/{NAME}.dll",
+            Files =
+            [
+                new("{NAME}.csproj", ConsoleProject),
+                new("Scheduler.cs", """
+                    namespace {NAMESPACE};
+
+                    /// <summary>One periodic job: a period, a phase and a pin.</summary>
+                    public sealed class Task
+                    {
+                        public string Name = "";
+                        public int PeriodMs;
+                        public int NextDueMs;
+                        public bool State;
+                    }
+
+                    /// <summary>
+                    /// A cooperative scheduler over a millisecond tick.
+                    ///
+                    /// Fixed-capacity on purpose: an embedded scheduler that allocates
+                    /// while running is a scheduler that can fail at 3am. Everything is
+                    /// sized once in the constructor.
+                    /// </summary>
+                    public sealed class Scheduler
+                    {
+                        private readonly Task[] _tasks;
+                        private int _count;
+
+                        public Scheduler(int capacity) { _tasks = new Task[capacity]; }
+
+                        public bool Add(string name, int periodMs)
+                        {
+                            if (_count >= _tasks.Length) return false;
+                            _tasks[_count] = new Task { Name = name, PeriodMs = periodMs, NextDueMs = periodMs };
+                            _count++;
+                            return true;
+                        }
+
+                        /// <summary>Advances to `nowMs` and toggles whatever is due.</summary>
+                        public int Tick(int nowMs)
+                        {
+                            int fired = 0;
+                            for (int i = 0; i < _count; i++)
+                            {
+                                Task t = _tasks[i];
+                                // `while`, not `if`: a late tick must not silently drop
+                                // periods, or a 1 Hz job becomes a 0.9 Hz job.
+                                while (nowMs >= t.NextDueMs)
+                                {
+                                    t.State = !t.State;
+                                    t.NextDueMs += t.PeriodMs;
+                                    fired++;
+                                }
+                            }
+                            return fired;
+                        }
+
+                        public string Render()
+                        {
+                            string line = "";
+                            for (int i = 0; i < _count; i++)
+                            {
+                                line += _tasks[i].Name + "=" + (_tasks[i].State ? "1" : "0") + " ";
+                            }
+                            return line;
+                        }
+                    }
+                    """),
+                new("Program.cs", """
+                    namespace {NAMESPACE};
+
+                    public static class Program
+                    {
+                        public static void Main()
+                        {
+                            var scheduler = new Scheduler(3);
+                            scheduler.Add("heartbeat", 500);
+                            scheduler.Add("status", 1000);
+                            scheduler.Add("radio", 2000);
+
+                            // On a board this loop reads a hardware timer. Here it steps
+                            // a simulated clock so the same code runs on a desktop.
+                            for (int nowMs = 0; nowMs <= 4000; nowMs += 250)
+                            {
+                                scheduler.Tick(nowMs);
+                                Console.WriteLine(nowMs + "ms  " + scheduler.Render());
+                            }
+                        }
+                    }
+                    """),
+            ],
+        });
+
+        templates.Add(new ProjectTemplate
+        {
+            Id = "iot-datalogger",
+            Name = "Ring-Buffer Data Logger",
+            Summary =
+                "Records samples into a fixed ring buffer and flushes full pages with a "
+                + "checksum. What a logger looks like when it cannot grow its storage.",
+            Category = TemplateCategory.IoT,
+            Domain = TemplateDomain.Science,
+            MinimumTier = BclTier.Minimal,
+            RunHint = "rustnet run bin/Release/net10.0/{NAME}.dll",
+            Files =
+            [
+                new("{NAME}.csproj", ConsoleProject),
+                new("RingLog.cs", """
+                    namespace {NAMESPACE};
+
+                    /// <summary>
+                    /// A fixed-size ring of samples that flushes a page at a time.
+                    ///
+                    /// Overwriting the oldest sample is deliberate: on a device that
+                    /// cannot phone home, recent data is worth more than a logger that
+                    /// stops when it fills up.
+                    /// </summary>
+                    public sealed class RingLog
+                    {
+                        private readonly int[] _samples;
+                        private int _head;
+                        private int _stored;
+
+                        public int Dropped { get; private set; }
+                        public int PageSize { get; }
+
+                        public RingLog(int capacity, int pageSize)
+                        {
+                            _samples = new int[capacity];
+                            PageSize = pageSize;
+                        }
+
+                        public void Record(int sample)
+                        {
+                            if (_stored == _samples.Length) Dropped++;
+                            _samples[_head] = sample;
+                            _head = (_head + 1) % _samples.Length;
+                            if (_stored < _samples.Length) _stored++;
+                        }
+
+                        public bool PageReady => _stored >= PageSize;
+
+                        /// <summary>
+                        /// Removes one page, oldest first, and returns it.
+                        /// </summary>
+                        public int[] TakePage()
+                        {
+                            int take = _stored < PageSize ? _stored : PageSize;
+                            int[] page = new int[take];
+                            int tail = (_head - _stored + _samples.Length) % _samples.Length;
+                            for (int i = 0; i < take; i++)
+                            {
+                                page[i] = _samples[(tail + i) % _samples.Length];
+                            }
+                            _stored -= take;
+                            return page;
+                        }
+
+                        /// <summary>
+                        /// Fletcher-16 over the page.
+                        ///
+                        /// Chosen over CRC because it needs no table — table space is
+                        /// real on a part with 192 KB — and still catches the bit errors
+                        /// a flash page actually suffers.
+                        /// </summary>
+                        public static int Checksum(int[] page)
+                        {
+                            int sum1 = 0;
+                            int sum2 = 0;
+                            for (int i = 0; i < page.Length; i++)
+                            {
+                                sum1 = (sum1 + (page[i] & 0xFF)) % 255;
+                                sum2 = (sum2 + sum1) % 255;
+                            }
+                            return (sum2 << 8) | sum1;
+                        }
+                    }
+                    """),
+                new("Program.cs", """
+                    namespace {NAMESPACE};
+
+                    public static class Program
+                    {
+                        public static void Main()
+                        {
+                            var log = new RingLog(32, 8);
+
+                            for (int i = 0; i < 40; i++)
+                            {
+                                // Stand-in for an ADC read.
+                                log.Record(400 + (i * 7) % 120);
+
+                                if (log.PageReady)
+                                {
+                                    int[] page = log.TakePage();
+                                    Console.WriteLine("flush " + page.Length + " samples, checksum 0x"
+                                        + Checksum16(page));
+                                }
+                            }
+                            Console.WriteLine("dropped " + log.Dropped);
+                        }
+
+                        // One-character strings rather than characters: `string + char`
+                        // works, but this allocates one object per digit instead of two,
+                        // which matters on a board with 192 KB.
+                        private static readonly string[] Nibble =
+                        [
+                            "0", "1", "2", "3", "4", "5", "6", "7",
+                            "8", "9", "A", "B", "C", "D", "E", "F",
+                        ];
+
+                        private static string Checksum16(int[] page)
+                        {
+                            int value = RingLog.Checksum(page);
+                            string hex = "";
+                            for (int shift = 12; shift >= 0; shift -= 4)
+                            {
+                                hex += Nibble[(value >> shift) & 0xF];
+                            }
+                            return hex;
+                        }
+                    }
+                    """),
+            ],
+        });
+
+        templates.Add(new ProjectTemplate
+        {
+            Id = "iot-modbus",
+            Name = "Modbus RTU Frames",
+            Summary =
+                "Builds and validates Modbus RTU frames with CRC-16. The protocol most "
+                + "industrial sensors actually speak.",
+            Category = TemplateCategory.IoT,
+            Domain = TemplateDomain.Business,
+            MinimumTier = BclTier.Minimal,
+            RunHint = "rustnet run bin/Release/net10.0/{NAME}.dll",
+            Files =
+            [
+                new("{NAME}.csproj", ConsoleProject),
+                new("Modbus.cs", """
+                    namespace {NAMESPACE};
+
+                    /// <summary>
+                    /// Modbus RTU framing.
+                    ///
+                    /// The CRC is computed rather than looked up: a 512-byte table would
+                    /// be a quarter of a percent of a small part's RAM, and this runs
+                    /// once per frame on a link that tops out at 115200 baud.
+                    /// </summary>
+                    public static class Modbus
+                    {
+                        public const int ReadHoldingRegisters = 3;
+                        public const int WriteSingleRegister = 6;
+
+                        /// <summary>CRC-16/MODBUS, polynomial 0xA001, seeded 0xFFFF.</summary>
+                        public static int Crc(int[] frame, int length)
+                        {
+                            int crc = 0xFFFF;
+                            for (int i = 0; i < length; i++)
+                            {
+                                crc ^= frame[i] & 0xFF;
+                                for (int bit = 0; bit < 8; bit++)
+                                {
+                                    if ((crc & 1) != 0) crc = (crc >> 1) ^ 0xA001;
+                                    else crc >>= 1;
+                                }
+                            }
+                            return crc & 0xFFFF;
+                        }
+
+                        /// <summary>A read-holding-registers request, CRC appended.</summary>
+                        public static int[] ReadRequest(int slave, int start, int count)
+                        {
+                            int[] frame = new int[8];
+                            frame[0] = slave;
+                            frame[1] = ReadHoldingRegisters;
+                            frame[2] = (start >> 8) & 0xFF;
+                            frame[3] = start & 0xFF;
+                            frame[4] = (count >> 8) & 0xFF;
+                            frame[5] = count & 0xFF;
+                            int crc = Crc(frame, 6);
+                            // Modbus sends the CRC low byte first, unlike every other
+                            // field in the frame. This is the usual place to get it wrong.
+                            frame[6] = crc & 0xFF;
+                            frame[7] = (crc >> 8) & 0xFF;
+                            return frame;
+                        }
+
+                        /// <summary>True when a received frame's trailing CRC checks out.</summary>
+                        public static bool Verify(int[] frame)
+                        {
+                            if (frame.Length < 4) return false;
+                            int expected = Crc(frame, frame.Length - 2);
+                            int actual = (frame[frame.Length - 1] << 8) | frame[frame.Length - 2];
+                            return expected == actual;
+                        }
+
+                        /// <summary>
+                        /// Nibbles as strings, not as characters in one.
+                        ///
+                        /// `text += "0123..."[i]` also works — RustCLR implements the
+                        /// span-based concat .NET 10 lowers `string + char` to — but an
+                        /// array of one-character strings allocates one object per digit
+                        /// instead of two, which is the kind of arithmetic that matters
+                        /// on a board with 192 KB.
+                        /// </summary>
+                        private static readonly string[] Nibble =
+                        [
+                            "0", "1", "2", "3", "4", "5", "6", "7",
+                            "8", "9", "A", "B", "C", "D", "E", "F",
+                        ];
+
+                        public static string Hex(int[] frame)
+                        {
+                            string text = "";
+                            for (int i = 0; i < frame.Length; i++)
+                            {
+                                int value = frame[i] & 0xFF;
+                                text += Nibble[(value >> 4) & 0xF];
+                                text += Nibble[value & 0xF];
+                                text += " ";
+                            }
+                            return text;
+                        }
+                    }
+                    """),
+                new("Program.cs", """
+                    namespace {NAMESPACE};
+
+                    public static class Program
+                    {
+                        public static void Main()
+                        {
+                            int[] request = Modbus.ReadRequest(slave: 17, start: 107, count: 3);
+                            Console.WriteLine("request  " + Modbus.Hex(request));
+                            Console.WriteLine("verifies " + Modbus.Verify(request));
+
+                            // Flip one bit, as a noisy RS-485 line would.
+                            request[3] ^= 0x01;
+                            Console.WriteLine("corrupt  " + Modbus.Verify(request));
+                        }
+                    }
+                    """),
+            ],
+        });
+
+        templates.Add(new ProjectTemplate
+        {
+            Id = "iot-pid",
+            Name = "PID Motor Control",
+            Summary =
+                "A PID loop with anti-windup and output clamping, in fixed steps. "
+                + "The control shape behind most actuators.",
+            Category = TemplateCategory.IoT,
+            Domain = TemplateDomain.Business,
+            MinimumTier = BclTier.Minimal,
+            RunHint = "rustnet run bin/Release/net10.0/{NAME}.dll",
+            Files =
+            [
+                new("{NAME}.csproj", ConsoleProject),
+                new("Pid.cs", """
+                    namespace {NAMESPACE};
+
+                    /// <summary>
+                    /// A discrete PID controller.
+                    ///
+                    /// Two details separate this from the textbook formula, and both
+                    /// exist because real actuators saturate:
+                    ///
+                    /// * **Anti-windup.** The integral only accumulates while the output
+                    ///   is within limits. Without it, a loop that sits against its stop
+                    ///   builds up integral it then has to unwind, and overshoots badly.
+                    /// * **Derivative on measurement.** Differentiating the measurement
+                    ///   rather than the error avoids a spike every time the setpoint
+                    ///   moves.
+                    /// </summary>
+                    public sealed class Pid
+                    {
+                        public double Kp = 1.0;
+                        public double Ki;
+                        public double Kd;
+                        public double OutputMin = -1.0;
+                        public double OutputMax = 1.0;
+
+                        private double _integral;
+                        private double _lastMeasurement;
+                        private bool _started;
+
+                        public void Reset()
+                        {
+                            _integral = 0;
+                            _started = false;
+                        }
+
+                        public double Step(double setpoint, double measurement, double dtSeconds)
+                        {
+                            double error = setpoint - measurement;
+
+                            double derivative = 0;
+                            if (_started && dtSeconds > 0)
+                            {
+                                derivative = -(measurement - _lastMeasurement) / dtSeconds;
+                            }
+                            _lastMeasurement = measurement;
+                            _started = true;
+
+                            double candidate = (Kp * error) + (Ki * (_integral + error * dtSeconds))
+                                + (Kd * derivative);
+
+                            // Only integrate if doing so keeps the output in range.
+                            if (candidate >= OutputMin && candidate <= OutputMax)
+                            {
+                                _integral += error * dtSeconds;
+                            }
+
+                            double output = (Kp * error) + (Ki * _integral) + (Kd * derivative);
+                            if (output < OutputMin) output = OutputMin;
+                            if (output > OutputMax) output = OutputMax;
+                            return output;
+                        }
+                    }
+                    """),
+                new("Program.cs", """
+                    namespace {NAMESPACE};
+
+                    public static class Program
+                    {
+                        public static void Main()
+                        {
+                            var pid = new Pid { Kp = 2.0, Ki = 0.8, Kd = 0.05 };
+
+                            // A first-order plant: speed relaxes toward the drive level.
+                            double speed = 0;
+                            double target = 1.0;
+                            double dt = 0.05;
+
+                            for (int step = 0; step < 40; step++)
+                            {
+                                double drive = pid.Step(target, speed, dt);
+                                speed += (drive - speed) * 0.25;
+
+                                if (step % 5 == 0)
+                                {
+                                    Console.WriteLine("t=" + Round2(step * dt)
+                                        + "  drive=" + Round2(drive)
+                                        + "  speed=" + Round2(speed));
+                                }
+                            }
+                        }
+
+                        private static double Round2(double value)
+                        {
+                            return Math.Round(value * 100) / 100;
+                        }
+                    }
+                    """),
+            ],
+        });
+
+        templates.Add(new ProjectTemplate
+        {
+            Id = "iot-classifier",
+            Name = "Edge Classifier",
+            Summary =
+                "A decision tree scored on-device, with the model as a flat array. "
+                + "Inference on a part with no floating-point accelerator.",
+            Category = TemplateCategory.IoT,
+            Domain = TemplateDomain.Science,
+            MinimumTier = BclTier.Minimal,
+            RunHint = "rustnet run bin/Release/net10.0/{NAME}.dll",
+            Files =
+            [
+                new("{NAME}.csproj", ConsoleProject),
+                new("Tree.cs", """
+                    namespace {NAMESPACE};
+
+                    /// <summary>
+                    /// A decision tree stored as a flat array of nodes.
+                    ///
+                    /// Flat rather than linked because the model is trained on a desktop
+                    /// and shipped as data: an array of four ints per node survives being
+                    /// written into flash, and chasing object references would not. This
+                    /// is what "deploy a model to a microcontroller" usually means in
+                    /// practice — no framework, just the coefficients.
+                    ///
+                    /// Each node is (feature, threshold, left, right). A leaf sets
+                    /// feature to -1 and carries its class in threshold.
+                    /// </summary>
+                    public sealed class Tree
+                    {
+                        private readonly int[] _nodes;
+
+                        public Tree(int[] flatNodes) { _nodes = flatNodes; }
+
+                        public int Classify(int[] features)
+                        {
+                            int node = 0;
+                            // Bounded rather than `while (true)`: a malformed model must
+                            // return a wrong answer, not hang the device.
+                            for (int depth = 0; depth < 32; depth++)
+                            {
+                                int at = node * 4;
+                                int feature = _nodes[at];
+                                if (feature < 0) return _nodes[at + 1];
+
+                                node = features[feature] <= _nodes[at + 1]
+                                    ? _nodes[at + 2]
+                                    : _nodes[at + 3];
+                            }
+                            return -1;
+                        }
+
+                        public int NodeCount => _nodes.Length / 4;
+                    }
+                    """),
+                new("Program.cs", """
+                    namespace {NAMESPACE};
+
+                    public static class Program
+                    {
+                        public static void Main()
+                        {
+                            // Classifies (temperature, humidity) into 0 dry, 1 normal, 2 damp.
+                            // Trained elsewhere; this is only the scoring half.
+                            int[] model =
+                            [
+                                //  feature, threshold, left, right
+                                1, 30, 1, 2,     // node 0: humidity <= 30 ?
+                                -1, 0, 0, 0,     // node 1: leaf -> dry
+                                1, 70, 3, 4,     // node 2: humidity <= 70 ?
+                                -1, 1, 0, 0,     // node 3: leaf -> normal
+                                -1, 2, 0, 0,     // node 4: leaf -> damp
+                            ];
+
+                            var tree = new Tree(model);
+                            Console.WriteLine("model has " + tree.NodeCount + " nodes");
+
+                            int[][] samples =
+                            [
+                                [22, 18],
+                                [24, 55],
+                                [19, 88],
+                            ];
+
+                            string[] names = ["dry", "normal", "damp"];
+                            for (int i = 0; i < samples.Length; i++)
+                            {
+                                int label = tree.Classify(samples[i]);
+                                Console.WriteLine("temp=" + samples[i][0] + " humidity=" + samples[i][1]
+                                    + " -> " + names[label]);
+                            }
+                        }
+                    }
+                    """),
+            ],
+        });
+
+        templates.Add(new ProjectTemplate
+        {
+            Id = "iot-morse",
+            Name = "Morse Beacon",
+            Summary =
+                "Encodes text as timed on/off symbols for an LED or buzzer. A first "
+                + "embedded project that produces something visible.",
+            Category = TemplateCategory.IoT,
+            Domain = TemplateDomain.Education,
+            MinimumTier = BclTier.Minimal,
+            RunHint = "rustnet run bin/Release/net10.0/{NAME}.dll",
+            Files =
+            [
+                new("{NAME}.csproj", ConsoleProject),
+                new("Morse.cs", """
+                    namespace {NAMESPACE};
+
+                    /// <summary>
+                    /// Text to Morse, and Morse to a timed key-down sequence.
+                    ///
+                    /// The timings are the real ones, expressed in dot units: a dash is
+                    /// three dots, the gap inside a letter is one, between letters three,
+                    /// between words seven. Getting those ratios right is the whole
+                    /// difference between Morse and blinking.
+                    /// </summary>
+                    public static class Morse
+                    {
+                        private const string Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+                        private static readonly string[] Codes =
+                        [
+                            ".-", "-...", "-.-.", "-..", ".", "..-.", "--.", "....", "..",
+                            ".---", "-.-", ".-..", "--", "-.", "---", ".--.", "--.-", ".-.",
+                            "...", "-", "..-", "...-", ".--", "-..-", "-.--", "--..",
+                            "-----", ".----", "..---", "...--", "....-", ".....", "-....",
+                            "--...", "---..", "----.",
+                        ];
+
+                        public static string Encode(string text)
+                        {
+                            string output = "";
+                            for (int i = 0; i < text.Length; i++)
+                            {
+                                char c = char.ToUpperInvariant(text[i]);
+                                if (c == ' ') { output += "/ "; continue; }
+
+                                int index = Alphabet.IndexOf(c);
+                                if (index < 0) continue;
+                                output += Codes[index] + " ";
+                            }
+                            return output.TrimEnd();
+                        }
+
+                        /// <summary>
+                        /// Turns encoded Morse into (keyDown, durationUnits) pairs, which
+                        /// is what a GPIO loop actually consumes.
+                        /// </summary>
+                        public static string Timeline(string encoded)
+                        {
+                            string line = "";
+                            for (int i = 0; i < encoded.Length; i++)
+                            {
+                                char c = encoded[i];
+                                if (c == '.') line += "on:1 off:1 ";
+                                else if (c == '-') line += "on:3 off:1 ";
+                                else if (c == ' ') line += "off:2 ";
+                                else if (c == '/') line += "off:4 ";
+                            }
+                            return line.TrimEnd();
+                        }
+
+                        public static int UnitCount(string timeline)
+                        {
+                            int total = 0;
+                            string[] parts = timeline.Split(' ');
+                            for (int i = 0; i < parts.Length; i++)
+                            {
+                                int colon = parts[i].IndexOf(':');
+                                if (colon < 0) continue;
+                                total += int.Parse(parts[i].Substring(colon + 1));
+                            }
+                            return total;
+                        }
+                    }
+                    """),
+                new("Program.cs", """
+                    namespace {NAMESPACE};
+
+                    public static class Program
+                    {
+                        public static void Main()
+                        {
+                            string message = "SOS RUSTCLR";
+                            string encoded = Morse.Encode(message);
+                            string timeline = Morse.Timeline(encoded);
+
+                            Console.WriteLine(message);
+                            Console.WriteLine(encoded);
+                            Console.WriteLine(timeline);
+
+                            // At 20 words per minute a dot is 60 ms.
+                            int units = Morse.UnitCount(timeline);
+                            Console.WriteLine("total " + units + " units = " + (units * 60) + " ms at 20 wpm");
+                        }
+                    }
+                    """),
+            ],
+        });
+
         return templates;
     }
 }

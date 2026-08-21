@@ -76,7 +76,7 @@ dotnet bin/Release/net10.0/Conformance.dll
 rustnet run bin/Release/net10.0/Conformance.dll
 ```
 
-Both print `checks=136 failures=0`. If they ever differ, that is a runtime bug
+Both print `checks=176 failures=0`. If they ever differ, that is a runtime bug
 and the differing check names it. `tests/fixtures/ModernSyntax/` is the same
 idea for modern C# features and prints `checks=35 failures=0`.
 

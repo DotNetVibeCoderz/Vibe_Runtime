@@ -18,6 +18,7 @@
     <KeyBinding Gesture="Ctrl+B" Command="{Binding BuildCommand}" />
     <KeyBinding Gesture="F5" Command="{Binding RunCommand}" />
     <KeyBinding Gesture="Ctrl+F5" Command="{Binding RunOnRustClrCommand}" />
+    <KeyBinding Gesture="Ctrl+D" Command="{Binding OpenDevicesCommand}" />
     <KeyBinding Gesture="Ctrl+K" Command="{Binding FormatCodeCommand}" />
     <KeyBinding Gesture="Ctrl+J" Command="{Binding ToggleChatCommand}" />
   </Window.KeyBindings>
@@ -55,6 +56,8 @@
             <Separator />
             <MenuItem Header="Verify on RustCLR" Command="{Binding VerifyCommand}" />
             <MenuItem Header="Deploy…" Command="{Binding DeployCommand}" />
+            <Separator />
+            <MenuItem Header="Devices…" InputGesture="Ctrl+D" Command="{Binding OpenDevicesCommand}" />
           </MenuItem>
 
           <MenuItem Header="_View">

@@ -566,9 +566,33 @@ impl Interpreter {
                 return self.do_endfinally();
             }
             Op::Endfilter => {
-                // Filters are evaluated by `dispatch_exception`; reaching this
-                // instruction during normal flow means the filter fell through.
-                let _ = self.pop()?;
+                // Ends the filter and hands its verdict back to the unwind.
+                //
+                // `do_return` is what carries it: the filter frame sits at the
+                // frame floor `run_filter` established, so returning a value
+                // from it goes to that caller rather than onto the evaluation
+                // stack of the frame being unwound.
+                let verdict = self.pop()?;
+                if self.frame_ref().is_filter {
+                    // The filter ran over a copy of the unwinding frame's
+                    // locals; write them back so anything it changed survives.
+                    //
+                    // `catch (E e) when (Log(ref buffer))` is the case that
+                    // needs this: the `ref` points into the filter frame's
+                    // copy, and without the write-back the append vanishes and
+                    // the filter looks as though it never ran. The frame
+                    // underneath is the one being unwound — `run_filter` pushes
+                    // this frame directly onto it.
+                    let locals = self.frame_ref().locals.clone();
+                    let depth = self.frames.len();
+                    if depth >= 2 {
+                        self.frames[depth - 2].locals = locals;
+                    }
+                    return self.do_return(Some(verdict));
+                }
+                // Reached outside a filter frame, which means the IL fell into
+                // a filter block during ordinary flow. That is malformed, and
+                // dropping the value is what the previous behaviour did.
             }
 
             // -- metadata ------------------------------------------------------------------------

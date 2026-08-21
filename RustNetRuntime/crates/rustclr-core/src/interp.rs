@@ -74,6 +74,13 @@ pub struct Frame {
     /// Set when `pending_newobj` is a one-field cell holding a value type
     /// rather than the instance itself: the caller wants the field, not the box.
     pending_newobj_is_cell: bool,
+    /// True for a frame created to evaluate an exception filter.
+    ///
+    /// It shares the method and code of the frame being unwound, so without
+    /// this there is nothing to distinguish the two — and `endfilter` needs to
+    /// know it is ending a filter rather than falling through one during
+    /// ordinary flow.
+    pub(crate) is_filter: bool,
 }
 
 /// Sentinel `finally_resume` meaning "resume unwinding" rather than "branch".
@@ -721,6 +728,7 @@ impl Interpreter {
             constrained: None,
             pending_newobj: None,
             pending_newobj_is_cell: false,
+            is_filter: false,
         });
         self.stats.max_frame_depth = self.stats.max_frame_depth.max(self.frames.len());
         Ok(Entered::Frame)

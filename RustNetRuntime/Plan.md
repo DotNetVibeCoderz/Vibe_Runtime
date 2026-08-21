@@ -186,7 +186,7 @@ and `Module` enumeration, and constructing generic types at run time.
 ## Milestone 6 — Embedded targets ◐
 
 **C# runs on a microcontroller.** On an ESP32-C3 — RISC-V, 400 KB of SRAM, no
-operating system — the loader, the interpreter and all 766 of RustBCL's native
+operating system — the loader, the interpreter and all 821 of RustBCL's native
 bindings execute `HelloWorld.Main`, and it prints the same three lines
 `dotnet` does, CRLF included, with the same instruction and call counts:
 [ESP32-C3, executing](docs/logs/esp32c3-interpreter.log).
@@ -226,21 +226,29 @@ cycle unrooted   live=0
 refused past it  true
 ```
 
-**Five boards now, from one demo.** `embedded/demo-common` holds the report and
+**Seven boards now, from one demo.** `embedded/demo-common` holds the report and
 each firmware supplies a `core::fmt::Write` to receive it — because "they all
 print the same thing" only stays true if there is one copy of it.
 
-| Board | Core | Target | State |
-| --- | --- | --- | --- |
-| ESP32-WROOM-32 | Xtensa LX6 | `xtensa-esp32-none-elf` | run on hardware |
-| ESP32-C3 | RISC-V 32 | `riscv32imc-unknown-none-elf` | run on hardware |
-| Meadow F7 Micro | Arm Cortex-M7 | `thumbv7em-none-eabihf` | run on hardware |
-| Raspberry Pi Pico | Arm Cortex-M0+ | `thumbv6m-none-eabi` | **builds; not yet flashed** |
-| Sipeed Maix Go | RISC-V 64 | `riscv64gc-unknown-none-elf` | **builds; not yet flashed** |
+| Board | Core | Target | Tier | State |
+| --- | --- | --- | --- | --- |
+| ESP32-C3 | RISC-V 32 | `riscv32imc-unknown-none-elf` | full | **executes IL on hardware** |
+| ESP32-WROOM-32 | Xtensa LX6 | `xtensa-esp32-none-elf` | full | run on hardware (pre-interpreter) |
+| Meadow F7 Micro | Arm Cortex-M7 | `thumbv7em-none-eabihf` | full | run on hardware (pre-interpreter) |
+| Sipeed Maix Go | RISC-V 64 | `riscv64gc-unknown-none-elf` | full | **builds; not yet flashed** |
+| Netduino 3 WiFi | Arm Cortex-M4F | `thumbv7em-none-eabihf` | minimal | **builds; not yet flashed** |
+| Raspberry Pi Pico | Arm Cortex-M0+ | `thumbv6m-none-eabi` | minimal | **builds; not yet flashed** |
+| Nucleo-F401RE | Arm Cortex-M4F | `thumbv7em-none-eabihf` | **none** | **builds; not yet flashed** |
 
-`tests/firmware.sh` builds all five, so a change to a shared type cannot break a
-board silently — that failure otherwise surfaces only when someone reaches for
+`tests/firmware.sh` builds all seven, so a change to a shared type cannot break
+a board silently — that failure otherwise surfaces only when someone reaches for
 the hardware.
+
+**The two STM32F4 boards were added to bracket the memory question**, not to add
+another Cortex-M. The F427VI is the tightest board that still runs a program,
+and only after `.data`, `.bss` and the stack are moved into CCM to free all
+192 KB of its SRAM for the heap. The F401RE, at 96 KB, is the first board that
+cannot run one at all — and reports that instead of faulting.
 
 **Difficulty was inversely related to how upstream the target is.** RISC-V and
 Arm are both upstream Rust targets: stable toolchain, prebuilt `core` and
@@ -254,7 +262,7 @@ actually locked to, so the claim stays checkable.
 
 ```bash
 bash tests/embedded.sh                 # the crates, four upstream targets
-bash tests/firmware.sh                 # all five board firmwares
+bash tests/firmware.sh                 # all seven board firmwares
 cd embedded/meadow-f7 && cargo build --release      # STM32, stable
 cd embedded/esp32-demo
 # ESP32-C3, stable Rust:
@@ -278,11 +286,21 @@ is exactly what reading an assembly out of flash requires.
 
 ---
 
-## Milestone 7 — Exception filters and the remaining IL
+## Milestone 7 — Exception filters and the remaining IL ◐
 
-- Evaluate `catch when` filters during the first unwind pass.
-- `localloc`, `cpblk`, `initblk`, `calli`, `arglist`.
-- Multi-dimensional arrays with non-zero lower bounds.
+| | |
+| --- | --- |
+| Evaluate `catch when` filters during the unwind | ✅ five conformance checks, byte-identical to `dotnet` |
+| `localloc`, `cpblk`, `initblk`, `calli`, `arglist` | ❌ |
+| Multi-dimensional arrays with non-zero lower bounds | ❌ |
+
+**Filters run in their own frame.** The obstacle was never the matching rule —
+it was that a filter is managed code executing *during* the unwind, before the
+frames below it are discarded. It gets a frame sharing the unwinding frame's
+method and arguments, with a copy of its locals that `endfilter` writes back;
+the verdict returns through the same frame-floor mechanism a native-to-managed
+call uses. A filter that throws declines, per the spec, so the exception in
+flight is never replaced by one from the code asking about it.
 
 ---
 

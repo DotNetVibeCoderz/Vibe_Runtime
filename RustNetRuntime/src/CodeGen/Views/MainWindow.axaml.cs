@@ -184,6 +184,12 @@ public partial class MainWindow : Window, IWorkspaceDialogs
         return await dialog.ShowDialog<NewProjectRequest?>(this);
     }
 
+    public async Task ShowDevicesAsync(DevicesViewModel devices)
+    {
+        var window = new DevicesWindow(devices);
+        await window.ShowDialog(this);
+    }
+
     public async Task ShowSettingsAsync(AppSettings settings)
     {
         var dialog = new SettingsWindow(settings);

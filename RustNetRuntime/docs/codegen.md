@@ -182,6 +182,107 @@ compile C#.
 
 ---
 
+## Devices
+
+**Devices** (`Ctrl+D`) is where boards are found, identified and flashed.
+
+![Devices](images/codegen-devices.png)
+
+### The gauge is the point
+
+A board's identity here is its memory budget. Loading the runtime costs
+**192,045 bytes** with console, strings and maths, or **260,702** with every
+RustBCL binding — both measured with a counting allocator, not estimated. Every
+board is drawn against those two marks on one scale, so two rows can be compared
+by eye and a tier reads as arithmetic.
+
+| Colour | Meaning |
+| --- | --- |
+| Patina | clears both marks — every binding fits |
+| Amber | clears the first — console, strings and maths fit |
+| Ember | clears neither — no program runs on this board |
+
+The Nucleo-F401RE is the honest end of that range: 65,536 bytes of heap against
+a 192,045-byte floor, short by 126,509. It still reads assemblies and collects
+garbage, and it says so rather than failing inside an allocator.
+
+### Scanning does not touch the board
+
+**Scan** lists serial ports and debug probes and nothing else. It runs
+automatically when the panel opens, because a passive list is safe to take
+without asking.
+
+**Identify** is separate for a reason: it talks to the chip, and `espflash
+board-info` resets the part into its bootloader. That would be a surprising side
+effect of opening a window.
+
+Detection is honest about what it cannot know. A CH340 bridge looks the same
+whether an ESP32 or an unrelated device is behind it, and a debug probe says
+nothing about what is on the other end of SWD, so those report **possibly
+connected** rather than a confident guess. The next step writes to flash; a
+wrong board identification there is expensive.
+
+### Deploy puts your program inside the firmware
+
+These boards have no filesystem, so an application is not copied onto one — it
+is compiled into the image the firmware runs. Each firmware's `build.rs` reads
+`RUSTCLR_APP`:
+
+```bash
+RUSTCLR_APP=/path/to/MyApp.dll cargo build --release
+```
+
+Deploy sets that variable, builds the firmware and flashes it. Nothing in the
+firmware crate is edited, so the same tree serves every deploy.
+
+For a board on the reduced binding set, Deploy first runs the program on the
+desktop with `rustnet run --bcl minimal` — the same 314 bindings the board
+carries. If it fails there it would fail on the board, and nothing is flashed.
+
+### What each board needs installed
+
+| Transport | Tool | Boards |
+| --- | --- | --- |
+| USB-serial | `espflash` | ESP32, ESP32-C3 |
+| SWD | `probe-rs` | Netduino 3 WiFi, Nucleo-F401RE, Maix Go |
+| USB DFU | `dfu-util` | Meadow F7 |
+| UF2 volume | none | Raspberry Pi Pico |
+
+A missing tool shows as **tool missing** with the name to install, rather than
+as a board that is not there.
+
+The Meadow F7 is deliberately not flashed from here. DFU into internal flash
+replaces its contents and is not reversible without a backup, so it is left to
+the documented steps in `embedded/meadow-f7/README.md`.
+
+---
+
+## Verifying the templates
+
+Templates carry a `RunsOnRustClr` flag and a minimum board tier, and both are
+claims. `--verify-templates` turns them into a check:
+
+```bash
+dotnet bin/Release/net10.0/CodeGen.dll --verify-templates [id] [--keep]
+```
+
+It scaffolds each template, builds it, runs it on .NET and on RustCLR, and
+compares the output byte for byte. Templates written for a board run against
+`--bcl minimal`, because passing with all 821 bindings says nothing about
+whether a 192 KB board could run them.
+
+Web, desktop and mobile templates are built but not run — they need a host — and
+a library has no entry point. Those are reported as skipped rather than counted
+as passes.
+
+It earns its keep. On its first run it found three IoT templates using
+`string + char`, which .NET 10 lowers to a span-based concat that RustCLR does
+not implement; a `Console.ReadLine()` in two templates that hung the runner
+until stdin was closed; and a double-formatting difference where .NET switches
+to scientific notation and Rust never does.
+
+---
+
 ## Format code
 
 **Format Code** (`Ctrl+K`) is a brace-depth reindenter, not a C# parser. It

@@ -165,6 +165,24 @@
     <Setter Property="Background" Value="Transparent" />
   </Style>
 
+  <!-- Selection, in the theme's own palette.
+       Avalonia's default is a saturated blue that appears nowhere else in
+       Forge; leaving it meant a selected row read as belonging to another
+       application. A raised slate with an oxide edge is how the rest of the
+       app marks "this one". -->
+  <Style Selector="ListBoxItem:selected /template/ ContentPresenter">
+    <Setter Property="Background" Value="{StaticResource SlateRaised}" />
+  </Style>
+  <Style Selector="ListBoxItem:selected:focus /template/ ContentPresenter">
+    <Setter Property="Background" Value="{StaticResource SlateRaised}" />
+  </Style>
+  <Style Selector="ListBoxItem:selected:pointerover /template/ ContentPresenter">
+    <Setter Property="Background" Value="{StaticResource SlateRaised}" />
+  </Style>
+  <Style Selector="ListBoxItem:pointerover /template/ ContentPresenter">
+    <Setter Property="Background" Value="{StaticResource Slate}" />
+  </Style>
+
   <!-- Menus -->
   <Style Selector="Menu">
     <Setter Property="Background" Value="Transparent" />

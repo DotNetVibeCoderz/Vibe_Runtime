@@ -101,7 +101,7 @@ pub use objects::{
 pub use opcode::{decode, decode_all, Instruction, Op, Operand};
 pub use types::{
     AssemblyId, CctorState, FieldId, FieldInfo, IlBody, MethodId, MethodInfo, MethodKind, Primitive,
-    RuntimeType, TypeId, TypeKind, TypeRegistry,
+    PropertyId, PropertyInfo, RuntimeType, TypeId, TypeKind, TypeRegistry,
 };
 pub use value::{ByRef, StructValue, Value};
 

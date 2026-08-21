@@ -17,6 +17,15 @@ internal static class Program
             return Screenshots.Capture(directory);
         }
 
+        index = Array.IndexOf(args, "--verify-templates");
+        if (index >= 0)
+        {
+            var filter = index + 1 < args.Length && !args[index + 1].StartsWith("--")
+                ? args[index + 1]
+                : null;
+            return TemplateVerifier.Run(filter, args.Contains("--keep"));
+        }
+
         index = Array.IndexOf(args, "--set");
         if (index >= 0)
         {
@@ -59,6 +68,8 @@ internal static class Program
             CodeGen --set Key=Value [Key=Value…]     Write settings into app.config
             CodeGen --chat "<prompt>" [--project D]  Run one assistant turn headlessly
             CodeGen --screenshot <directory>         Render the UI to PNG files
+            CodeGen --verify-templates [id] [--keep]  Build every template and run it on
+                                                     both runtimes, comparing the output
 
         SETTING KEYS
             Llm.Provider            OpenAI | Claude | Gemini | Ollama

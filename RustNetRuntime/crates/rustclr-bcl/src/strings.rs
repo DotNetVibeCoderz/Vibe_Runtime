@@ -243,22 +243,19 @@ pub fn register(interp: &mut Interpreter) {
         Ok(Some(Value::Obj(h)))
     });
 
-    interp.register_native("System.String::Split(char[])", |i, a| {
-        let s = arg_string_or_empty(i, a, 0)?;
-        let seps = arg_handle(i, a, 1)?;
-        let separators: Vec<char> = array_values(i, seps)
-            .iter()
-            .filter_map(|v| v.as_i32())
-            .filter_map(|c| char::from_u32(c as u32))
-            .collect();
-        let parts: Vec<String> = if separators.is_empty() {
-            s.split_whitespace().map(str::to_string).collect()
-        } else {
-            s.split(|c| separators.contains(&c)).map(str::to_string).collect()
-        };
-        let array = string_array(i, &parts);
-        Ok(Some(Value::Obj(array)))
-    });
+    // `Split` binds through arity as well as through the array key.
+    //
+    // `"a b".Split(' ')` looks like a one-argument call and is not: C# resolves
+    // it to `Split(char, StringSplitOptions)` and passes the default, so the
+    // typed key carries a token for `StringSplitOptions` that means nothing
+    // outside the calling assembly. Binding `Split/2` and `Split/1` as well is
+    // what makes the ordinary spelling work — without it a program that splits
+    // a string fails with "no implementation" while `Split(char[])` sits
+    // registered and unreachable.
+    interp.register_native("System.String::Split(char[])", split_string);
+    interp.register_native("System.String::Split/1", split_string);
+    interp.register_native("System.String::Split/2", split_string);
+    interp.register_native("System.String::Split/3", split_string);
     interp.register_native("System.String::ToCharArray()", |i, a| {
         let s = arg_string_or_empty(i, a, 0)?;
         let array = char_array(i, &s);
@@ -348,12 +345,76 @@ pub fn register(interp: &mut Interpreter) {
         Ok(Some(Value::I32(lo)))
     });
 
+    register_span_concat(interp);
+    register_span_concat_calls(interp);
+
+    // The invariant forms. Rust's `to_uppercase` is already invariant — it
+    // does not consult a locale — so these are the same implementation under a
+    // different name rather than a second one. Registering them matters
+    // because `char.ToUpperInvariant` is what culture-correct C# actually
+    // calls, and a program that used it failed with "no implementation"
+    // despite `ToUpper` being right there.
+    interp.register_native("System.Char::ToUpperInvariant(char)", |i, a| {
+        let c = arg_i32(i, a, 0)?;
+        let up = char::from_u32(c as u32)
+            .and_then(|c| c.to_uppercase().next())
+            .map(|c| c as i32)
+            .unwrap_or(c);
+        Ok(Some(Value::I32(up)))
+    });
+    interp.register_native("System.Char::ToLowerInvariant(char)", |i, a| {
+        let c = arg_i32(i, a, 0)?;
+        let lo = char::from_u32(c as u32)
+            .and_then(|c| c.to_lowercase().next())
+            .map(|c| c as i32)
+            .unwrap_or(c);
+        Ok(Some(Value::I32(lo)))
+    });
+
     register_string_builder(interp);
 }
 
 /// `StringBuilder` is backed by a managed object whose single field holds a
 /// managed string; that keeps its contents visible to the collector without a
 /// bespoke heap object kind.
+/// `string.Split(...)`, however the call was spelled.
+///
+/// The second argument is a separator — a `char`, or an array of them — or a
+/// `StringSplitOptions` the caller never wrote. Splitting on whitespace when it
+/// is neither matches `Split(null)`, which is what a bare `Split()` means.
+fn split_string(i: &mut Interpreter, a: &[Value]) -> ExecResult<Option<Value>> {
+    let s = arg_string_or_empty(i, a, 0)?;
+
+    let mut separators: Vec<char> = Vec::new();
+    if let Some(second) = a.get(1) {
+        match second {
+            // `Split('x')` — a char arrives as an integer.
+            Value::I32(c) => {
+                if let Some(c) = char::from_u32(*c as u32) {
+                    separators.push(c);
+                }
+            }
+            // `Split(new[] { 'x', 'y' })`.
+            Value::Obj(handle) => {
+                for value in array_values(i, *handle) {
+                    if let Some(c) = value.as_i32().and_then(|c| char::from_u32(c as u32)) {
+                        separators.push(c);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let parts: Vec<String> = if separators.is_empty() {
+        s.split_whitespace().map(str::to_string).collect()
+    } else {
+        s.split(|c| separators.contains(&c)).map(str::to_string).collect()
+    };
+    let array = string_array(i, &parts);
+    Ok(Some(Value::Obj(array)))
+}
+
 /// `string.Join(separator, values)` over an array or any enumerable.
 fn join_sequence(interp: &mut Interpreter, args: &[Value]) -> ExecResult<Option<Value>> {
     let separator = arg_string_or_empty(interp, args, 0)?;
@@ -585,5 +646,129 @@ mod tests {
         assert_eq!(utf16_index_of("\u{1F600}b", "b"), 2);
         assert_eq!(utf16_index_of("hello", "ll"), 2);
         assert_eq!(utf16_index_of("hello", "z"), -1);
+    }
+}
+
+// ── string building through ReadOnlySpan<char> ───────────────────────────────
+
+/// The span members that ordinary string concatenation goes through.
+///
+/// **This is not `Span<T>` support.** It is three BCL members, and the reason
+/// they are here is that without them an ordinary line of C# does not run:
+///
+/// ```csharp
+/// text += "0123456789ABCDEF"[nibble];
+/// ```
+///
+/// `string + char` looks like it should reach `String.Concat(string, string)`
+/// and does not. Roslyn on .NET 10 lowers it to
+///
+/// ```text
+/// ldarg.0
+/// call     ReadOnlySpan<char> String::op_Implicit(string)
+/// ldarg.1
+/// stloc.0
+/// ldloca.s 0
+/// newobj   ReadOnlySpan<char>::.ctor(ref char)
+/// call     string String::Concat(ReadOnlySpan<char>, ReadOnlySpan<char>)
+/// ```
+///
+/// so a program that never mentions `Span` fails with "no implementation for
+/// System.String::op_Implicit". Three templates in CodeGen hit exactly this.
+///
+/// # A span over characters is represented as a string
+///
+/// That works because of what these three members do with it: the span is
+/// read-only, it is over `char`, and the only thing that consumes it is
+/// `Concat`. Nothing here indexes, slices or writes through one.
+///
+/// It is a representation choice for *this path*, not a `ReadOnlySpan<char>`
+/// implementation. `span[0]`, `span.Slice(..)` and `span.Length` are not
+/// registered and still refuse — which is the intended outcome: a partial span
+/// that half-works would be harder to diagnose than one that says no.
+fn register_span_concat(interp: &mut Interpreter) {
+    // `string` to `ReadOnlySpan<char>`: the string is the representation, so
+    // the conversion is the identity.
+    interp.register_native("System.String::op_Implicit(string)", |i, a| {
+        Ok(Some(arg(i, a, 0)?))
+    });
+
+    // `new ReadOnlySpan<char>(ref c)` — the one-element form the lowering uses
+    // for the `char` operand. Argument 0 is the span being constructed,
+    // argument 1 the managed pointer to the character.
+    // Both the typed key and the arity key: the typed one is what the
+    // `MemberRef` produces (`!0&` — a managed pointer to the element type),
+    // and the arity key catches the spellings that do not.
+    for key in [
+        "System.ReadOnlySpan`1::.ctor(!0&)",
+        "System.ReadOnlySpan`1::.ctor/2",
+        "System.ReadOnlySpan`1::.ctor/1",
+        "System.Span`1::.ctor(!0&)",
+        "System.Span`1::.ctor/2",
+    ] {
+        interp.register_native(key, span_ctor);
+    }
+}
+
+/// `new ReadOnlySpan<char>(ref c)`.
+fn span_ctor(i: &mut Interpreter, a: &[Value]) -> ExecResult<Option<Value>> {
+    {
+        let text = match a.get(1) {
+            Some(Value::Ref(target)) => {
+                let value = i.load_indirect_public(target.clone())?;
+                char_to_string(value)
+            }
+            // Already a string: a span over one, which `op_Implicit` produced.
+            Some(other) => read_span(i, other.clone()),
+            None => String::new(),
+        };
+        let value = string_value(i, &text);
+        match a.first() {
+            Some(Value::Ref(target)) => {
+                let target = target.clone();
+                i.store_indirect_public(target, value)?;
+                Ok(None)
+            }
+            _ => Ok(Some(value)),
+        }
+    }
+}
+
+/// The concatenations Roslyn emits for span-based string building.
+fn register_span_concat_calls(interp: &mut Interpreter) {
+    // The concatenations Roslyn emits. Two spans covers `s + c`, `c + s` and
+    // `s + s`; three and four cover the longer chains it folds into one call.
+    for arity in 2..=4 {
+        let key: &'static str =
+            Box::leak(format!("System.String::Concat/{arity}").into_boxed_str());
+        interp.register_native(key, |i, a| {
+            let mut text = String::new();
+            for value in a {
+                text.push_str(&read_span(i, value.clone()));
+            }
+            Ok(Some(string_value(i, &text)))
+        });
+    }
+}
+
+/// A `char` as a one-character string.
+///
+/// Characters arrive as integers, which is how the interpreter carries them.
+fn char_to_string(value: Value) -> String {
+    match value.as_i32().and_then(|c| char::from_u32(c as u32)) {
+        Some(c) => c.to_string(),
+        None => String::new(),
+    }
+}
+
+/// The text a span-or-string argument stands for.
+fn read_span(interp: &mut Interpreter, value: Value) -> String {
+    match &value {
+        // A bare integer here is a `char` that never needed a span.
+        Value::I32(_) => char_to_string(value),
+        _ => match value.as_handle() {
+            Some(h) if !h.is_null() => interp.string_value(h).unwrap_or_default(),
+            _ => String::new(),
+        },
     }
 }

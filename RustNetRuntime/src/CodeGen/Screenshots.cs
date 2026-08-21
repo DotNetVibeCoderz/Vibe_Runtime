@@ -50,6 +50,7 @@ internal static class Screenshots
             new("codegen-chat.png", 1440, 900, () => MainWindowWith(sample, showChat: true, chatFocus: true)),
             new("codegen-new-project.png", 760, 560, () => new NewProjectWindow()),
             new("codegen-settings.png", 700, 640, () => new SettingsWindow(SampleSettings())),
+            new("codegen-devices.png", 1020, 680, DevicesWindowSample),
         };
 
         var written = 0;
@@ -95,6 +96,28 @@ internal static class Screenshots
         using var stream = File.Create(path);
         frame.Save(stream);
         window.Close();
+    }
+
+    /// <summary>
+    /// The Devices panel with its catalogue, but no scan.
+    ///
+    /// Deliberately unscanned: enumerating ports here would make the screenshot
+    /// depend on what happened to be plugged into the machine that rendered it,
+    /// and the panel's subject is the memory budget, which is the same
+    /// everywhere.
+    /// </summary>
+    private static Window DevicesWindowSample()
+    {
+        var runner = new ProcessRunner();
+        var projects = new ProjectService();
+        var model = new DevicesViewModel(
+            new DeviceService(runner),
+            new BuildService(projects, runner),
+            projects,
+            SampleSettings(),
+            _ => { });
+        var window = new DevicesWindow { DataContext = model };
+        return window;
     }
 
     private static Window MainWindowWith(string projectPath, bool showChat, bool chatFocus = false)

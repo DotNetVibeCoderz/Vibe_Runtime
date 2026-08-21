@@ -8,7 +8,7 @@ the assistant against a live LLM — produce byte-identical output on RustCLR an
 .NET.
 
 ```
-Conformance    IDENTICAL — checks=136 failures=0
+Conformance    IDENTICAL — checks=176 failures=0
 ModernSyntax   IDENTICAL — checks=35 failures=0
 UserDirectory  IDENTICAL
 PrimeSieve     IDENTICAL   (written by Jack from a prompt)
@@ -24,30 +24,200 @@ SensorGateway  IDENTICAL   (edited by Jack from a prompt)
 | `rustclr-metadata` | PE/COFF + ECMA-335 reader, signatures, IL bodies | 27 tests, incl. 9 against a real Roslyn-built assembly |
 | `rustclr-gc` | Handle-based heap, pluggable collectors, mark-sweep | 10 tests; 200k-deep graph marks without stack overflow |
 | `rustclr-core` | Type system, loader, IL interpreter, exception handling | 18 tests |
-| `rustclr-bcl` | Native BCL: Console, String, Math, interpolation, tuples, ranges, Nullable, generic collections, LINQ, Task and async, reflection | 20 unit + 8 integration; 766 bindings |
+| `rustclr-bcl` | Native BCL: Console, String, Math, interpolation, tuples, ranges, Nullable, generic collections, LINQ, Task and async, reflection | 20 unit + 8 integration; 821 bindings |
 | `rustclr-sched` | Lock-free MS queue, MPMC channel, thread pool | 16 tests |
 | `rustclr-interop` | P/Invoke, dynamic loading, marshalling | 9 tests; calls the real `GetCurrentProcessId` |
 | `rustclr-jit` | Compiler trait, IL verifier, analysis, **x86-64 code generator**, W^X pages, tiering | 25 unit + 3 differential |
 | `rustnet-cli` | `run` / `info` / `disasm` / `verify` / `build` / `capabilities` | Drives every fixture |
 
-### Five board firmwares, one demonstration
+### Seven board firmwares, one demonstration
 
 `embedded/demo-common` holds the on-chip report and each firmware supplies a
 `core::fmt::Write` to receive it. That refactor was the point of adding the
 fourth and fifth boards: "they all print the same thing" is only true if there
 is one copy of it, and four copies would have drifted.
 
-| Board | Core | Target | State |
-| --- | --- | --- | --- |
-| ESP32-WROOM-32 | Xtensa LX6 | `xtensa-esp32-none-elf` | run on hardware |
-| ESP32-C3 | RISC-V 32 | `riscv32imc-unknown-none-elf` | run on hardware |
-| Meadow F7 Micro | Arm Cortex-M7 | `thumbv7em-none-eabihf` | run on hardware |
-| Raspberry Pi Pico | Arm Cortex-M0+ | `thumbv6m-none-eabi` | builds; **not yet flashed** |
-| Sipeed Maix Go | RISC-V 64 | `riscv64gc-unknown-none-elf` | builds; **not yet flashed** |
+| Board | Core | Target | Tier | State |
+| --- | --- | --- | --- | --- |
+| ESP32-C3 | RISC-V 32 | `riscv32imc-unknown-none-elf` | full | **executes IL on hardware** |
+| ESP32-WROOM-32 | Xtensa LX6 | `xtensa-esp32-none-elf` | full | run on hardware (pre-interpreter) |
+| Meadow F7 Micro | Arm Cortex-M7 | `thumbv7em-none-eabihf` | full | run on hardware (pre-interpreter) |
+| Sipeed Maix Go | RISC-V 64 | `riscv64gc-unknown-none-elf` | full | builds; **not yet flashed** |
+| Netduino 3 WiFi | Arm Cortex-M4F | `thumbv7em-none-eabihf` | minimal | builds; **not yet flashed** |
+| Raspberry Pi Pico | Arm Cortex-M0+ | `thumbv6m-none-eabi` | minimal | builds; **not yet flashed** |
+| Nucleo-F401RE | Arm Cortex-M4F | `thumbv7em-none-eabihf` | **none** | builds; **not yet flashed** |
 
-`tests/firmware.sh` builds all five. That catches a class `tests/embedded.sh`
+`tests/firmware.sh` builds all seven. That catches a class `tests/embedded.sh`
 cannot: a change to a shared type breaks a board firmware long before it breaks
 the host build, and otherwise nobody notices until they reach for the hardware.
+
+### Reflection is finished, apart from loading
+
+`Assembly` and `Module` enumerate: `GetExecutingAssembly`, `GetEntryAssembly`,
+`GetTypes`, `GetType(name)`, `GetName`, `Type.Assembly`, `Type.Module`. Each is
+an object holding an assembly id, the same shape a `MethodInfo` uses for a
+method id — three types rather than one because `Type.Assembly` and
+`Type.Module` are distinct properties in C#, and returning the wrong one would
+compile and then misbehave.
+
+Two things the reference runtime settled rather than reasoning:
+
+* **`GetEntryAssembly` is not assembly 0.** Slot 0 is RustBCL's synthetic
+  assembly, so the first version reported `RustBCL` as the program's entry
+  assembly. It now finds the one with an entry point.
+* **`Module.Name` keeps the extension.** .NET answers `Conformance.dll` where
+  the assembly is `Conformance`. Both the test expectation and the
+  implementation were written the other way and a byte-for-byte comparison
+  caught it; the name now comes from the `Module` table rather than from the
+  assembly name plus a guessed suffix.
+
+**Parameter names came with it.** The `Param` table is separate from the
+signature — a signature carries types, and only that table carries what the
+author called them — so `MethodInfo` now stores them and `ParameterInfo.Name`
+reports the real one. A method with no rows there still answers `argN`, which
+says "not recorded" rather than inventing one.
+
+### Exception filters, and properties for reflection
+
+**`catch when` runs.** The obstacle was never the matching rule — it was that a
+filter is managed code executing *during* the unwind, before the frames below
+it are discarded, which is the whole reason `when` can see state a catch block
+would arrive too late to observe.
+
+A filter now gets a frame of its own, pushed onto the frame being unwound and
+sharing its method and arguments, with a copy of its locals. `endfilter` writes
+those locals back and returns the `int32` verdict through the same frame-floor
+mechanism a native-to-managed call uses — the mechanism that already existed for
+`ToString` called from a native.
+
+The write-back was not in the first version, and a test caught it.
+`catch (E e) when (Log(ref buffer))` came back with the log empty: the `ref`
+pointed into the filter's copy of the locals, so the append vanished and the
+filter looked as though it had never run. Five conformance checks cover filters
+now, including ordering across nested clauses and the spec's rule that a
+throwing filter *declines* rather than replacing the exception in flight.
+
+**Properties are materialised from metadata.** C# compiles `p.X` to a call to
+`get_X`, so nothing was needed to run a property — what was missing was knowing
+that `get_X` and `set_X` are two halves of one member, which is what
+`GetProperties()` has to answer. The loader now reads `PropertyMap` and
+`MethodSemantics` and interns a `PropertyInfo` per property.
+
+Reconstructed from those tables rather than guessed from method names, which
+matters twice: a method called `get_Total` is not necessarily an accessor, and a
+property whose accessors an obfuscator renamed still pairs correctly.
+
+`MethodBase.GetParameters()` came with it. A parameter has no id of its own — it
+is the *n*th entry of a signature — so a `ParameterInfo` carries the method id
+and the position packed into one word.
+
+**A one-line bug worth recording**: the first run reported position 0 and type
+`Object` for every parameter. `ParameterInfo` was not in the loader's list of
+pre-registered framework types, so `new_member` could not find the type to
+allocate and returned null for every entry. The array had the right length and
+nothing else.
+
+### CodeGen: boards, deploy, and a check that found four bugs
+
+**Devices** (`Ctrl+D`) lists the seven boards, scans for what is attached, and
+flashes firmware or a program. The panel is organised around the memory budget
+because that is what decides everything else: each board's heap is drawn on one
+scale against 192,045 and 260,702 bytes, so a tier reads as arithmetic. The
+Nucleo-F401RE's bar stopping 126,509 bytes short of the first mark is the entire
+explanation for why it cannot run C#.
+
+Two decisions there were deliberate rather than convenient:
+
+* **Scanning never touches a board.** It lists ports and probes. `Identify` is a
+  separate action because `espflash board-info` resets the part into its
+  bootloader, which should not be a side effect of opening a window.
+* **Ambiguity is reported.** A CH340 bridge looks identical whether an ESP32 or
+  a sewing machine is behind it, and a probe says nothing about what is on the
+  far end of SWD. Those read "possibly connected". The next step writes to
+  flash, and a confident wrong answer there is expensive.
+
+**Deploy needed the firmware to stop hard-coding its assembly.** These boards
+have no filesystem, so an application is not copied onto one — it is compiled
+into the image. Each firmware's `build.rs` now resolves `RUSTCLR_APP` and hands
+the path to `include_bytes!`, so `RUSTCLR_APP=MyApp.dll cargo build` embeds a
+different program without editing the crate. Verified by swapping a 4,608-byte
+assembly for an 11,264-byte one and watching the image grow.
+
+**Six embedded templates, written to the reduced binding set** — blink
+scheduler, ring-buffer logger, Modbus RTU frames, PID control, edge classifier,
+Morse beacon. They stay inside `Console`, `String`, `Math` and arrays, because a
+template that will not run on the board it was written for is worse than no
+template.
+
+**`--verify-templates` is the part worth keeping.** `RunsOnRustClr` was a
+property nothing checked, and the convention says templates carrying it must
+actually run there. The command scaffolds all 20 templates, builds them, runs
+them on both runtimes and diffs the output — board templates against
+`--bcl minimal`, since passing with all 821 bindings says nothing about a 192 KB
+board. It found four real things on its first run:
+
+1. **`Console.ReadLine()` hung the runner.** `ProcessRunner` redirected stdout
+   and stderr but left stdin inherited, so two templates waited forever on a
+   console nobody was typing at. Any child reading stdin would have wedged the
+   IDE the same way. Stdin is now redirected and closed at once, which is EOF.
+2. **`string + char` does not run.** .NET 10 lowers it to a span-based
+   `String.Concat`, and `Span<T>` is unimplemented — so `text += "0123ABC"[i]`
+   fails at *every* tier, not just the reduced one. Three of my own templates
+   did it. Fixed in the templates, and documented there, because the runtime gap
+   is the documented kind.
+3. **`char.ToUpperInvariant` was missing** while `ToUpper` sat registered beside
+   it. Added, along with `ToLowerInvariant`.
+4. **`"a b".Split(' ')` failed.** It looks like a one-argument call and is not:
+   C# resolves it to `Split(char, StringSplitOptions)`, whose typed key carries
+   a token that means nothing outside the calling assembly. `Split/1`, `/2` and
+   `/3` now bind through arity, the same fix `Join/2` needed earlier.
+
+**And a formatting bug worth its own note.** `console-numerics` printed a
+solver's residual as `0.000000000291990431…` where .NET prints
+`2.9199043183325557E-10`. .NET switches to scientific notation outside a band
+and Rust never does. The first fix guessed the band as `[-4, 15)` and `1e15`
+disagreed; reading the boundaries off the reference runtime gave `[-4, 17)` for
+double and `[-4, 9)` for float. Eight conformance checks cover it now — the
+fixture is at 144.
+
+Neither of the two boards this was built against was connected, so Deploy and
+Flash are exercised only as far as building the image. Scanning, tier reporting
+and the minimal-BCL pre-check run without hardware.
+
+### The two STM32F4 boards bracket the memory question
+
+`embedded/stm32f4` builds for a **Nucleo-F401RE** and a **Netduino 3 WiFi** from
+one source file. They were not added for another Cortex-M — they were added
+because they sit either side of the line the interpreter draws.
+
+**The F427VI runs a program only after its memories swap roles.** The part
+advertises 256 KB in two pieces that are not adjacent: 192 KB of DMA-reachable
+SRAM at `0x20000000`, and 64 KB of CCM at `0x10000000` that the core reaches but
+DMA cannot. Handing the allocator only the SRAM leaves 192 KB minus `.data`,
+`.bss` and the stack, against a 192,045-byte floor — so a few kilobytes of
+statics decides whether the board runs C#. `memory-f427vi.x` therefore names
+**CCM as `RAM`**, which is what moves `.data`, `.bss` and the stack there
+(`cortex-m-rt`'s `link.x` hardcodes `> RAM`), and gives the whole SRAM to the
+heap through its own `(NOLOAD)` section. The heap could not be an ordinary
+`static`: `.bss` is in CCM now, and a `static` would follow it there. Verified
+by reading the linked ELF rather than by assertion — `.data` at `0x10000000`,
+`.sram_heap` 196,608 bytes at `0x20000000`, `_stack_start` at `0x10010000`.
+That clears the floor by 4,563 bytes, which is thin enough to re-measure if
+RustBCL grows.
+
+**The F401RE is the first board that cannot run one at all.** 96 KB against a
+192,045-byte floor is not close, so the firmware prints the shortfall and
+carries on with the metadata reader and the collector.
+
+**An unplanned result worth recording: it does not pay flash for what it cannot
+use.** `Tier::for_budget` is a `const fn` and `HEAP_BYTES` is a constant, so LTO
+folds the decision, finds the `Full` and `Minimal` arms unreachable, and strips
+the loader and all 821 native bindings. `.text` is 21 KB on the F401RE against
+282 KB on the F427VI, from the same source file. That fell out of making the
+tier a constant expression rather than a runtime check — worth knowing, because
+it means adding a board below the threshold costs nothing but its own bring-up.
+
+Neither board was connected, so both rows are builds.
 
 **Two facts worth not rediscovering**, both taken from the sibling RustNet ports
 rather than worked out again. The RP2040's ROM checks a CRC over the first 256
@@ -115,7 +285,7 @@ reached only `lib.rs`, and `Image` was gated on `std` in its entirety when only
 ### The interpreter runs on the chip
 
 **C# executes on an ESP32-C3** — RISC-V, 400 KB of SRAM, no operating system.
-The loader builds a type registry, RustBCL registers all 766 of its native
+The loader builds a type registry, RustBCL registers all 821 of its native
 bindings, and `HelloWorld.Main` prints the same three lines `dotnet` prints,
 CRLF included, with the same 68 IL instructions and 6 calls:
 [docs/logs/esp32c3-interpreter.log](docs/logs/esp32c3-interpreter.log).
@@ -452,15 +622,27 @@ Ordered as in [Plan.md](Plan.md):
    the next piece. The AArch64 and RISC-V backends emit and disassemble
    correctly but **have never executed a single instruction** — running them
    needs hardware this host is not.
-4. **Reflection breadth** — `PropertyInfo` accessors, `MethodInfo` parameter
-   lists, `Assembly`/`Module` enumeration, and constructing generic types at run
-   time. Types, members, invocation and attributes all work.
+4. **Reflection breadth** — only two gaps left, and both are about *loading*
+   rather than inspecting: `Assembly.Load` needs a search path and a resolver,
+   and constructing a generic type at run time is blocked by erasure. Types,
+   members, properties, parameters and their names, assemblies, modules,
+   invocation and attributes all work.
 5. **IL execution on more hardware** — an ESP32-C3 runs the interpreter with
-   the whole of RustBCL. The other four board images build but have not been
-   flashed since; the Pico clears only the reduced binding set, and no board
-   was connected for it or the K210. Ahead-of-time compilation additionally
-   needs the Arm and RISC-V backends to actually execute.
-6. **Exception filters** — `catch when` is treated as non-matching.
+   the whole of RustBCL. The other six board images build but have not been
+   flashed since; the Pico and the Netduino clear only the reduced binding set,
+   the Nucleo-F401RE clears neither, and no board was connected for any of
+   them. Ahead-of-time compilation additionally needs the Arm and RISC-V
+   backends to actually execute.
+6. **`Span<T>`** — not implemented as a type. Slicing, indexing and `stackalloc`
+   still refuse, and the `span` probe in the advanced-feature matrix still
+   fails. What *does* work is the string-building path: `string + char` lowers
+   through `ReadOnlySpan<char>` on .NET 10, so three BCL members are
+   implemented for it and a span over characters is represented by the string
+   it stands for. That is a representation for one path, not a span — and the
+   members that would expose the difference are deliberately unregistered.
+7. **The remaining IL** — `localloc`, `cpblk`, `initblk`, `calli`, `arglist`,
+   and multi-dimensional arrays with non-zero lower bounds. Exception filters
+   were the other half of this milestone and now work.
 
 `rustnet capabilities` prints this from the runtime itself, and
 `rustnet verify <assembly>` names what a specific program would hit.

@@ -35,8 +35,10 @@ use esp_hal::main;
 
 
 /// The assembly to read, compiled by Roslyn for `net10.0` and linked into
-/// flash. 4,608 bytes — small enough that the whole image sits in the binary.
-static HELLO_WORLD: &[u8] = include_bytes!("HelloWorld.dll");
+/// flash. `HelloWorld.dll` by default — 4,608 bytes, small enough that the
+/// whole image sits in the binary — or whatever `RUSTCLR_APP` named at
+/// build time. See `build.rs`.
+static HELLO_WORLD: &[u8] = include_bytes!(env!("RUSTCLR_APP_PATH"));
 
 // The ESP-IDF second-stage bootloader reads a descriptor out of the image
 // header — version, project name, build time — and refuses an image without
@@ -60,7 +62,7 @@ const BOARD: &str = "ESP32-C3 (RISC-V)";
 /// | --- | ---: |
 /// | loader, 202 pre-registered framework types | 127 K |
 /// | managed heap, 512 slots at 41 bytes | 21 K |
-/// | RustBCL, 766 native bindings | 106 K |
+/// | RustBCL, 821 native bindings | 106 K |
 /// | loading and running `HelloWorld` | 6 K |
 /// | **peak** | **260,702** |
 ///
