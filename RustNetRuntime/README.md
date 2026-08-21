@@ -24,10 +24,10 @@ handling — produces identical output on both runtimes:
 
 ```console
 $ dotnet Conformance.dll
-checks=176 failures=0
+checks=285 failures=0
 
 $ rustnet run Conformance.dll --stats
-checks=176 failures=0
+checks=285 failures=0
 
 ─── execution ──────────────────────────────
   wall clock                  10.505 ms
@@ -49,7 +49,7 @@ divide-by-zero, delegates, and allocation under collection pressure. A second
 suite, `tests/fixtures/ModernSyntax/`, does the same for 35 modern C# features.
 Both are normal C# projects you can read and extend.
 
-`cargo test --workspace` runs 163 tests across the eight crates.
+`cargo test --workspace` runs 175 tests across the eight crates.
 
 ---
 
@@ -325,8 +325,18 @@ of which **2.9× is the inliner alone** — with `--no-inline` the same run take
 1,148 ms because the method around the helpers stays interpreted. Only
 branch-free static callees are spliced, one level deep.
 
+**Arrays compile too, on one condition: they must arrive as a parameter.** An
+`int[]` argument is handed to compiled code as a data pointer and a length, so
+`a[i]` becomes a bounds check and a scaled-index load rather than a handle
+lookup. The `arrays` benchmark runs **89.8× faster** compiled — 18,401 ms
+against 205 ms, the largest gap in the suite. An array created *inside* the
+method is still declined, because `new int[n]` allocates and "this method
+allocates nothing" is the invariant that makes holding a pointer into the heap
+sound for the length of a call.
+
 The reach is still narrow and `rustnet jit <assembly>` says exactly how narrow:
-anything using arrays, allocation or exception handling is interpreted.
+allocation, exception handling, floating point and object field access are all
+interpreted.
 `rustnet run --no-jit` interprets everything and `rustnet run --no-inline`
 compiles without splicing; both must print the same bytes — there are
 differential tests that assert it.
@@ -336,9 +346,9 @@ the same IL through the same shared translation as x86-64 and are checked by
 disassembling their output, but no compiled method has ever run on either. Only
 x86-64 is dispatched to at runtime.
 
-**Advanced C# features.** 13 of 21 probed features produce identical output on
+**Advanced C# features.** 21 of 21 probed features produce identical output on
 both runtimes: garbage collection, `IDisposable`/`using`, `async`/`await`,
-threading with `lock` and `Interlocked` (both serialised — see below), primary
+real threading with `lock` and `Interlocked`, primary
 constructors, collection expressions over arrays, extension members, P/Invoke,
 pattern matching, records, LINQ, source generators and interceptors.
 
@@ -354,12 +364,15 @@ The full matrix, with why each row lands where it does:
 
 **Does not work yet.** Nothing runs concurrently: `async` tasks and `Thread`
 bodies both execute inline, so results are right but there is no parallelism.
-Generic type *arguments* are erased, so user generic code that reads `T` at run
-time — `typeof(T)`, `is T`, a static field per instantiation — does not behave
-correctly, and custom comparers are ignored. The native code generator takes only
-integer methods — 11.0× faster where it applies, and inlining lets it accept
-calls to small helpers, but it declines anything using arrays, which is most of
-a real program.
+Generic type arguments are known for user types and methods — `typeof(T)`,
+`x is T`, `default(T)` and a static field per construction all behave correctly.
+Framework generics stay erased by choice: `List<int>` and `List<string>` are one
+runtime type, because every native binding is keyed by its declaring type's
+name. A class type parameter in a *static* method still refuses, having no
+receiver to ask. The native code generator takes integer methods and `int[]`
+parameters — 11.0× faster on arithmetic and 89.8× on an array walk — but it
+declines allocation, which includes creating an array inside the method, and
+that covers a great deal of a real program.
 
 `rustnet capabilities` prints this list from the runtime itself, so it cannot
 drift from reality. Detail: [docs/limitations.md](docs/limitations.md).
@@ -376,7 +389,7 @@ The **whole runtime builds without `std`** — `rustclr-metadata`, `rustclr-gc`,
 combinations.
 
 **C# runs on a microcontroller.** On an ESP32-C3 — RISC-V, 400 KB of SRAM, no
-operating system — the loader builds a type registry, RustBCL registers all 821
+operating system — the loader builds a type registry, RustBCL registers all 836
 of its native bindings, and the interpreter executes `HelloWorld.Main`:
 
 ```
@@ -393,6 +406,10 @@ Hello from RustCLR
 il executed      68
 calls            6
 ```
+
+That capture is from the last time the board was attached; RustBCL has since
+grown to 836 bindings. The count in the excerpt is what the chip actually
+printed, not what a rebuild would print today.
 
 Those three lines are byte-identical to what `dotnet HelloWorld.dll` prints on
 a desktop, CRLF included, and so are the counters — 68 IL instructions and 6
@@ -416,7 +433,8 @@ allocator.
 | Board | Core | RAM | Tier | State |
 | --- | --- | ---: | --- | --- |
 | [ESP32-C3](embedded/esp32-demo) | RISC-V 32 | 400 K | full | **executes IL on hardware** |
-| [ESP32-WROOM-32](embedded/esp32-demo) | Xtensa LX6 | 520 K | full | builds; last flashed pre-interpreter |
+| [M5Stack Tough](embedded/esp32-demo) | Xtensa LX6 | 520 K | full | **executes IL on hardware** |
+| [ESP32-WROOM-32](embedded/esp32-demo) | Xtensa LX6 | 520 K | full | same image; last flashed pre-interpreter |
 | [Meadow F7](embedded/meadow-f7) | Cortex-M7 | 384 K | full | builds; last flashed pre-interpreter |
 | [Maix Go K210](embedded/k210) | RISC-V 64 | 6 M | full | builds; never flashed — no board |
 | [Netduino 3 WiFi](embedded/stm32f4) | Cortex-M4F | 256 K | minimal | builds; never flashed — no board |
@@ -429,8 +447,10 @@ them — and its image is 21 KB rather than 282 KB, because LTO strips an
 interpreter the constant says can never be reached.
 
 All seven share one demonstration ([embedded/demo-common](embedded/demo-common))
-and `bash tests/firmware.sh` builds them. Only the first row has run on
-hardware since the interpreter landed; earlier metadata-and-GC captures:
+and `bash tests/firmware.sh` builds them. **Two architectures have run the
+interpreter on hardware** — RISC-V 32 and Xtensa LX6, from the same source
+file: [ESP32-C3](docs/logs/esp32c3-interpreter.log) ·
+[M5Stack Tough](docs/logs/m5stack-tough.log). Earlier metadata-and-GC captures:
 [Xtensa](docs/logs/esp32-wroom32.log) · [RISC-V](docs/logs/esp32c3.log) ·
 [Arm](docs/logs/meadow-f7.log).
 

@@ -139,35 +139,31 @@ fn append_formatted(interp: &mut Interpreter, args: &[Value]) -> ExecResult<Opti
 fn to_string_and_clear(interp: &mut Interpreter, args: &[Value]) -> ExecResult<Option<Value>> {
     let handle = load_handle(interp, args)?;
     let units = interp
-        .heap
-        .get_as::<ClrString>(handle)
-        .map(|s| s.units.clone())
+        .heap.with::<ClrString, _>(handle, |s| s.units.clone())
         .unwrap_or_default();
 
     // The result must be an independent string: the handler is cleared and its
     // storage reused by the next interpolation in the same method.
     let result = interp.alloc_clr_string(ClrString { units });
-    if let Some(accumulator) = interp.heap.get_as_mut::<ClrString>(handle) {
+    interp.heap.with_mut::<ClrString, _>(handle, |accumulator| {
         accumulator.units.clear();
-    }
+    });
     Ok(Some(Value::Obj(result)))
 }
 
 fn to_string(interp: &mut Interpreter, args: &[Value]) -> ExecResult<Option<Value>> {
     let handle = load_handle(interp, args)?;
     let units = interp
-        .heap
-        .get_as::<ClrString>(handle)
-        .map(|s| s.units.clone())
+        .heap.with::<ClrString, _>(handle, |s| s.units.clone())
         .unwrap_or_default();
     Ok(Some(Value::Obj(interp.alloc_clr_string(ClrString { units }))))
 }
 
 fn clear(interp: &mut Interpreter, args: &[Value]) -> ExecResult<Option<Value>> {
     let handle = load_handle(interp, args)?;
-    if let Some(accumulator) = interp.heap.get_as_mut::<ClrString>(handle) {
+    interp.heap.with_mut::<ClrString, _>(handle, |accumulator| {
         accumulator.units.clear();
-    }
+    });
     Ok(None)
 }
 
@@ -205,11 +201,12 @@ fn load_handle(interp: &mut Interpreter, args: &[Value]) -> ExecResult<Handle> {
 fn append(interp: &mut Interpreter, args: &[Value], text: &str) -> ExecResult<()> {
     let handle = load_handle(interp, args)?;
     let addition: Vec<u16> = text.encode_utf16().collect();
-    match interp.heap.get_as_mut::<ClrString>(handle) {
-        Some(accumulator) => {
-            accumulator.units.extend_from_slice(&addition);
-            Ok(())
-        }
+    match interp
+        .heap
+        .with_mut::<ClrString, _>(handle, |accumulator| {
+            accumulator.units.extend_from_slice(&addition)
+        }) {
+        Some(()) => Ok(()),
         None => Err(ExecutionError::InvalidProgram(
             "the interpolated string handler's buffer was collected".into(),
         )),

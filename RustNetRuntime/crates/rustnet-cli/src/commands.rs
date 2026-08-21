@@ -18,7 +18,7 @@ fn runtime(args: Vec<String>) -> Interpreter {
 /// The runtime, with either the whole BCL or the subset a small board can hold.
 ///
 /// `minimal` is not a smaller *runtime* — the loader and interpreter are
-/// identical. It registers 314 native bindings instead of 821, which is what a
+/// identical. It registers 314 native bindings instead of 826, which is what a
 /// board with 192 KB of RAM can afford. Running a program this way on a desktop
 /// is how to find out it calls `List<T>` before flashing it to something that
 /// cannot answer.
@@ -108,8 +108,11 @@ fn report_failure(interp: &Interpreter, error: &ExecutionError) {
     eprintln!("\nUnhandled exception. {error}");
 
     if let ExecutionError::Exception { object, .. } = error {
-        if let Some(e) = interp.heap.get_as::<rustclr_core::ClrException>(*object) {
-            for frame in &e.stack_trace {
+        let trace = interp
+            .heap
+            .with::<rustclr_core::ClrException, _>(*object, |e| e.stack_trace.clone());
+        if let Some(frames) = trace {
+            for frame in &frames {
                 eprintln!("{frame}");
             }
             return;
@@ -398,8 +401,17 @@ fn describe_decline(interp: &Interpreter, method: rustclr_core::MethodId) -> Str
     if !info.returns_void() && !is_integer_sig(&info.signature.return_type) {
         return "returns a non-integer type".into();
     }
-    if let Some(i) = info.signature.params.iter().position(|p| !is_integer_sig(p)) {
-        return format!("parameter {i} is not an integer");
+    // An `int[]` parameter is accepted — the backend takes arrays that arrive
+    // as arguments. This explanation used to test integers only and reported
+    // "parameter 0 is not an integer" for a method the backend declined for a
+    // different reason entirely, which is worse than no explanation.
+    if let Some(i) = info
+        .signature
+        .params
+        .iter()
+        .position(|p| !is_integer_sig(p) && !rustclr_jit::translate::is_int_array(p))
+    {
+        return format!("parameter {i} is neither an integer nor an int[]");
     }
     if let Some(i) = body.locals.iter().position(|l| !is_integer_sig(l)) {
         return format!("local {i} is not an integer");
@@ -408,7 +420,10 @@ fn describe_decline(interp: &Interpreter, method: rustclr_core::MethodId) -> Str
         Ok(instructions) => {
             let mut unsupported: Vec<String> = instructions
                 .iter()
-                .filter(|i| !rustclr_jit::x64::is_supported(i.op))
+                .filter(|i| {
+                    !rustclr_jit::x64::is_supported(i.op)
+                        && !rustclr_jit::translate::is_array_op(i.op)
+                })
                 .map(|i| i.op.name().to_string())
                 .collect();
             unsupported.sort();
@@ -573,12 +588,19 @@ pub fn capabilities() -> Result<i32> {
     println!("RustCLR runtime capabilities\n");
     println!("Execution");
     println!("  IL interpreter               yes");
-    println!("  native JIT backend           x86-64, INTEGER METHODS ONLY:");
+    println!("  native JIT backend           x86-64, INTEGER METHODS AND int[]:");
     println!("                               integer arithmetic, comparison, branching,");
-    println!("                               arguments and locals. No allocation, exception");
-    println!("                               handling, floating point or object access.");
+    println!("                               arguments, locals, and element access on an");
+    println!("                               int[] that arrives as a PARAMETER. No");
+    println!("                               allocation, so an array created inside the");
+    println!("                               method is declined; no exception handling,");
+    println!("                               floating point or object access.");
     println!("                               Everything else is interpreted, and");
     println!("                               `rustnet jit <assembly>` says which is which.");
+    println!("  array bounds                 checked. Compiled code cannot throw, so a");
+    println!("                               failure flags and returns and the tier raises");
+    println!("                               IndexOutOfRangeException; stores already made");
+    println!("                               stay made, as on .NET.");
     println!("  code memory                  write-xor-execute; never both at once");
     println!("  tiering                      compile after 32 calls; --no-jit disables");
     println!("  inlining                     yes - branch-free static callees, one level");
@@ -598,7 +620,34 @@ pub fn capabilities() -> Result<i32> {
     println!("  virtual and interface calls  yes");
     println!("  value types, enums           yes");
     println!("  delegates                    yes (unicast and multicast)");
-    println!("  generics                     erased to object");
+    println!("  generic types                USER types get one runtime type per closed");
+    println!("                               construction: Cell<int> and Cell<string> are");
+    println!("                               two types, each with its own type arguments");
+    println!("                               and its own static slots. A class type");
+    println!("                               parameter is answered through the receiver.");
+    println!("                               Framework generics stay erased by choice -");
+    println!("                               native bindings are keyed by declaring type");
+    println!("                               name, and List<int> having its own name would");
+    println!("                               put List`1::Add out of reach.");
+    println!("                               A class parameter in a STATIC method also");
+    println!("                               answers: there is no receiver, so the frame");
+    println!("                               carries the construction the CALL SITE named.");
+    println!("                               A call site naming the open definition still");
+    println!("                               refuses - nothing there knows the argument.");
+    println!("  generic methods              type arguments ARE known: typeof(T),");
+    println!("                               default(T) and `x is T` all answer inside");
+    println!("                               M<T>, because each call site\'s MethodSpec");
+    println!("                               carries the arguments and the instantiation");
+    println!("                               records them.");
+    println!("  custom comparers             yes - List<T>.Sort takes a Comparison<T>");
+    println!("                               lambda or an IComparer<T>, and calls back");
+    println!("                               into managed code for each comparison.");
+    println!("                               The sort is a stable merge sort, where");
+    println!("                               .NET's List<T>.Sort is an unstable");
+    println!("                               introsort - equal elements can end up in a");
+    println!("                               different order there, which .NET does not");
+    println!("                               promise either way. OrderBy is stable on");
+    println!("                               both and agrees exactly.");
     println!("  generic methods              instantiations bind by type argument");
     println!("  reflection                   System.Type is a real object:");
     println!("                               name, namespace, base type, IsValueType and");
@@ -613,10 +662,23 @@ pub fn capabilities() -> Result<i32> {
     println!("                               Assembly and Module: GetExecutingAssembly,");
     println!("                               GetEntryAssembly, GetTypes, GetType(name),");
     println!("                               GetName, Type.Assembly and Type.Module.");
-    println!("                               Assembly.Load is NOT here: it needs a search");
-    println!("                               path, and a chip has no filesystem.");
-    println!("                               Constructing a generic type at run time is");
-    println!("                               blocked by erasure, not by reflection.");
+    println!("                               Assembly.Load works on a host and RESOLVES");
+    println!("                               DIFFERENTLY from .NET: it probes beside the");
+    println!("                               loaded assemblies and the search paths, where");
+    println!("                               .NET reads deps.json and the load context. A");
+    println!("                               referenced assembly behaves identically; an");
+    println!("                               unreferenced DLL beside the app loads here and");
+    println!("                               does not on .NET. Without std it refuses.");
+    println!("                               MakeGenericType WORKS, and returns the same");
+    println!("                               instance as typeof: it calls the loader path a");
+    println!("                               TypeSpec calls and shares its cache. So do");
+    println!("                               IsGenericType, IsGenericTypeDefinition,");
+    println!("                               ContainsGenericParameters and");
+    println!("                               GetGenericTypeDefinition.");
+    println!("                               GetGenericArguments on an OPEN definition is");
+    println!("                               REFUSED: .NET returns the parameter T and this");
+    println!("                               runtime records only a definition's arity, so");
+    println!("                               an empty array would quietly disagree.");
     println!("                               typeof(T) on a generic parameter is REFUSED:");
     println!("                               the argument was erased, so there is no type");
     println!("                               to name and a guess would look plausible.");
@@ -652,43 +714,124 @@ Collections and LINQ");
     println!("  generic collections, LINQ    yes - see below");
 
     println!("\nAsync and threading");
-    println!("  async / await                yes, but SYNCHRONOUS:");
-    println!("                               a task runs to completion where it is");
-    println!("                               created, so results, ordering and exception");
-    println!("                               propagation are correct but nothing ever");
-    println!("                               overlaps. Code relying on two tasks");
-    println!("                               interleaving will not interleave.");
+    println!("  async / await                yes, and await SUSPENDS. An async method");
+    println!("                               awaiting a pending task copies its state");
+    println!("                               machine to the heap, queues it on that");
+    println!("                               task and returns; the thread that");
+    println!("                               completes the task resumes it.");
+    println!("                               Where work STARTS is what decides whether");
+    println!("                               it overlaps: two Task.Run started and then");
+    println!("                               awaited run at once; awaiting in a loop is");
+    println!("                               sequential, as it is on .NET.");
+    println!("                               Task.Run and Parallel.* run on a POOL of one");
+    println!("                               worker per core; Task.Delay arms a timer.");
+    println!("                               A thread waiting on a task runs queued work");
+    println!("                               rather than idling, so a task awaiting a");
+    println!("                               task cannot deadlock the pool.");
+    println!("                               Thread.Start still gets its own thread.");
     println!("  Task, Task<T>, WhenAll       yes");
     println!("  TaskCompletionSource         yes - a real suspend and resume");
-    println!("  Task Parallel Library        no - Parallel.For is unimplemented");
-    println!("  Thread, lock, Interlocked    yes, but SERIALISED:");
-    println!("                               Thread.Start runs the body on the calling");
-    println!("                               thread, and Join returns at once. Correct");
-    println!("                               for start-then-join; a program that needs");
-    println!("                               two threads to progress together will hang.");
+    println!("  Task Parallel Library        yes - see Parallel.* below");
+    println!("  Thread, lock, Interlocked    yes - REAL THREADS. Thread.Start spawns an");
+    println!("                               OS thread and Join waits for it. lock");
+    println!("                               genuinely excludes; Interlocked does not");
+    println!("                               lose updates. A thread started later can");
+    println!("                               unblock one already waiting.");
+    println!("                               A spawned thread shares the heap, static");
+    println!("                               storage and the bindings, and gets its own");
+    println!("                               frames and an identical COPY of the loader -");
+    println!("                               which is why no lock sits on the path that");
+    println!("                               runs every instruction.");
+    println!("                               Task.Run and Parallel.* spawn too.");
 
     println!("\nMemory and resources");
     println!("  IDisposable, using           yes");
-    println!("  IAsyncDisposable             no - await using is unimplemented");
-    println!("  Span<T>, Memory<T>           no - generic ref structs. Slicing,");
-    println!("                               indexing and stackalloc all refuse.");
-    println!("                               ONE PATH IS IMPLEMENTED: `string + char`");
-    println!("                               lowers through ReadOnlySpan<char> on");
-    println!("                               .NET 10, so op_Implicit, the one-element");
-    println!("                               ctor and Concat over spans exist and a");
-    println!("                               span over chars is the string it stands");
-    println!("                               for. That is a representation for string");
-    println!("                               building, not a span type.");
-    println!("  stackalloc, unsafe pointers  no - localloc is unimplemented, and managed");
-    println!("                               references here are structural, not addresses");
+    println!("  IAsyncDisposable             yes - await using works, with ValueTask");
+    println!("                               underneath. Disposal runs after the body.");
+    println!("  IAsyncEnumerable, await      yes - an async iterator runs, including");
+    println!("  foreach                      yield break, an empty sequence, and break");
+    println!("                               out of the loop. Still no overlap: the body");
+    println!("                               runs to the next yield before MoveNextAsync");
+    println!("                               returns, so the sequence is produced eagerly");
+    println!("                               one element at a time rather than awaited.");
+    println!("  Span<T>, Memory<T>           yes - over an array, a string, or");
+    println!("                               stackalloc memory. Length, IsEmpty,");
+    println!("                               indexing, Slice, CopyTo, ToArray, foreach,");
+    println!("                               AsSpan, AsMemory and Memory<T>.Span.");
+    println!("                               Indexing yields a REFERENCE, so a write");
+    println!("                               through a span reaches what it is over.");
+    println!("                               Both collection-expression forms work:");
+    println!("                               [..xs, 4] and ReadOnlySpan<char> x =");
+    println!("                               ['a','b'], the latter via CreateSpan.");
+    println!("                               For raw memory the element width comes");
+    println!("                               from the CALL SITE - framework generics");
+    println!("                               are erased, but the TypeSpec still names");
+    println!("                               its arguments.");
+    println!("                               REFUSED: slicing a span that STANDS FOR a");
+    println!("                               string - the string is the whole");
+    println!("                               representation and has no offset in it.");
+    println!("  Task.WaitAll(a, b) in C#     yes - .NET 10 lowers it through an");
+    println!("                               InlineArray2<Task> and a ReadOnlySpan,");
+    println!("                               and both are implemented. It still says");
+    println!("                               NOTHING about concurrency: both tasks ran");
+    println!("                               to completion before WaitAll saw them.");
+    println!("  Unsafe.As / Unsafe.Add       yes - a managed reference here is a path");
+    println!("                               to a slot, so As keeps the path and Add");
+    println!("                               walks it to the nth element or field.");
+    println!("  MemoryMarshal.CreateSpan     yes, but it COPIES rather than making a");
+    println!("                               view onto the caller's storage. Nothing");
+    println!("                               that reaches it can observe the");
+    println!("                               difference; a genuine view is not served.");
+    println!("  Marshal (blittable structs)  yes - SizeOf<T>, AllocHGlobal, FreeHGlobal,");
+    println!("                               StructureToPtr and PtrToStructure<T> for a");
+    println!("                               struct of primitive fields; widths survive.");
+    println!("                               AllocHGlobal uses the MANAGED heap, so");
+    println!("                               FreeHGlobal is a no-op and the pointer");
+    println!("                               cannot be handed to native code.");
+    println!("                               A struct with a reference field is refused:");
+    println!("                               its field is a handle, not bytes.");
+    println!("  stackalloc, unsafe pointers  yes - stackalloc, fixed, arithmetic,");
+    println!("                               comparison and dereference all run, and so");
+    println!("                               do cpblk and initblk.");
+    println!("                               A POINTER IS NOT AN ADDRESS: it is a buffer");
+    println!("                               on the managed heap plus a byte offset, so");
+    println!("                               it cannot name memory the runtime does not");
+    println!("                               own, and it roots its buffer. The access");
+    println!("                               width comes from the instruction, not the");
+    println!("                               pointer.");
+    println!("                               REFUSED: an unaligned pointer, a pointer");
+    println!("                               into an array of references, cpblk between");
+    println!("                               anything but byte buffers, and Span<T> over");
+    println!("                               stackalloc - its element width lives in T.");
 
     println!("\nCompile-time features");
     println!("  source generators            yes - the runtime only ever sees the IL");
     println!("  interceptors                 yes - same reason");
     println!("\nExceptions");
     println!("  try / catch / finally        yes");
+    println!("  Parallel.For/ForEach/Invoke  yes, REAL - one thread per core, capped by");
+    println!("                               the iteration count, contiguous chunks.");
+    println!("                               Iteration ORDER IS NOT PRESERVED, which is");
+    println!("                               the contract a parallel loop already has.");
+    println!("  Task.Run                     yes, REAL - starts the delegate on another");
+    println!("                               thread. Result, Wait, WaitAll and an");
+    println!("                               awaiter all wait for it first.");
+    println!("  Task.WaitAll from C#         yes, and it genuinely waits. .NET 10 lowers");
+    println!("                               it through an InlineArray2<Task> and a");
+    println!("                               ReadOnlySpan, so it reads a span as well as");
+    println!("                               an array.");
     println!("  exception filters            yes - `catch when` runs mid-unwind;");
     println!("                               a throwing filter declines");
+    println!("  calli                        yes - a function pointer names a method");
+    println!("                               rather than an address, so an indirect call");
+    println!("                               needs no code map. It does not survive being");
+    println!("                               stored in integer-shaped storage such as a");
+    println!("                               delegate*[] element; that refuses with a");
+    println!("                               message saying why.");
+    println!("  localloc, cpblk, initblk     no - they address byte ranges, and a managed");
+    println!("                               pointer here is a path to a slot rather than");
+    println!("                               an address. Needs a raw-pointer value kind.");
+    println!("  arglist                      no - varargs");
     println!("\nInterop");
     println!("  P/Invoke                     yes, up to {} arguments", rustclr_interop::MAX_PINVOKE_ARGS);
     println!("  string marshalling           UTF-8 only");
@@ -707,8 +850,10 @@ Collections and LINQ");
     println!("                               Only the filesystem stayed std-only, so");
     println!("                               load_from_file is gated and bytes are not.");
     println!("  fixed-size heap              yes - Heap::embedded(n) is a hard ceiling");
-    println!("  IL EXECUTION ON A CHIP       yes - verified on an ESP32-C3 (RISC-V,");
-    println!("                               400 KB SRAM, no OS). Loader, interpreter and");
+    println!("  IL EXECUTION ON A CHIP       yes - verified on TWO architectures from one");
+    println!("                               source: an ESP32-C3 (RISC-V 32) and an");
+    println!("                               M5Stack Tough (Xtensa LX6), both with no OS.");
+    println!("                               Loader, interpreter and");
     println!("                               all {} native bindings; HelloWorld.Main", interp.native_count());
     println!("                               printed the same bytes dotnet prints, with");
     println!("                               the same instruction and call counts.");
@@ -731,12 +876,16 @@ Collections and LINQ");
     println!("                               of .text against 282 KB for the same source");
     println!("                               on the F427VI: the tier is a const fn over a");
     println!("                               constant, so LTO strips what cannot run.");
-    println!("  run on real hardware         ESP32-C3 executes IL. The Xtensa and");
-    println!("                               Cortex-M7 boards were last flashed before");
-    println!("                               the interpreter landed, so their captures");
-    println!("                               show metadata and GC only. The K210, both");
-    println!("                               STM32F4 boards and the Pico build but were");
-    println!("                               never flashed - no board was connected.");
+    println!("  run on real hardware         ESP32-C3 (RISC-V) and M5Stack Tough (Xtensa)");
+    println!("                               both execute IL. The Xtensa board needs two");
+    println!("                               heap regions to fit the full binding set:");
+    println!("                               176 KB of dram_seg plus the 96 KB bank past");
+    println!("                               the ROM data, 278,528 against 260,702 needed.");
+    println!("                               The WROOM-32 and Meadow F7 were last flashed");
+    println!("                               before the interpreter landed, so their");
+    println!("                               captures show metadata and GC only. The K210,");
+    println!("                               both STM32F4 boards and the Pico build but");
+    println!("                               were never flashed - no board was connected.");
     println!("                               Captured runs: docs/logs/.");
 
     println!("\nArchitectures recognised in PE headers");

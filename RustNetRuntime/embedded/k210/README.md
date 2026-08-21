@@ -11,8 +11,53 @@ so it is the one board of the seven with room to spare: it gets the full set of
 RustBCL bindings without anything being trimmed. See
 [docs/limitations.md](../../docs/limitations.md).
 
-**Status: built, not yet flashed.** No K210 was connected when this was
-written. The image builds; the run is the step outstanding.
+**Status: builds; boots from SRAM on a HuskyLens, but prints nothing there.**
+
+A Sipeed **HuskyLens** — a K210 vision module — was tried on 2026-08-21. The
+useful finding is about *how* to try one safely:
+
+**`kflash -s` boots from SRAM and never touches flash.** The K210 has no
+internal flash, so its firmware lives on an external SPI part, and on a
+commercial module that part holds the product's own firmware. `--sram` loads
+into RAM and jumps there; a power cycle brings the product back. The HuskyLens
+was booted this way several times and its firmware — camera bring-up, UI, face
+recognition — returned intact each time. Nothing was erased.
+
+```bash
+kflash -p COM<n> -b 1500000 -s fw.bin     # SRAM only; flash untouched
+```
+
+**What did not work, and what was ruled out.** The ISP handshake, the download
+and `Boot user code from SRAM` all succeed, and then the board is silent —
+nothing at 115200, 230400, 921600 or 1500000 baud. Four things were checked and
+none of them is the cause:
+
+* **Not the baud.** The divisor is computed from a PLL0 read, so a wrong clock
+  would give a wrong baud — but a build that skips programming the divisor
+  entirely, inheriting the one `kflash` just used at 1.5 Mbaud, is equally
+  silent.
+* **Not the UART.** `kflash`'s ISP talks over UARTHS and checks the replies, so
+  transmit demonstrably reaches the host moments earlier.
+* **Not the entry address.** The ELF's entry is `0x80000000`, `.text` starts
+  there, and `.bss`/`.stack` are `NOLOAD`, so the 563 KB image is exactly what
+  should sit at the boot address.
+* **`main` is never reached.** A raw write to `HS_TXDATA` as the first statement
+  of `main` — no clock, no heap, no allocator — produced nothing either. The
+  failure is in the hand-off or in `riscv-rt`'s startup, before any of this
+  crate's code runs.
+
+That is as far as it could be taken without a second K210 to compare against or
+a way to see the chip's state. It is recorded here rather than guessed at.
+
+So RISC-V **64** is still unverified on hardware. RISC-V **32** is verified — the
+ESP32-C3 runs the interpreter.
+
+**One thing changed as a result.** The report now repeats every few seconds
+rather than printing once. On a board with flash, a single print is fine: the
+firmware is still there after a host attaches and resets it. Here a reset
+discards SRAM and boots the *other* firmware, so a report printed once is
+unobservable by construction. That change is itself unverified, for the same
+reason everything else here is.
 
 ---
 

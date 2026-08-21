@@ -70,9 +70,8 @@ pub fn marshal_argument(
         Value::I64(v) | Value::NativeInt(v) => Marshalled::integer(*v),
         Value::F(v) => Marshalled::float(*v),
         Value::Null => Marshalled::integer(0),
-        Value::Obj(h) => match interp.heap.get_as::<ClrString>(*h) {
-            Some(s) => {
-                let text = s.to_rust_string();
+        Value::Obj(h) => match interp.heap.with::<ClrString, _>(*h, |s| s.to_rust_string()) {
+            Some(text) => {
                 let c = CString::new(text).map_err(|_| {
                     ExecutionError::exception(
                         rustclr_core::ClrExceptionKind::Argument,

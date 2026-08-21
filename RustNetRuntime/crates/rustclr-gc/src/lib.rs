@@ -45,9 +45,12 @@ extern crate alloc;
 pub mod collector;
 pub mod handle;
 pub mod object;
+pub mod safepoint;
+pub mod shared;
 pub mod space;
 
 pub use collector::{CollectionReport, Collector, HeapPressure, MarkSweep, NeverCollect, RootSet};
+pub use shared::SharedHeap;
 pub use handle::Handle;
 pub use object::{GcObject, Tracer};
 pub use space::ObjectSpace;
@@ -191,6 +194,33 @@ impl Heap {
 
     pub fn get_as_mut<T: GcObject>(&mut self, handle: Handle) -> Option<&mut T> {
         self.space.get_as_mut::<T>(handle)
+    }
+
+    /// Reads an object through a closure rather than by handing out a borrow.
+    ///
+    /// This is the shape an accessor has to have once the heap is shared
+    /// between threads: a `&T` returned from behind a lock would outlive the
+    /// guard that made it safe, so the borrow has to stay inside a scope the
+    /// heap controls.
+    ///
+    /// Returns `None` — without calling `f` — when the handle is stale or names
+    /// something that is not a `T`, which is the same answer [`Self::get_as`]
+    /// gives.
+    ///
+    /// The closure must not reach back into the heap. Nothing in this runtime
+    /// does: of 56 accessor sites, none holds a borrow across a call that would
+    /// need one, which is what makes a lock viable here at all.
+    pub fn with<T: GcObject, R>(&self, handle: Handle, f: impl FnOnce(&T) -> R) -> Option<R> {
+        self.space.get_as::<T>(handle).map(f)
+    }
+
+    /// [`Self::with`], for a mutation.
+    pub fn with_mut<T: GcObject, R>(
+        &mut self,
+        handle: Handle,
+        f: impl FnOnce(&mut T) -> R,
+    ) -> Option<R> {
+        self.space.get_as_mut::<T>(handle).map(f)
     }
 
     pub fn is_valid(&self, handle: Handle) -> bool {

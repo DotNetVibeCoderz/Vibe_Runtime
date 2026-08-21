@@ -18,9 +18,7 @@ fn managed_trace(interp: &Interpreter, error: &rustclr_core::ExecutionError) -> 
         return "<not a managed exception>".into();
     };
     interp
-        .heap
-        .get_as::<rustclr_core::ClrException>(*object)
-        .map(|e| e.stack_trace.join("
+        .heap.with::<rustclr_core::ClrException, _>(*object, |e| e.stack_trace.join("
 "))
         .unwrap_or_else(|| "<no trace captured>".into())
 }

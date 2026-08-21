@@ -12,6 +12,8 @@
 //! Rust.
 
 use crate::error::{ExecResult, ExecutionError};
+use crate::statics::SharedStatics;
+use rustclr_gc::Handle;
 use crate::naming::{native_key, native_key_typed};
 use crate::types::*;
 use crate::value::Value;
@@ -48,6 +50,7 @@ pub struct CoreTypes {
 }
 
 /// One loaded assembly.
+#[derive(Clone)]
 pub struct LoadedAssembly {
     pub id: AssemblyId,
     pub name: String,
@@ -76,6 +79,13 @@ pub struct LoadedAssembly {
     pub member_ref_by_row: HashMap<u32, MethodId>,
     /// `Property` table row to registry id.
     pub property_by_row: HashMap<u32, PropertyId>,
+    /// `StandAloneSig` rows that parse as *method* signatures.
+    ///
+    /// That table holds two unrelated things: the local-variable signature of
+    /// every method body, and the call-site signature of every `calli`. Only
+    /// the second kind is here — the first is consumed when the body is read
+    /// and would misparse as a method signature.
+    pub call_sites: HashMap<u32, MethodSig>,
     /// `MemberRef` rows that name a field rather than a method.
     pub field_ref_by_row: HashMap<u32, FieldId>,
     /// Resolved `MethodSpec` rows — a generic instantiation mapped to the open
@@ -104,6 +114,31 @@ pub struct LoadedAssembly {
     pub method_impls: HashMap<(TypeId, MethodId), MethodId>,
     /// Signature blobs of `TypeSpec` rows, kept for generic instantiation.
     pub type_specs: HashMap<u32, TypeSig>,
+    /// `TypeSpec` rows that name a closed construction of a generic type
+    /// declared in this assembly, mapped to the type built for it.
+    ///
+    /// Only user types are here. A closed construction of a *framework* generic
+    /// — `List<int>` — still resolves to the open definition, because every
+    /// native binding is keyed by its declaring type's name and giving
+    /// `List<int>` a name of its own would take `List\`1::Add` out of reach.
+    pub generic_instances: HashMap<u32, TypeId>,
+    /// `MemberRef` rows whose declaring type is a closed construction.
+    ///
+    /// A member reference resolves to the *definition's* method — one shared
+    /// body serves every construction — so the method alone cannot say which
+    /// construction was named. `newobj Box<int>::.ctor()` needs that, or the
+    /// instance it builds is a `Box<T>` and its `T` is unknowable.
+    pub member_ref_owner: HashMap<u32, TypeId>,
+    /// Type arguments the `TypeSpec` behind a member reference names.
+    ///
+    /// Separate from `member_ref_owner`, and populated for *framework*
+    /// generics too. A framework construction has no runtime type of its own —
+    /// `List<int>` and `List<string>` are one type by choice, so that native
+    /// bindings stay reachable by declaring-type name — but the call site
+    /// still spells its arguments out, and some implementations need them.
+    /// `new Span<int>(ptr, 4)` is the case that forced this: the element width
+    /// lives in `T` and nowhere else.
+    pub member_ref_type_args: HashMap<u32, Vec<TypeId>>,
     /// Initial data for fields with an RVA (array initialisers).
     pub field_data: HashMap<u32, Vec<u8>>,
     /// Entry point token, if this assembly is executable.
@@ -122,6 +157,22 @@ pub struct CustomAttribute {
 }
 
 /// Resolves assemblies and owns the type registry.
+/// Cloneable, and that is the whole design for running managed code on more
+/// than one thread.
+///
+/// Everything here except `statics` is settled before the first instruction
+/// runs: types are registered, tokens are resolved, and closed generic
+/// constructions are built eagerly in pass 7b. A clone taken after loading is
+/// therefore *identical* to the original — same `TypeId`s, same `MethodId`s,
+/// same everything — so two threads reading their own copies behave exactly as
+/// if they shared one, and neither pays a lock on the path that runs every
+/// instruction. `statics` is shared rather than copied, because
+/// `static int Total` must be one slot.
+///
+/// The correctness condition is precise: **the clones must not diverge.** Two
+/// things could make them, and both are handled — see
+/// `Loader::would_diverge`.
+#[derive(Clone)]
 pub struct Loader {
     pub registry: TypeRegistry,
     assemblies: Vec<LoadedAssembly>,
@@ -133,10 +184,19 @@ pub struct Loader {
     /// Synthetic assembly holding the natively implemented framework types.
     bcl: AssemblyId,
     /// Static-field storage, indexed by `FieldId`.
-    statics: Vec<Value>,
+    /// Static-field storage, indexed by `FieldId`.
+    ///
+    /// Shared, and deliberately the *only* mutable thing a `Loader` clone does
+    /// not get a copy of. Two threads running managed code must see one
+    /// `Counter.Total`; everything else in a loader is settled by the time
+    /// anything runs.
+    statics: SharedStatics,
     /// Internal-call stubs synthesised for interface dispatch onto native
     /// types, keyed by the receiver type and the native binding name.
     interned_calls: HashMap<(TypeId, String), MethodId>,
+    /// One runtime type per closed construction, keyed by definition and
+    /// arguments, so `Box<int>` named twice is one type.
+    generic_constructions: HashMap<(TypeId, Vec<TypeId>), TypeId>,
 }
 
 impl Loader {
@@ -163,8 +223,9 @@ impl Loader {
                 type_handle: TypeId::INVALID,
             },
             bcl: AssemblyId(0),
-            statics: Vec::new(),
+            statics: SharedStatics::default(),
             interned_calls: HashMap::new(),
+            generic_constructions: HashMap::new(),
         };
         loader.install_core_types();
         loader
@@ -181,6 +242,49 @@ impl Loader {
     #[cfg(feature = "std")]
     pub fn add_search_path(&mut self, path: impl Into<PathBuf>) {
         self.search_paths.push(path.into());
+    }
+
+    /// Loads an assembly by simple name, searching the registered paths.
+    ///
+    /// This is what `Assembly.Load("Foo")` needs, and it is the one part of
+    /// reflection that cannot exist without a filesystem — which is why it is
+    /// gated on `std` and absent on a microcontroller, where an assembly
+    /// arrives as bytes and there is nowhere to look for a second one.
+    ///
+    /// Returns the already-loaded id when the name is one this loader has seen,
+    /// so loading twice is idempotent rather than duplicating every type.
+    #[cfg(feature = "std")]
+    pub fn load_by_name(&mut self, name: &str) -> ExecResult<AssemblyId> {
+        if let Some(existing) = self.by_name.get(name) {
+            return Ok(*existing);
+        }
+
+        // Beside an assembly already loaded first, then the registered search
+        // paths. A program that references a library almost always ships it in
+        // the same directory, and looking there first means the common case
+        // needs no configuration at all.
+        let mut roots: Vec<PathBuf> = Vec::new();
+        for assembly in &self.assemblies {
+            if let Some(path) = &assembly.path {
+                if let Some(directory) = path.parent() {
+                    roots.push(directory.to_path_buf());
+                }
+            }
+        }
+        roots.extend(self.search_paths.iter().cloned());
+
+        for root in roots {
+            for extension in ["dll", "exe"] {
+                let candidate = root.join(format!("{name}.{extension}"));
+                if candidate.is_file() {
+                    return self.load_from_file(candidate);
+                }
+            }
+        }
+
+        Err(ExecutionError::MissingImplementation(format!(
+            "assembly `{name}` was not found beside the loaded assemblies or on any search path"
+        )))
     }
 
     pub fn assemblies(&self) -> &[LoadedAssembly] {
@@ -201,17 +305,41 @@ impl Loader {
 
     // -- static field storage ------------------------------------------------
 
-    pub fn static_value(&self, field: FieldId) -> &Value {
-        &self.statics[field.index()]
+    /// Reads a static field.
+    ///
+    /// Returns a *value*, not a borrow. Static storage is shared between every
+    /// thread running managed code — `Counter.Total` is one slot however many
+    /// threads reach it, which is what C# means by `static` — so it lives
+    /// behind a lock and nothing may hold a reference into it. That is the same
+    /// bargain [`crate::gc::SharedHeap`] makes, for the same reason.
+    pub fn static_value(&self, field: FieldId) -> Value {
+        self.statics
+            .lock()
+            .get(field.index())
+            .cloned()
+            .unwrap_or(Value::Null)
     }
 
-    pub fn static_value_mut(&mut self, field: FieldId) -> &mut Value {
-        &mut self.statics[field.index()]
+    /// Writes a static field. `&self`, because the storage is shared.
+    pub fn set_static(&self, field: FieldId, value: Value) {
+        let mut statics = self.statics.lock();
+        if statics.len() <= field.index() {
+            statics.resize(field.index() + 1, Value::Null);
+        }
+        statics[field.index()] = value;
+    }
+
+    /// Hands every static's handles to the collector.
+    pub fn static_roots(&self, out: &mut Vec<Handle>) {
+        for v in self.statics.lock().iter() {
+            v.trace_handles(out);
+        }
     }
 
     fn ensure_static_slot(&mut self, field: FieldId) {
-        if self.statics.len() <= field.index() {
-            self.statics.resize(field.index() + 1, Value::Null);
+        let mut statics = self.statics.lock();
+        if statics.len() <= field.index() {
+            statics.resize(field.index() + 1, Value::Null);
         }
     }
 
@@ -236,12 +364,16 @@ impl Loader {
             type_ref_by_row: HashMap::new(),
             member_ref_by_row: HashMap::new(),
             property_by_row: HashMap::new(),
+            call_sites: HashMap::new(),
             field_ref_by_row: HashMap::new(),
             method_spec_by_row: HashMap::new(),
             unresolved_members: HashMap::new(),
             method_impls: HashMap::new(),
             attributes: HashMap::new(),
             type_specs: HashMap::new(),
+            generic_instances: HashMap::new(),
+            member_ref_owner: HashMap::new(),
+            member_ref_type_args: HashMap::new(),
             field_data: HashMap::new(),
             entry_point: None,
             references: Vec::new(),
@@ -405,11 +537,12 @@ impl Loader {
             ("System", "Buffer"),
             ("System.Text", "StringBuilder"),
             ("System.Text", "Encoding"),
-            ("System.Diagnostics", "Stopwatch"),
+
             ("System.Diagnostics", "Debug"),
             ("System.Threading", "Thread"),
             ("System.Threading", "Monitor"),
             ("System.Threading", "Interlocked"),
+            ("System.Threading", "Volatile"),
             ("System.IO", "File"),
             ("System.IO", "Directory"),
             ("System.IO", "Path"),
@@ -474,18 +607,27 @@ impl Loader {
         // a type of this name the whole member reference fails long before any
         // native implementation is consulted.
         //
-        // One field, holding the string the span stands for. That is a
-        // representation for the concatenation path in `rustclr-bcl`, not a
-        // span implementation: nothing indexes or slices one, and the members
-        // that would are deliberately not registered. See
-        // `register_span_concat` there, and `docs/limitations.md`.
-        for name in ["ReadOnlySpan`1", "Span`1"] {
+        // A span is *either* a string — the original representation, still
+        // used for the `s + c` concatenation path, where the string is the
+        // span — or a window onto an array: these three slots. Two shapes
+        // under one type because they are two genuinely different things a
+        // span can be over, and the array one cannot be a string.
+        //
+        // What is still absent is a span over anything that is not a managed
+        // object: `stackalloc` needs raw memory, which this runtime has no
+        // representation for. See `docs/limitations.md`.
+        // `Memory<T>` is the same window as a span and is *not* a ref struct,
+        // so it can live in a field or be awaited. Nothing here distinguishes
+        // them: the difference is a compile-time restriction on where a span
+        // may be stored, and Roslyn has already enforced it by the time any of
+        // this runs.
+        for name in ["ReadOnlySpan`1", "Span`1", "ReadOnlyMemory`1", "Memory`1"] {
             self.add_native_type_with_fields(
                 "System",
                 name,
                 Some(value_type),
                 synth(),
-                &["_text"],
+                &["_source", "_start", "_length", "_width"],
                 bcl,
             );
         }
@@ -769,7 +911,9 @@ impl Loader {
         // `Task` carries its own completion state. Continuations are held in a
         // managed array so a suspended state machine stays reachable to the
         // collector for exactly as long as the task that will resume it.
-        let task_fields = &["_status", "_result", "_exception", "_continuations"];
+        // `_thread` holds the id of the OS thread running a `Task.Run` body, so
+        // anything observing the task can wait for it.
+        let task_fields = &["_status", "_result", "_exception", "_continuations", "_thread"];
         let task = self.add_native_type_with_fields_of_kind(
             TASKS,
             "Task",
@@ -809,6 +953,103 @@ impl Loader {
             let id = self.add_native_type(TASKS, name, TypeKind::ValueType, Some(value_type), synth());
             self.registry.ty_mut(id).generic_param_count = arity;
         }
+        // Async iterators — `async IAsyncEnumerable<T>` plus `await foreach`.
+        //
+        // The state machine implements the two interfaces itself, in IL, so
+        // what the runtime has to supply is the builder that drives it and the
+        // promise its `MoveNextAsync` hands back.
+        const SOURCES: &str = "System.Threading.Tasks.Sources";
+        for (ns, name, arity) in [
+            ("System.Collections.Generic", "IAsyncEnumerable`1", 1u32),
+            ("System.Collections.Generic", "IAsyncEnumerator`1", 1),
+            (SOURCES, "IValueTaskSource", 0),
+            (SOURCES, "IValueTaskSource`1", 1),
+        ] {
+            let id = self.add_native_type(ns, name, TypeKind::Interface, None, synth());
+            self.registry.ty_mut(id).generic_param_count = arity;
+        }
+        for name in ["ValueTaskSourceStatus", "ValueTaskSourceOnCompletedFlags"] {
+            self.add_native_type(SOURCES, name, TypeKind::Enum, Some(value_type), synth());
+        }
+
+        // The promise behind one `MoveNextAsync`. Its two slots hold the
+        // result and whether it has been set; nothing here needs a version,
+        // because a synchronous runtime never reuses one before it is read.
+        let promise = self.add_native_type_with_fields_of_kind(
+            SOURCES,
+            "ManualResetValueTaskSourceCore`1",
+            TypeKind::ValueType,
+            Some(value_type),
+            synth(),
+            &["_result", "_hasResult"],
+            self.bcl,
+        );
+        self.registry.ty_mut(promise).generic_param_count = 1;
+
+        self.add_native_type(
+            CS,
+            "AsyncIteratorMethodBuilder",
+            TypeKind::ValueType,
+            Some(value_type),
+            synth(),
+        );
+
+        // `Unsafe.InitBlock` and `Unsafe.CopyBlock` are the callable spellings
+        // of the `initblk` and `cpblk` instructions.
+        self.add_native_type(CS, "Unsafe", TypeKind::Class, Some(object), synth());
+
+        // `InlineArray<N><T>` — the buffers Roslyn lowers `params` and
+        // `Task.WaitAll(a, b)` through on .NET 10. Each is a struct of N
+        // elements, and the arity is in the name, so N slots is the whole
+        // representation. Registering the family costs a type each and is what
+        // lets the lowering's `TypeSpec` resolve at all.
+        for n in 1..=16usize {
+            let fields: Vec<String> = (0..n).map(|i| alloc::format!("_e{i}")).collect();
+            let borrowed: Vec<&str> = fields.iter().map(|f| f.as_str()).collect();
+            let id = self.add_native_type_with_fields_of_kind(
+                CS,
+                &alloc::format!("InlineArray{n}`1"),
+                TypeKind::ValueType,
+                Some(value_type),
+                synth(),
+                &borrowed,
+                self.bcl,
+            );
+            self.registry.ty_mut(id).generic_param_count = 1;
+        }
+
+        // `MemoryMarshal` holds the span constructors the lowering uses.
+        self.add_native_type(
+            "System.Runtime.InteropServices",
+            "MemoryMarshal",
+            TypeKind::Class,
+            Some(object),
+            synth(),
+        );
+
+        // `MemoryExtensions` holds `AsSpan` and `AsMemory`.
+        self.add_native_type("System", "MemoryExtensions", TypeKind::Class, Some(object), synth());
+
+        // `Stopwatch` needs slots: it is a class in .NET and `Restart` mutates
+        // it, which a bare number could not represent.
+        self.add_native_type_with_fields(
+            "System.Diagnostics",
+            "Stopwatch",
+            Some(object),
+            synth(),
+            &["_start", "_elapsed"],
+            self.bcl,
+        );
+
+        // `Marshal`, for blittable structs. See `rustclr_bcl::marshal`.
+        self.add_native_type(
+            "System.Runtime.InteropServices",
+            "Marshal",
+            TypeKind::Class,
+            Some(object),
+            synth(),
+        );
+
         self.add_native_type(TASKS, "TaskFactory", TypeKind::Class, Some(object), synth());
         self.add_native_type(TASKS, "Parallel", TypeKind::Class, Some(object), synth());
         self.add_native_type(
@@ -857,6 +1098,14 @@ impl Loader {
             ("ConfiguredTaskAwaitable`1+ConfiguredTaskAwaiter", 1),
             ("ConfiguredValueTaskAwaitable", 0),
             ("ConfiguredValueTaskAwaitable`1", 1),
+            // The `ValueTask` awaiters. `ConfiguredValueTaskAwaitable` was
+            // already here without them, so `await using` reached
+            // `get_IsCompleted` on a type the registry did not have and the
+            // member reference would not resolve.
+            ("ValueTaskAwaiter", 0),
+            ("ValueTaskAwaiter`1", 1),
+            ("ConfiguredValueTaskAwaitable+ConfiguredValueTaskAwaiter", 0),
+            ("ConfiguredValueTaskAwaitable`1+ConfiguredValueTaskAwaiter", 1),
             ("YieldAwaitable", 0),
             ("YieldAwaitable+YieldAwaiter", 0),
         ] {
@@ -1122,12 +1371,16 @@ impl Loader {
             type_ref_by_row: HashMap::new(),
             member_ref_by_row: HashMap::new(),
             property_by_row: HashMap::new(),
+            call_sites: HashMap::new(),
             field_ref_by_row: HashMap::new(),
             method_spec_by_row: HashMap::new(),
             unresolved_members: HashMap::new(),
             method_impls: HashMap::new(),
             attributes: HashMap::new(),
             type_specs: HashMap::new(),
+            generic_instances: HashMap::new(),
+            member_ref_owner: HashMap::new(),
+            member_ref_type_args: HashMap::new(),
             field_data: HashMap::new(),
             entry_point: image.entry_point(),
             references,
@@ -1266,7 +1519,7 @@ impl Loader {
                 if is_static {
                     self.ensure_static_slot(field_id);
                     if let Some(v) = self.registry.field(field_id).constant.clone() {
-                        *self.static_value_mut(field_id) = v;
+                        self.set_static(field_id, v);
                     }
                 }
 
@@ -1378,6 +1631,7 @@ impl Loader {
                     token: Token::new(TableId::MethodDef, method_row),
                     assembly: id,
                     param_names,
+                    generic_args: Vec::new(),
                     qualified_name: native_key_typed(&declaring_name, m.name, &sig),
                     signature: sig,
                     flags: m.flags,
@@ -1450,6 +1704,44 @@ impl Loader {
             }
         }
 
+        // --- pass 7b: closed constructions of user generic types --------------
+        //
+        // `Box<int>` and `Box<string>` become two runtime types rather than one.
+        // They share the definition's methods — generics are still erased for
+        // *execution*, one body serves every argument — but each carries its own
+        // type arguments and its own static storage, which is what
+        // `typeof(T)`, `x is T` and a per-instantiation static field need.
+        //
+        // Framework generics are deliberately left erased. Every native binding
+        // is keyed by its declaring type's name, so giving `List<int>` a type of
+        // its own would put `List`1::Add` out of reach of the implementation
+        // behind it — and nothing in the collections needs `T` at run time
+        // anyway, because their storage is self-describing.
+        let spec_rows: Vec<(u32, TypeSig)> = assembly
+            .type_specs
+            .iter()
+            .map(|(row, sig)| (*row, sig.clone()))
+            .collect();
+        for (row, sig) in spec_rows {
+            let TypeSig::GenericInst { definition, args, .. } = sig.unwrap_modifiers() else {
+                continue;
+            };
+            let Some(open) = self.resolve_type_token(&assembly, *definition) else { continue };
+            // Framework types live in the synthetic BCL assembly.
+            if self.registry.ty(open).assembly == self.bcl {
+                continue;
+            }
+            let resolved: Vec<TypeId> = args
+                .iter()
+                .filter_map(|a| self.resolve_type_sig(&assembly, a))
+                .collect();
+            if resolved.len() != args.len() {
+                continue;
+            }
+            let constructed = self.construct_generic(open, &resolved);
+            assembly.generic_instances.insert(row, constructed);
+        }
+
         // --- pass 8: MemberRefs -----------------------------------------------
         for row in 1..=md.row_count(TableId::MemberRef) {
             let mr = md.member_ref(row).map_err(ExecutionError::Metadata)?;
@@ -1464,6 +1756,20 @@ impl Loader {
                     .insert(row, format!("{scope}::{}", mr.name));
                 continue;
             };
+
+            // Pass 7b ran before this, so `parent` is already the *constructed*
+            // type when the reference names one — which is what binds a field
+            // reference to that construction's own static slot, and what lets
+            // `newobj` build an instance that knows its type arguments.
+            if self.registry.ty(parent).generic_definition.is_some() {
+                assembly.member_ref_owner.insert(row, parent);
+            }
+
+            // The arguments the reference itself names, whether or not the
+            // definition got a runtime type per construction.
+            if let Some(args) = self.type_spec_arguments(&assembly, mr.class) {
+                assembly.member_ref_type_args.insert(row, args);
+            }
 
             // A member ref signature starting with FIELD names a field.
             if mr.signature.first().copied() == Some(0x06) {
@@ -1501,6 +1807,7 @@ impl Loader {
                         token: Token::new(TableId::MemberRef, row),
                         assembly: id,
                         param_names: Vec::new(),
+                        generic_args: Vec::new(),
                         qualified_name: native_key_typed(&declaring_name, mr.name, &sig),
                         signature: sig,
                         flags,
@@ -1548,8 +1855,20 @@ impl Loader {
                             .collect(),
                         ..base.signature.clone()
                     };
+                    // Resolve each argument to a real type id. This is what
+                    // the instantiation knows and the open definition does not,
+                    // and it is what `!!N` reads at run time.
+                    let resolved: Vec<TypeId> = arguments
+                        .iter()
+                        .map(|a| {
+                            self.resolve_type_sig(&assembly, a)
+                                .unwrap_or_else(|| self.core.object)
+                        })
+                        .collect();
                     let mut clone = base.clone();
                     clone.qualified_name = native_key_typed(&declaring, &base.name, &concrete);
+                    clone.signature = concrete;
+                    clone.generic_args = resolved;
                     Some(self.registry.add_method(clone))
                 }
                 _ => None,
@@ -1644,6 +1963,26 @@ impl Loader {
                 setters.get(&row).copied(),
             );
             assembly.property_by_row.insert(row, id);
+        }
+
+        // --- pass 10c: `calli` call-site signatures ---------------------------
+        // `StandAloneSig` holds local-variable signatures *and* call-site
+        // signatures, told apart by the calling-convention byte. The locals are
+        // read with each body; these are the other kind, and they have to be
+        // captured now because the image is dropped once loading finishes and a
+        // `calli` needs its signature at run time.
+        for row in 1..=md.row_count(TableId::StandAloneSig) {
+            let Ok(blob) = md.stand_alone_sig(row) else { continue };
+            let is_locals = blob
+                .signature
+                .first()
+                .is_some_and(|cc| cc & 0x0F == rustclr_metadata::signature::calling_convention::LOCAL_SIG);
+            if is_locals {
+                continue;
+            }
+            if let Ok(sig) = SignatureParser::new(blob.signature).parse_method() {
+                assembly.call_sites.insert(row, sig);
+            }
         }
 
         // --- pass 11: custom attributes ---------------------------------------
@@ -1756,11 +2095,114 @@ impl Loader {
     }
 
     /// Resolves a `TypeDefOrRef`-shaped token within an assembly.
+    /// The call-site signature a `calli` operand names.
+    pub fn call_site_signature(
+        &self,
+        assembly: &LoadedAssembly,
+        token: Token,
+    ) -> Option<MethodSig> {
+        if token.table() != Some(TableId::StandAloneSig) {
+            return None;
+        }
+        assembly.call_sites.get(&token.row()).cloned()
+    }
+
+    /// Builds — or returns — the runtime type for one closed construction.
+    ///
+    /// The construction shares the definition's methods, so a call still lands
+    /// on the one shared body and every native binding key is unchanged. What
+    /// it does not share is identity, type arguments, or static storage.
+    ///
+    /// Static fields are cloned with fresh slots, which is the whole of
+    /// "a static field per instantiation": `Counter<int>.Count` and
+    /// `Counter<string>.Count` end up in different slots of the same table.
+    ///
+    /// Public because `Type.MakeGenericType` needs exactly this and nothing
+    /// else: a construction named at run time is the same object as one named
+    /// by a `TypeSpec` at load time, cache included, so `MakeGenericType` and
+    /// `typeof` agree by reference.
+    pub fn construct_generic(&mut self, open: TypeId, args: &[TypeId]) -> TypeId {
+        if let Some(existing) = self.generic_constructions.get(&(open, args.to_vec())) {
+            return *existing;
+        }
+
+        let mut constructed = self.registry.ty(open).clone();
+        constructed.generic_args = args.to_vec();
+        constructed.generic_definition = Some(open);
+
+        // Fresh static slots. Instance fields are shared: their layout depends
+        // on the definition, not on the arguments, because every argument is
+        // stored as a `Value` that carries its own shape.
+        // Static storage is indexed by `FieldId`, not by the `slot` an
+        // instance field carries — so a fresh field id *is* a fresh static
+        // slot, and the table only has to be grown to reach it. Setting `slot`
+        // here instead was the first attempt, and it put the value at one index
+        // while every read looked at another.
+        let open_statics = self.registry.ty(open).static_fields.clone();
+        let mut statics: Vec<FieldId> = Vec::with_capacity(open_statics.len());
+        for field in open_statics {
+            let info = self.registry.field(field).clone();
+            let cloned = self.registry.add_constructed_field(info);
+            self.ensure_static_slot(cloned);
+            statics.push(cloned);
+        }
+        constructed.static_fields = statics;
+        // A construction has its own class constructor state: `Counter<int>`
+        // and `Counter<string>` each run the `.cctor` once.
+        constructed.cctor_state = CctorState::NotRun;
+
+        let id = self.registry.add_constructed_type(constructed);
+        self.generic_constructions.insert((open, args.to_vec()), id);
+        id
+    }
+
+    /// The resolved type arguments of a `TypeSpec`, if it names a construction.
+    fn type_spec_arguments(
+        &self,
+        assembly: &LoadedAssembly,
+        token: Token,
+    ) -> Option<Vec<TypeId>> {
+        if token.table() != Some(TableId::TypeSpec) {
+            return None;
+        }
+        let sig = assembly.type_specs.get(&token.row())?;
+        let TypeSig::GenericInst { args, .. } = sig.unwrap_modifiers() else {
+            return None;
+        };
+        let resolved: Vec<TypeId> = args
+            .iter()
+            .filter_map(|a| self.resolve_type_sig(assembly, a))
+            .collect();
+        (resolved.len() == args.len()).then_some(resolved)
+    }
+
+    /// Type arguments a member reference's declaring `TypeSpec` names.
+    pub fn member_ref_type_args(
+        &self,
+        assembly: AssemblyId,
+        token: Token,
+    ) -> Option<&[TypeId]> {
+        if token.table() != Some(TableId::MemberRef) {
+            return None;
+        }
+        self.assemblies
+            .get(assembly.index())?
+            .member_ref_type_args
+            .get(&token.row())
+            .map(|v| v.as_slice())
+    }
+
     pub fn resolve_type_token(&self, assembly: &LoadedAssembly, token: Token) -> Option<TypeId> {
         match token.table() {
             Some(TableId::TypeDef) => assembly.type_by_row.get(&token.row()).copied(),
             Some(TableId::TypeRef) => assembly.type_ref_by_row.get(&token.row()).copied(),
             Some(TableId::TypeSpec) => {
+                // A closed construction of a user generic type has a runtime
+                // type of its own; everything else falls back to the erased
+                // resolution.
+                if let Some(constructed) = assembly.generic_instances.get(&token.row()) {
+                    return Some(*constructed);
+                }
                 let sig = assembly.type_specs.get(&token.row())?;
                 self.resolve_type_sig(assembly, sig)
             }
@@ -1869,6 +2311,7 @@ impl Loader {
             assembly: self.bcl,
             // A synthesised internal call has no `Param` rows to read.
             param_names: Vec::new(),
+            generic_args: Vec::new(),
             qualified_name,
             signature,
             flags,
@@ -1921,12 +2364,14 @@ impl Loader {
 
     /// Total static-field slots allocated.
     pub fn static_slot_count(&self) -> usize {
-        self.statics.len()
+        self.statics.lock().len()
     }
 
-    /// Every static field value, for GC root scanning.
-    pub fn static_values(&self) -> &[Value] {
-        &self.statics
+    /// Shares this loader's static storage with another.
+    ///
+    /// What makes two loaders one runtime rather than two.
+    pub fn share_statics_with(&mut self, other: &Loader) {
+        self.statics = other.statics.clone();
     }
 
     /// Initial bytes of a field that carries an RVA.

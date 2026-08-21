@@ -163,6 +163,134 @@ fn register_type(interp: &mut Interpreter) {
         Ok(Some(Value::I32(id.0 as i32)))
     });
 
+    // -- generics --------------------------------------------------------
+    //
+    // A closed construction is a real runtime type here, with its own identity
+    // and its own static storage, so these read metadata the loader already
+    // holds rather than reconstructing anything.
+
+    interp.register_native(key(TYPE, "get_IsGenericType()"), |i, a| {
+        let id = described(i, a, 0)?;
+        let ty = i.loader.registry.ty(id);
+        // True for both `List<int>` and the open `List<>`, which is what .NET
+        // reports. `IsGenericTypeDefinition` is the narrower question.
+        let generic = !ty.generic_args.is_empty() || ty.generic_param_count > 0;
+        Ok(Some(Value::I32(generic as i32)))
+    });
+
+    interp.register_native(key(TYPE, "get_IsGenericTypeDefinition()"), |i, a| {
+        let id = described(i, a, 0)?;
+        let ty = i.loader.registry.ty(id);
+        let open = ty.generic_param_count > 0 && ty.generic_args.is_empty();
+        Ok(Some(Value::I32(open as i32)))
+    });
+
+    interp.register_native(key(TYPE, "get_ContainsGenericParameters()"), |i, a| {
+        let id = described(i, a, 0)?;
+        let ty = i.loader.registry.ty(id);
+        let open = ty.generic_param_count > 0 && ty.generic_args.is_empty();
+        Ok(Some(Value::I32(open as i32)))
+    });
+
+    interp.register_native(key(TYPE, "GetGenericArguments()"), |i, a| {
+        let id = described(i, a, 0)?;
+        let ty = i.loader.registry.ty(id);
+
+        // On an *open* definition .NET returns the type parameters themselves —
+        // `typeof(Cell<>).GetGenericArguments()` is `[T]`, not `[]`. This
+        // runtime records only the arity of a definition, not a runtime type
+        // per parameter, so it has nothing truthful to return and refuses
+        // rather than handing back an empty array that would quietly disagree.
+        // Found by the conformance fixture: `dotnet` said 1 where this said 0.
+        if ty.generic_args.is_empty() && ty.generic_param_count > 0 {
+            return Err(ExecutionError::MissingImplementation(
+                "GetGenericArguments on an open generic definition: this runtime                  has no runtime type for a type parameter"
+                    .into(),
+            ));
+        }
+
+        let args = ty.generic_args.clone();
+        let values: Vec<Value> = args.iter().map(|t| Value::Obj(i.type_object(*t))).collect();
+        Ok(Some(value_array(i, values)))
+    });
+
+    interp.register_native(key(TYPE, "GetGenericTypeDefinition()"), |i, a| {
+        let id = described(i, a, 0)?;
+        let ty = i.loader.registry.ty(id);
+        // An open definition is its own definition; a construction names one.
+        // Anything else is not generic at all, and .NET throws there rather
+        // than returning null.
+        let definition = match ty.generic_definition {
+            Some(open) => Some(open),
+            None if ty.generic_param_count > 0 => Some(id),
+            None => None,
+        };
+        match definition {
+            Some(open) => {
+                let handle = i.type_object(open);
+                Ok(Some(Value::Obj(handle)))
+            }
+            None => Err(ExecutionError::exception(
+                ClrExceptionKind::InvalidOperation,
+                "GetGenericTypeDefinition requires a generic type",
+            )),
+        }
+    });
+
+    interp.register_native(key(TYPE, "MakeGenericType/1"), |i, a| {
+        let open = described(i, a, 0)?;
+        let ty = i.loader.registry.ty(open);
+        let expected = ty.generic_param_count as usize;
+        if expected == 0 || !ty.generic_args.is_empty() {
+            return Err(ExecutionError::exception(
+                ClrExceptionKind::InvalidOperation,
+                "MakeGenericType requires a generic type definition",
+            ));
+        }
+
+        // The argument is a `Type[]`. Each element has to name a runtime type;
+        // a null or a non-`Type` is the caller's mistake and is refused rather
+        // than silently dropped.
+        let handle = arg(i, a, 1)?
+            .as_handle()
+            .filter(|h| !h.is_null())
+            .ok_or_else(ExecutionError::null_reference)?;
+        let elements = array_values(i, handle);
+        if elements.len() != expected {
+            let name = i.loader.registry.ty(open).full_name();
+            return Err(ExecutionError::exception(
+                ClrExceptionKind::Argument,
+                format!(
+                    "{name} takes {expected} type argument(s), {} were supplied",
+                    elements.len()
+                ),
+            ));
+        }
+
+        let mut args = Vec::with_capacity(elements.len());
+        for element in &elements {
+            let h = element
+                .as_handle()
+                .filter(|h| !h.is_null())
+                .ok_or_else(ExecutionError::null_reference)?;
+            match i.type_from_object(h) {
+                Some(t) => args.push(t),
+                None => {
+                    return Err(ExecutionError::exception(
+                        ClrExceptionKind::Argument,
+                        "a type argument was not a System.Type instance",
+                    ))
+                }
+            }
+        }
+
+        // Same call the loader makes for a `TypeSpec`, same cache — so
+        // `MakeGenericType` and `typeof` return the identical instance.
+        let constructed = i.loader.construct_generic(open, &args);
+        let object = i.type_object(constructed);
+        Ok(Some(Value::Obj(object)))
+    });
+
     interp.register_native(key(TYPE, "GetType(string)"), |i, a| {
         let name = arg_string_or_empty(i, a, 0)?;
         match i.loader.registry.find_type_by_name(&name) {
@@ -299,12 +427,12 @@ fn filtered_attributes(
 ) -> Value {
     let kept = matching(interp, args, &instances);
     let array = interp.alloc_value_array(0);
-    if let Some(a) = interp.heap.get_as_mut::<ClrArray>(array) {
+    interp.heap.with_mut::<ClrArray, _>(array, |a| {
         if let Some(v) = a.storage.values_mut() {
             *v = kept;
             a.dimensions = vec![v.len() as u32];
         }
-    }
+    });
     Value::Obj(array)
 }
 
@@ -423,12 +551,12 @@ fn id_array(
     let values: Vec<Value> =
         ids.iter().map(|id| new_member(interp, type_name, *id, declaring)).collect();
     let array = interp.alloc_value_array(0);
-    if let Some(a) = interp.heap.get_as_mut::<ClrArray>(array) {
+    interp.heap.with_mut::<ClrArray, _>(array, |a| {
         if let Some(v) = a.storage.values_mut() {
             *v = values;
             a.dimensions = vec![v.len() as u32];
         }
-    }
+    });
     Value::Obj(array)
 }
 
@@ -770,7 +898,7 @@ fn register_members(interp: &mut Interpreter) {
         let value = arg(i, a, 2)?;
         let value = unbox(i, value);
         if i.loader.registry.field(id).is_static {
-            *i.loader.static_value_mut(id) = value;
+            i.loader.set_static(id, value);
             return Ok(None);
         }
         let target = arg(i, a, 1)?
@@ -836,10 +964,10 @@ fn invoke_method(interp: &mut Interpreter, args: &[Value]) -> ExecResult<Option<
 /// Unwraps a boxed primitive, leaving anything else alone.
 fn unbox(interp: &Interpreter, value: Value) -> Value {
     match &value {
-        Value::Obj(h) => match interp.heap.get_as::<rustclr_core::ClrBox>(*h) {
-            Some(b) => b.value.clone(),
-            None => value,
-        },
+        Value::Obj(h) => interp
+            .heap
+            .with::<rustclr_core::ClrBox, _>(*h, |b| b.value.clone())
+            .unwrap_or(value),
         _ => value,
     }
 }
@@ -1234,6 +1362,36 @@ fn register_assembly(interp: &mut Interpreter) {
             Ok(Some(string_value(i, &name)))
         });
     }
+    // `Assembly.Load("Foo")`. The only part of reflection that needs a
+    // filesystem, and so the only part that is absent without `std`: on a chip
+    // an assembly arrives as bytes and there is nowhere to look for a second
+    // one. The loader searches beside the assemblies already loaded first,
+    // then any registered search path.
+    for member in ["Load(string)", "Load/1", "LoadFrom(string)"] {
+        interp.register_native(key(assembly_type, member), |i, a| {
+            let name = arg_string_or_empty(i, a, 0)?;
+            #[cfg(feature = "std")]
+            {
+                match i.loader.load_by_name(&name) {
+                    Ok(id) => Ok(Some(new_assembly(i, "Assembly", id))),
+                    Err(e) => Err(ExecutionError::exception(
+                        ClrExceptionKind::InvalidOperation,
+                        format!("Could not load file or assembly '{name}'. {e}"),
+                    )),
+                }
+            }
+            #[cfg(not(feature = "std"))]
+            {
+                Err(ExecutionError::exception(
+                    ClrExceptionKind::InvalidOperation,
+                    format!(
+                        "Assembly.Load('{name}') needs a filesystem to search, and this build has none."
+                    ),
+                ))
+            }
+        });
+    }
+
     interp.register_native(key(assembly_type, "GetName()"), |i, a| {
         let id = assembly_of(i, a)?;
         Ok(Some(new_assembly(i, "AssemblyName", id)))
@@ -1310,11 +1468,11 @@ fn assembly_of(interp: &mut Interpreter, args: &[Value]) -> ExecResult<AssemblyI
 /// Wraps values in a managed array.
 fn value_array(interp: &mut Interpreter, values: Vec<Value>) -> Value {
     let array = interp.alloc_value_array(0);
-    if let Some(a) = interp.heap.get_as_mut::<ClrArray>(array) {
+    interp.heap.with_mut::<ClrArray, _>(array, |a| {
         if let Some(v) = a.storage.values_mut() {
             *v = values;
             a.dimensions = vec![v.len() as u32];
         }
-    }
+    });
     Value::Obj(array)
 }

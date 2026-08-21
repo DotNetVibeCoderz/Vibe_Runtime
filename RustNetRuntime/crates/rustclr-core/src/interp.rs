@@ -19,7 +19,8 @@ use crate::objects::*;
 use crate::opcode::{decode_all, Instruction, Op, Operand};
 use crate::types::*;
 use crate::value::{ByRef, StructValue, Value};
-use rustclr_gc::{Handle, Heap, RootSet};
+use rustclr_gc::safepoint::{Mutators, Registration};
+use rustclr_gc::{Handle, SharedHeap};
 use rustclr_metadata::{ExceptionClause, HandlerKind, Token, TypeSig};
 
 #[allow(unused_imports)]
@@ -69,6 +70,16 @@ pub struct Frame {
     in_flight: Option<Box<ExecutionError>>,
     /// `constrained.` prefix token awaiting the next `callvirt`.
     constrained: Option<Token>,
+    /// The closed construction this call was made *through*, when the call site
+    /// named one.
+    ///
+    /// Only a static method on a generic type needs it. An instance method asks
+    /// its receiver — `this` is a `Tally<int>` or a `Tally<string>` and those
+    /// are different runtime types — but a static method has no receiver, and
+    /// the body is shared by every construction. The call site is the one place
+    /// that still knows: `call Tally<int>::Add()` is a `MemberRef` whose owner
+    /// is the construction, not the definition.
+    pub construction: Option<TypeId>,
     /// Object under construction, pushed to the caller when a `.ctor` returns.
     pending_newobj: Option<Handle>,
     /// Set when `pending_newobj` is a one-field cell holding a value type
@@ -115,15 +126,24 @@ pub trait NativeTier: Send {
 
     /// Offers a call to the backend.
     ///
-    /// `None` means "not compiled — interpret it". `Some(result)` means the
+    /// `None` means "not compiled — interpret it". `Some(Ok(result))` means the
     /// method ran natively; the inner `Option` is its return value, absent for
-    /// a void method.
+    /// a void method. `Some(Err(..))` means it ran and *faulted* — an array
+    /// index out of range, say — which is not the same as declining: the method
+    /// has already had its effects and must not be run again.
+    ///
+    /// `heap` is here because a backend may need to look through a handle to
+    /// the storage behind it. It is a [`SharedHeap`], so a backend reads it
+    /// through a closure and holds no borrow of its own; it reads to marshal
+    /// arguments and never allocates, which is the property that makes it safe
+    /// to hold a pointer into an object for the duration of a compiled call.
     fn try_execute(
         &mut self,
         loader: &Loader,
+        heap: &SharedHeap,
         method: MethodId,
         args: &[Value],
-    ) -> Option<Option<Value>>;
+    ) -> Option<ExecResult<Option<Value>>>;
 
     /// Methods compiled and bytes emitted, for `--stats`.
     fn stats(&self) -> (usize, usize);
@@ -181,7 +201,21 @@ enum StepOutcome {
 /// The execution engine.
 pub struct Interpreter {
     pub loader: Loader,
-    pub heap: Heap,
+    /// The managed heap.
+    ///
+    /// Shared rather than owned: every accessor keeps its borrow inside a
+    /// closure, so the heap can sit behind a lock without any call site
+    /// noticing. That is the prerequisite for more than one thread running
+    /// managed code — see `rustclr_gc::shared` and `rustclr_gc::safepoint`.
+    pub heap: SharedHeap,
+    /// The threads collecting against `heap`. One, unless something spawned.
+    mutators: Mutators,
+    /// This interpreter's membership in `mutators`, dropped with it.
+    ///
+    /// An interpreter *is* a mutator: it is the thing that holds references
+    /// into the heap and the thing that can describe its own roots. Registering
+    /// per-interpreter rather than per-thread keeps those two facts together.
+    _registration: Registration,
     pub host: Box<dyn Host>,
     pub limits: Limits,
     pub stats: ExecutionStats,
@@ -203,6 +237,32 @@ pub struct Interpreter {
     /// compares equal by reference the way .NET guarantees. Also GC roots.
     type_objects: HashMap<TypeId, Handle>,
     exit_requested: Option<i32>,
+    /// The monitors of this runtime — what `lock (x)` takes.
+    monitors: crate::monitor::Monitors,
+    /// The threads that run `Task.Run` and `Parallel.*`, started on first use.
+    ///
+    /// Lazily, because building it copies the loader once per core, and a
+    /// program that never starts a task should not pay for that.
+    #[cfg(feature = "std")]
+    pool: Option<crate::pool::TaskPool>,
+    /// Threads started by this one, waiting to be joined.
+    #[cfg(feature = "std")]
+    threads: HashMap<u64, std::thread::JoinHandle<(ExecResult<()>, bool)>>,
+    #[cfg(feature = "std")]
+    next_thread_id: u64,
+    /// Method count when this interpreter was made a worker, or zero.
+    ///
+    /// The tripwire for [`Interpreter::diverged`].
+    loaded_size: usize,
+    /// Type arguments the call site named for the native being serviced.
+    ///
+    /// A framework generic is one runtime type for every construction, so the
+    /// method cannot be asked what `T` is. The *reference* that reached it can:
+    /// `new Span<int>(ptr, 4)` spells `int` out in its `TypeSpec`. Set for the
+    /// duration of one native call, like `current_native`.
+    current_native_type_args: Vec<TypeId>,
+    /// Staged by the call site, taken by the next non-IL call.
+    pending_type_args: Vec<TypeId>,
     /// The method a native handler is currently servicing.
     ///
     /// Native methods are plain `fn` pointers with no user data, so a handler
@@ -230,9 +290,12 @@ impl Interpreter {
     }
 
     pub fn with_host(host: Box<dyn Host>) -> Self {
+        let mutators = Mutators::default();
         Self {
             loader: Loader::new(),
-            heap: Heap::new(),
+            heap: SharedHeap::default(),
+            mutators: mutators.clone(),
+            _registration: mutators.register(),
             host,
             limits: Limits::default(),
             stats: ExecutionStats::default(),
@@ -247,6 +310,16 @@ impl Interpreter {
             type_objects: HashMap::new(),
             exit_requested: None,
             current_native: None,
+            monitors: crate::monitor::Monitors::default(),
+            #[cfg(feature = "std")]
+            pool: None,
+            #[cfg(feature = "std")]
+            threads: HashMap::new(),
+            #[cfg(feature = "std")]
+            next_thread_id: 0,
+            loaded_size: 0,
+            current_native_type_args: Vec::new(),
+            pending_type_args: Vec::new(),
         }
     }
 
@@ -278,6 +351,15 @@ impl Interpreter {
     /// The method whose native handler is running, if any.
     pub fn current_native_method(&self) -> Option<MethodId> {
         self.current_native
+    }
+
+    /// Type arguments the call site named, for a native on a framework generic.
+    ///
+    /// Empty when the call site named none — an ordinary method, or a
+    /// construction this runtime gave a runtime type of its own, where the
+    /// method already knows.
+    pub fn current_type_arguments(&self) -> &[TypeId] {
+        &self.current_native_type_args
     }
 
     /// Assembly of the currently executing frame.
@@ -331,7 +413,7 @@ impl Interpreter {
     }
 
     pub fn string_value(&self, handle: Handle) -> Option<String> {
-        self.heap.get_as::<ClrString>(handle).map(|s| s.to_rust_string())
+        self.heap.with::<ClrString, _>(handle, |s| s.to_rust_string())
     }
 
     /// Reads a value expected to be a string. `null` yields `None`.
@@ -459,7 +541,8 @@ impl Interpreter {
     }
 
     pub fn type_of(&self, handle: Handle) -> Option<TypeId> {
-        let obj = self.heap.get(handle)?;
+        // `with_any` keeps the borrow inside the lock; see `SharedHeap`.
+        self.heap.with_any(handle, |obj| {
         let any = obj.as_any();
         if let Some(o) = any.downcast_ref::<ClrObject>() {
             Some(o.type_id)
@@ -476,6 +559,8 @@ impl Interpreter {
         } else {
             Some(self.loader.core().object)
         }
+        })
+        .flatten()
     }
 
     /// The `System.Type` instance describing `type_id`, allocated once.
@@ -493,25 +578,29 @@ impl Interpreter {
             return Handle::NULL;
         };
         let handle = self.alloc_object(type_type);
-        if let Some(o) = self.heap.get_as_mut::<ClrObject>(handle) {
+        self.heap.with_mut::<ClrObject, _>(handle, |o| {
             if o.fields.is_empty() {
                 o.fields.push(Value::I32(type_id.0 as i32));
             } else {
                 o.fields[0] = Value::I32(type_id.0 as i32);
             }
-        }
+        });
         self.type_objects.insert(type_id, handle);
         handle
     }
 
     /// The runtime type a `System.Type` instance describes.
     pub fn type_from_object(&self, handle: Handle) -> Option<TypeId> {
-        let object = self.heap.get_as::<ClrObject>(handle)?;
+        // Copied out rather than held: the borrow ends before the loader is
+        // consulted, which is what an accessor behind a lock will require.
+        let described = self
+            .heap
+            .with::<ClrObject, _>(handle, |o| (o.type_id, o.fields.first().and_then(|f| f.as_i32())))?;
         let type_type = self.loader.registry.find_type_by_name("System.Type")?;
-        if object.type_id != type_type {
+        if described.0 != type_type {
             return None;
         }
-        let id = object.fields.first()?.as_i32()?;
+        let id = described.1?;
         let id = TypeId(id as u32);
         if id.index() < self.loader.registry.type_count() {
             Some(id)
@@ -535,9 +624,7 @@ impl Interpreter {
                 v.trace_handles(&mut out);
             }
         }
-        for v in self.loader.static_values() {
-            v.trace_handles(&mut out);
-        }
+        self.loader.static_roots(&mut out);
         out.extend(self.interned.values().copied());
         out.extend(self.literal_cache.values().copied());
         out.extend(self.type_objects.values().copied());
@@ -545,8 +632,17 @@ impl Interpreter {
     }
 
     /// Collects if the policy asks for it. Only called between instructions,
-    /// where no interior state is mid-update.
+    /// where no interior state is mid-update — which is also what makes this
+    /// point safe to *stop* at, so it doubles as the safepoint poll.
+    ///
+    /// The two jobs are deliberately at the same place. A thread that checks
+    /// whether it should collect is a thread that has just finished an
+    /// instruction, and that is exactly when its roots are describable.
     pub fn maybe_collect(&mut self) {
+        // Park here if another thread is collecting. Cheap when nobody is:
+        // one relaxed load of the `stopping` flag.
+        self.mutators.poll(|| self.roots());
+
         if self.heap.should_collect() {
             self.force_collect();
         }
@@ -554,8 +650,311 @@ impl Interpreter {
 
     pub fn force_collect(&mut self) {
         let roots = self.roots();
-        self.heap.collect(&roots as &dyn RootSet);
+        let heap = self.heap.clone();
+        // Every other registered thread parks before `collect` runs, and each
+        // hands in its own roots on the way. With one thread this reduces to
+        // collecting against `roots` and costs a flag check.
+        self.mutators.stop_the_world(roots, |all| heap.collect(all));
         self.stats.collections += 1;
+    }
+
+    /// An interpreter that runs the same program on another thread.
+    ///
+    /// Shares the heap, the mutator registry, the native bindings and static
+    /// field storage; **copies** the loader. That sounds like two runtimes and
+    /// is one, because a loader is finished by the time anything runs: the copy
+    /// has the same `TypeId`s and `MethodId`s as the original, so the two read
+    /// identical tables and neither pays a lock to do it. See [`Loader`] on why
+    /// that holds, and [`Interpreter::diverged`] on what would break it.
+    ///
+    /// The two are then mutator threads over one object graph: either can
+    /// allocate, either can mutate an object the other made, either sees the
+    /// other's writes to a static, and a collection on either stops both.
+    #[cfg(feature = "std")]
+    pub fn worker(&self, host: Box<dyn Host>) -> Self {
+        let mut worker = Self::with_host(host);
+        worker.heap = self.heap.clone();
+        worker.mutators = self.mutators.clone();
+        // Registration follows the registry. Assigning here drops the
+        // membership `with_host` took in the throwaway registry it made.
+        worker._registration = worker.mutators.register();
+        worker.limits = self.limits.clone();
+
+        // One set of monitors, or `lock` would exclude nothing.
+        worker.monitors = self.monitors.clone();
+        // The pool is shared so a worker can queue work and help drain it, but
+        // it is *not* started by this: a pool building its own workers would
+        // recurse forever.
+        worker.pool = self.pool.clone();
+        worker.loader = self.loader.clone();
+        worker.loader.share_statics_with(&self.loader);
+        // The bindings are the same program's, and a native the parent
+        // registered has to be reachable from the worker or the two would run
+        // different code.
+        worker.natives = self.natives.clone();
+        // Interned strings and `System.Type` instances are identity-bearing:
+        // `typeof(T) == typeof(T)` and `ReferenceEquals` on an interned string
+        // must hold across threads, so the caches come across rather than being
+        // rebuilt into different objects.
+        worker.interned = self.interned.clone();
+        worker.literal_cache = self.literal_cache.clone();
+        worker.type_objects = self.type_objects.clone();
+        worker.loaded_size = self.loader.registry.method_count();
+        worker
+    }
+
+    /// Runs `body` on a real OS thread and returns a token for joining it.
+    ///
+    /// The thread gets a worker: same heap, same statics, same bindings, its
+    /// own frames. It is a *managed* thread in every sense that matters — it
+    /// allocates into the same object graph, it is stopped by a collection, and
+    /// what it writes to a static is what the starting thread reads.
+    #[cfg(feature = "std")]
+    pub fn spawn(
+        &mut self,
+        host: Box<dyn Host>,
+        body: impl FnOnce(&mut Interpreter) -> ExecResult<()> + Send + 'static,
+    ) -> u64 {
+        let mut worker = self.worker(host);
+        let handle = std::thread::spawn(move || {
+            let result = body(&mut worker);
+            // The worker's loader is dropped here, and with it its registration
+            // in the mutator registry — a collection will stop waiting for a
+            // thread that has gone.
+            (result, worker.diverged())
+        });
+        self.next_thread_id = self.next_thread_id.wrapping_add(1).max(1);
+        let id = self.next_thread_id;
+        self.threads.insert(id, handle);
+        id
+    }
+
+    /// How many other mutators are registered.
+    ///
+    /// Zero means nothing else is running managed code, so a task still pending
+    /// will stay that way — which is the difference between waiting and
+    /// hanging.
+    pub fn other_threads_running(&self) -> usize {
+        self.mutators.registered().saturating_sub(1)
+    }
+
+    /// Whether this interpreter started the thread with that id.
+    ///
+    /// Join handles belong to the interpreter that spawned them, so a thread
+    /// waiting on a task another thread started has to watch instead of join.
+    #[cfg(feature = "std")]
+    pub fn owns_thread(&self, id: u64) -> bool {
+        self.threads.contains_key(&id)
+    }
+
+    /// Waits for a thread started by [`Interpreter::spawn`].
+    ///
+    /// Waiting reaches no safe point, so it is done inside [`Self::blocking`]:
+    /// a collection on the thread being waited for would otherwise wait for
+    /// this one forever. That deadlock is not hypothetical — it is the first
+    /// thing the safepoint protocol got wrong.
+    #[cfg(feature = "std")]
+    pub fn join(&mut self, id: u64) -> ExecResult<()> {
+        let Some(handle) = self.threads.remove(&id) else {
+            return Ok(());
+        };
+        let joined = self.blocking(|_| handle.join());
+        match joined {
+            Ok((result, diverged)) => {
+                if diverged {
+                    return Err(ExecutionError::Unsupported(
+                        "a thread grew the type registry while another was running: this runtime                          gives each thread an identical copy of the loader, and one that grows is                          no longer identical. See docs/limitations.md."
+                            .into(),
+                    ));
+                }
+                result
+            }
+            // A panic in managed code is a runtime bug, not a program error.
+            Err(_) => Err(ExecutionError::InvalidProgram(
+                "a managed thread panicked".into(),
+            )),
+        }
+    }
+
+    /// The task pool, started on first use.
+    #[cfg(feature = "std")]
+    pub fn task_pool(&mut self) -> crate::pool::TaskPool {
+        if let Some(pool) = &self.pool {
+            return pool.clone();
+        }
+        let pool = crate::pool::TaskPool::start(self, crate::pool::default_host);
+        self.pool = Some(pool.clone());
+        pool
+    }
+
+    /// Queues managed work on the pool.
+    #[cfg(feature = "std")]
+    pub fn queue_work(
+        &mut self,
+        job: Box<dyn FnOnce(&mut Interpreter) + Send>,
+    ) {
+        self.task_pool().submit(job);
+    }
+
+    /// Queues managed work to run after a delay.
+    #[cfg(feature = "std")]
+    pub fn queue_work_after(
+        &mut self,
+        delay: core::time::Duration,
+        job: Box<dyn FnOnce(&mut Interpreter) + Send>,
+    ) {
+        self.task_pool().schedule(delay, job);
+    }
+
+    /// Announces this thread blocked until the guard drops, holding no roots.
+    ///
+    /// For a pool worker waiting for work: it is between jobs, so its frames
+    /// are empty and there is nothing for a collection to keep.
+    #[cfg(feature = "std")]
+    pub fn blocked_now(&self) -> rustclr_gc::safepoint::Blocked {
+        self.mutators.blocked()
+    }
+
+    /// Runs one queued job here, if there is one. Used by a thread that would
+    /// otherwise idle waiting for a task.
+    #[cfg(feature = "std")]
+    pub fn help_with_queued_work(&mut self) -> bool {
+        let Some(pool) = self.pool.clone() else { return false };
+        pool.run_one(self)
+    }
+
+    /// Whether anything could still complete a pending task.
+    ///
+    /// Pool workers are always registered, so counting mutators alone would say
+    /// "yes" forever. What matters is whether work is outstanding, or a thread
+    /// that is not a pool worker is running.
+    #[cfg(feature = "std")]
+    pub fn work_may_still_arrive(&self) -> bool {
+        let pooled = self.pool.as_ref().map(|p| p.worker_count()).unwrap_or(0);
+        let outstanding = self.pool.as_ref().map(|p| p.outstanding()).unwrap_or(0);
+        outstanding > 0 || self.mutators.registered().saturating_sub(1 + pooled) > 0
+    }
+
+    /// Takes the monitor on `object` — the `Enter` half of `lock (object)`.    /// Takes the monitor on `object` — the `Enter` half of `lock (object)`.
+    ///
+    /// Blocks until it is free. The wait is announced to the collector, since
+    /// a thread queued on a lock reaches no safe point of its own.
+    pub fn monitor_enter(&mut self, object: Handle) {
+        let monitors = self.monitors.clone();
+        let mutators = self.mutators.clone();
+        let roots = self.roots();
+        monitors.enter(object, &mut |wait| {
+            let guard = mutators.blocked_with(roots.clone());
+            wait();
+            drop(guard);
+        });
+    }
+
+    /// Releases one level of the monitor on `object`.
+    pub fn monitor_exit(&mut self, object: Handle) {
+        self.monitors.exit(object);
+    }
+
+    /// Whether this thread holds the monitor on `object`.
+    pub fn monitor_held(&self, object: Handle) -> bool {
+        self.monitors.holds(object)
+    }
+
+    /// Runs `f` with no other thread inside an interlocked operation.
+    ///
+    /// `Interlocked.Increment` is a read, an add and a write, and each of those
+    /// takes the heap or statics lock separately — so without this, two threads
+    /// interleave between them and one increment is lost. The lock is the
+    /// monitor on a handle no object can have, which reuses machinery that
+    /// already announces itself to the collector.
+    pub fn interlocked<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.monitor_enter(Handle::NULL);
+        let out = f(self);
+        self.monitor_exit(Handle::NULL);
+        out
+    }
+
+    /// Whether this interpreter's loader has grown since it was copied.
+    ///
+    /// Two loaders that were identical stay identical only while neither adds
+    /// to its registry, and a `MethodId` minted on one thread means nothing on
+    /// another — it would name a different method, or none. Growth is rare and
+    /// bounded: an interface stub for a native implementation, or
+    /// `MakeGenericType`. This is how a thread notices it happened.
+    pub fn diverged(&self) -> bool {
+        self.loaded_size != 0 && self.loader.registry.method_count() != self.loaded_size
+    }
+
+    /// Bytes an instance of `type_id` occupies, for marshalling.
+    pub fn size_of_public(&self, type_id: TypeId) -> usize {
+        self.size_of(type_id)
+    }
+
+    /// A pointer to a fresh byte buffer of `size` bytes.
+    pub fn alloc_pointer(&mut self, size: usize) -> crate::value::RawPtr {
+        let buffer = self.alloc_byte_buffer(size);
+        crate::value::RawPtr { buffer, offset: 0 }
+    }
+
+    /// Reads `width` bytes through a pointer.
+    pub fn read_pointer(
+        &mut self,
+        p: crate::value::RawPtr,
+        width: usize,
+    ) -> ExecResult<Value> {
+        self.load_pointer_sized(p, width)
+    }
+
+    /// Writes `width` bytes through a pointer.
+    pub fn write_pointer(
+        &mut self,
+        p: crate::value::RawPtr,
+        value: Value,
+        width: usize,
+    ) -> ExecResult<()> {
+        let op = match width {
+            1 => Op::StindI1,
+            2 => Op::StindI2,
+            8 => Op::StindI8,
+            _ => Op::StindI4,
+        };
+        self.store_through_pointer(p, value, op)
+    }
+
+    /// `cpblk`, for the BCL's `Unsafe.CopyBlock`.
+    pub fn copy_block_public(&mut self, to: Value, from: Value, count: usize) -> ExecResult<()> {
+        self.copy_block(to, from, count)
+    }
+
+    /// `initblk`, for the BCL's `Unsafe.InitBlock`.
+    pub fn fill_block_public(&mut self, to: Value, fill: u8, count: usize) -> ExecResult<()> {
+        self.fill_block(to, fill, count)
+    }
+
+    /// The mutator registry this interpreter belongs to.
+    ///
+    /// A second interpreter built on the same registry and the same
+    /// [`SharedHeap`] is a second mutator thread: allocation is serialised by
+    /// the heap lock, and collection stops both.
+    pub fn mutators(&self) -> &Mutators {
+        &self.mutators
+    }
+
+    /// Marks a stretch of work that reaches no safepoint — a blocking call,
+    /// or native code the runtime cannot interrupt.
+    ///
+    /// A collection may proceed while this is held; the thread's roots were
+    /// recorded when it entered. Dropping the guard is itself a safepoint, so
+    /// a thread that returns mid-collection waits rather than running on a
+    /// heap being swept.
+    pub fn blocking<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        // The roots go with it. A thread waiting in `Join` still holds every
+        // local in its frames, and a collection that ran while it was away used
+        // to sweep them.
+        let guard = self.mutators.blocked_with(self.roots());
+        let out = f(self);
+        drop(guard);
+        out
     }
 
     // -- compilation ---------------------------------------------------------
@@ -636,9 +1035,9 @@ impl Interpreter {
             let array = self.alloc_array(string_type, host_args.len());
             for (i, a) in host_args.iter().enumerate() {
                 let s = self.alloc_string(a);
-                if let Some(arr) = self.heap.get_as_mut::<ClrArray>(array) {
+                self.heap.with_mut::<ClrArray, _>(array, |arr| {
                     arr.storage.set(i, &Value::Obj(s));
-                }
+                });
             }
             vec![Value::Obj(array)]
         } else {
@@ -673,9 +1072,9 @@ impl Interpreter {
         // compiled method needs no interpreter state at all, so this is where
         // the saving is: no frame, no locals vector, no decode loop.
         if let Some(tier) = self.native_tier.as_mut() {
-            if let Some(result) = tier.try_execute(&self.loader, method, &args) {
+            if let Some(outcome) = tier.try_execute(&self.loader, &self.heap, method, &args) {
                 self.stats.native_tier_calls += 1;
-                return Ok(Entered::Native(result));
+                return outcome.map(Entered::Native);
             }
         }
 
@@ -726,6 +1125,7 @@ impl Interpreter {
             finally_resume: None,
             in_flight: None,
             constrained: None,
+            construction: None,
             pending_newobj: None,
             pending_newobj_is_cell: false,
             is_filter: false,
@@ -735,6 +1135,14 @@ impl Interpreter {
     }
 
     /// Runs a method that has no IL body: native, P/Invoke or runtime-provided.
+    /// Type arguments for the *next* non-IL call, taken from its call site.
+    ///
+    /// Consumed by `call_non_il`, so they belong to one call and cannot leak
+    /// into the next one.
+    pub(crate) fn stage_type_arguments(&mut self, args: Vec<TypeId>) {
+        self.pending_type_args = args;
+    }
+
     fn call_non_il(&mut self, method: MethodId, args: &[Value]) -> ExecResult<Option<Value>> {
         let info = self.loader.registry.method(method);
         let qualified = info.qualified_name.clone();
@@ -745,8 +1153,12 @@ impl Interpreter {
                 for key in self.loader.native_keys(method) {
                     if let Some(f) = self.natives.get(&key).copied() {
                         let previous = self.current_native.replace(method);
+                        let previous_args = core::mem::take(&mut self.pending_type_args);
+                        let previous_args =
+                            core::mem::replace(&mut self.current_native_type_args, previous_args);
                         let result = f(self, args);
                         self.current_native = previous;
+                        self.current_native_type_args = previous_args;
                         return result;
                     }
                 }
@@ -792,8 +1204,7 @@ impl Interpreter {
             };
             let targets = self
                 .heap
-                .get_as::<ClrDelegate>(*h)
-                .map(|d| d.targets.clone())
+                .with::<ClrDelegate, _>(*h, |d| d.targets.clone())
                 .ok_or_else(ExecutionError::null_reference)?;
 
             let mut result = None;
@@ -950,8 +1361,8 @@ impl Interpreter {
                 // caller the constructed value, not the cell.
                 (Some(cell), true) => self
                     .heap
-                    .get_as::<ClrObject>(cell)
-                    .and_then(|o| o.fields.first().cloned()),
+                    .with::<ClrObject, _>(cell, |o| o.fields.first().cloned())
+                    .flatten(),
                 (Some(handle), false) => Some(Value::Obj(handle)),
                 _ => None,
             },

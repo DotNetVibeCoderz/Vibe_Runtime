@@ -60,6 +60,42 @@ pub enum Value {
     Struct(Box<StructValue>),
     /// A method pointer produced by `ldftn` / `ldvirtftn`.
     FnPtr(crate::types::MethodId),
+    /// An unmanaged pointer: a byte offset into a buffer on the managed heap.
+    ///
+    /// Not an address. C# reaches for one through `stackalloc` or `fixed`, and
+    /// both name memory this runtime already owns — `localloc` allocates a byte
+    /// array, and `fixed` pins an existing one — so a pointer can be the pair
+    /// (buffer, byte offset) and stay inside the handle table. Arithmetic moves
+    /// the offset; nothing here can be made to point at memory the runtime does
+    /// not own, which is the property that keeps `unsafe` C# safe underneath.
+    ///
+    /// This is why [`ByRef`] and this are different things. A `ByRef` is a
+    /// *path* to a slot — a local, a field, an element — and cannot be
+    /// byte-addressed or advanced past its target. `conv.u` on one produces
+    /// this, which is exactly what `fixed` compiles to.
+    Ptr(RawPtr),
+}
+
+/// An unmanaged pointer: a buffer and a byte offset into it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawPtr {
+    /// The array the pointer is into. Null for a null pointer.
+    pub buffer: Handle,
+    /// Bytes from the start of the buffer. Signed, because pointer arithmetic
+    /// may legally step outside a buffer as long as nothing dereferences there.
+    pub offset: i64,
+}
+
+impl RawPtr {
+    pub const NULL: RawPtr = RawPtr { buffer: Handle::NULL, offset: 0 };
+
+    pub fn is_null(&self) -> bool {
+        self.buffer.is_null()
+    }
+
+    pub fn offset_by(self, bytes: i64) -> RawPtr {
+        RawPtr { buffer: self.buffer, offset: self.offset + bytes }
+    }
 }
 
 /// The contents of an unboxed value type.
@@ -129,6 +165,8 @@ impl Value {
             Value::Obj(h) => !h.is_null(),
             Value::Ref(_) | Value::FnPtr(_) => true,
             Value::Struct(_) => true,
+            // A null pointer is false, exactly as `brfalse` on one expects.
+            Value::Ptr(p) => !p.is_null() || p.offset != 0,
         }
     }
 
@@ -144,6 +182,7 @@ impl Value {
             Value::Ref(_) => "&",
             Value::Struct(_) => "value type",
             Value::FnPtr(_) => "method pointer",
+            Value::Ptr(_) => "native int",
         }
     }
 
@@ -153,6 +192,10 @@ impl Value {
             Value::Obj(h) if !h.is_null() => out.push(*h),
             Value::Ref(ByRef::Field { object, .. }) => out.push(*object),
             Value::Ref(ByRef::ArrayElement { array, .. }) => out.push(*array),
+            // A raw pointer roots the buffer it points into. `stackalloc`
+            // memory has no other reference anywhere, so without this a
+            // collection between the `localloc` and the next write frees it.
+            Value::Ptr(p) if !p.is_null() => out.push(p.buffer),
             // A pointer into a struct roots whatever its base roots: the
             // struct may live in a field of a heap object that nothing else
             // on the stack refers to.
@@ -181,6 +224,7 @@ impl core::fmt::Display for Value {
             Value::Ref(r) => write!(f, "&{r:?}"),
             Value::Struct(s) => write!(f, "struct#{}", s.type_id.0),
             Value::FnPtr(m) => write!(f, "fn#{}", m.0),
+            Value::Ptr(p) => write!(f, "{:?}+{}", p.buffer, p.offset),
         }
     }
 }
@@ -213,5 +257,26 @@ mod tests {
         let mut out = Vec::new();
         inner.trace_handles(&mut out);
         assert_eq!(out.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::*;
+
+    /// Every evaluation-stack slot, every local and every argument is a
+    /// `Value`, so its width is multiplied by everything the interpreter does.
+    /// It is 24 bytes because `ByRef` is 16 and needs a discriminant beside it.
+    ///
+    /// This is here because adding `Value::Ptr` looked like it should have cost
+    /// something and did not: `RawPtr` is a handle and an offset, 16 bytes, so
+    /// it fits in the room `ByRef` had already taken. A future variant that is
+    /// wider would widen every slot in the runtime, which is worth failing a
+    /// test over rather than discovering in a benchmark.
+    #[test]
+    fn a_value_stays_three_words() {
+        assert_eq!(core::mem::size_of::<ByRef>(), 16);
+        assert_eq!(core::mem::size_of::<RawPtr>(), 16);
+        assert_eq!(core::mem::size_of::<Value>(), 24);
     }
 }

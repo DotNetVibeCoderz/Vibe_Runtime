@@ -20,7 +20,12 @@ bash probe.sh
 
 ## Matriksnya
 
-**13 dari 21 probe menghasilkan keluaran identik di kedua runtime.**
+**21 dari 21 probe menghasilkan keluaran identik di kedua runtime.**
+
+Itu pernyataan tentang *keluaran*, bukan tentang kemampuan. Baris `async`,
+threading dan TPL ditandai ⚠️ karena probe tidak bisa membedakannya: ketiganya
+memberi jawaban yang sama dengan .NET, tanpa konkurensi sama sekali. Probe yang
+mengukur tumpang tindih waktu nyata akan gagal.
 
 ### Asynchronous & Parallel Programming
 
@@ -37,7 +42,7 @@ bash probe.sh
 | --- | --- | --- |
 | Garbage Collection | ✅ | Mark-sweep, menangani siklus, bisa diganti |
 | `IDisposable` / `using` | ✅ | Dispatch interface menemukan `Dispose` yang konkret |
-| `IAsyncDisposable` / `await using` | ❌ | Belum diimplementasikan; `async` sendiri sudah jalan |
+| `IAsyncDisposable` / `await using` | ✅ | Jalan, dengan `ValueTask` di bawahnya. Dispose berjalan setelah body |
 | `Span<T>`, `Memory<T>` | ❌ | Ref struct generic, dan `stackalloc` butuh `localloc` |
 
 ### Modern Language Features (C# 12–15)

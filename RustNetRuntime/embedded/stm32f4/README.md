@@ -60,7 +60,7 @@ collector, which is what the board *can* do.
 **The image does not carry the interpreter it cannot use.** `Tier::for_budget`
 is a `const fn` and `HEAP_BYTES` is a constant, so LTO folds the decision at
 compile time, finds the `Full` and `Minimal` arms unreachable, and strips the
-loader and all 821 native bindings. That is why `.text` is 21 KB here against
+loader and all 826 native bindings. That is why `.text` is 21 KB here against
 282 KB on the F427VI. It was not designed for — it fell out of making the tier
 a constant expression — but it is the right outcome, and it is worth knowing
 that a board below the threshold pays no flash for being below it.

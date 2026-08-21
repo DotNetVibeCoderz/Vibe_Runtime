@@ -120,10 +120,12 @@ pub mod collections;
 pub mod console;
 pub mod interpolation;
 pub mod linq;
+pub mod marshal;
 pub mod numerics;
 pub mod ranges;
 pub mod reflection;
 pub mod runtime;
+pub mod spans;
 pub mod strings;
 pub mod tasks;
 pub mod threading;
@@ -141,6 +143,8 @@ pub fn install(interp: &mut Interpreter) {
     interpolation::register(interp);
     ranges::register(interp);
     strings::register(interp);
+    spans::register(interp);
+    marshal::register(interp);
     numerics::register(interp);
     threading::register(interp);
     collections::register(interp);
@@ -152,7 +156,7 @@ pub fn install(interp: &mut Interpreter) {
 /// Registers the bindings a console program needs, and no more.
 ///
 /// `Console`, `String`, `Math`, interpolated strings and the object/runtime
-/// basics — 314 bindings against [`install`]'s 821. No generic collections, no
+/// basics — 314 bindings against [`install`]'s 826. No generic collections, no
 /// LINQ, no reflection, no tasks.
 ///
 /// This exists for boards that cannot hold the whole binding table. Registering
@@ -167,6 +171,8 @@ pub fn install_minimal(interp: &mut Interpreter) {
     console::register(interp);
     interpolation::register(interp);
     strings::register(interp);
+    spans::register(interp);
+    marshal::register(interp);
     numerics::register(interp);
 }
 

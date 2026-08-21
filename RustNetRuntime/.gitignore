@@ -17,3 +17,4 @@ Thumbs.db
 testkey.txt
 *.key
 *.pem
+backups/

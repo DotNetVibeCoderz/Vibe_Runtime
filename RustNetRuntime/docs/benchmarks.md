@@ -18,11 +18,12 @@ process start.
 
 | Workload | .NET (ms) | RustCLR (ms) | Ratio | What it stresses |
 | --- | ---: | ---: | ---: | --- |
-| `noop` | 108 | **62** | **0.6×** | Process start — nothing else |
+| `noop` | 109 | **58** | **0.5×** | Process start — nothing else |
 | `exceptions` | 130 | **111** | **0.9×** | 50k throws through `try`/`catch`/`finally` |
 | `kernels` | 149 | **268** | **1.8×** | Integer arithmetic written longhand — **compiled** |
 | `strings` | 96 | **190** | **2.0×** | 20k concatenations, `Length`, `IndexOf` |
-| `inlined` | 106 | **310** | **2.9×** | The same arithmetic in helpers — **compiled, inlined** |
+| `inlined` | 113 | **327** | **2.9×** | The same arithmetic in helpers — **compiled, inlined** |
+| `arrays` | 128 | **418** | **3.3×** | An `int[]` passed in and walked — **compiled** |
 | `fib` | 108 | 442 | 4.1× | Recursive call overhead, fib(27) |
 | `alloc` | 112 | 1,014 | 9.1× | 300k allocations with collection pressure |
 | `sieve` | 107 | 1,287 | 12.0× | 1M-element sieve: array writes in a tight loop |
@@ -34,6 +35,30 @@ process start.
 Every row's checksum is compared between the two runtimes before it is timed. A
 mismatch prints `MISMATCH` instead of a number — a benchmark that computed a
 different answer is not a benchmark.
+
+### How much of a difference is real
+
+**About ten percent of run-to-run drift, on this machine, within one session.**
+That is measured, not assumed: `fields` gave 2,856 ms, then 3,097 ms, then
+3,200 ms across one afternoon on the same binary, drifting slower as the machine
+warmed. Two full suite runs an hour apart put every row 5–10% above the table
+above.
+
+So a 5% difference between two runs of this suite means nothing. Before
+attributing one to a change, measure both binaries **in the same session,
+interleaved** — which is how the shared-heap cost in
+[limitations.md](limitations.md) was measured, and why that comparison is
+trustworthy where a comparison against this table would not be.
+
+The check that catches a real regression is the reverse experiment: remove the
+suspect code and measure again. A per-call lookup added for generic type
+arguments looked like an 8% cost on `virtual` until deleting it measured
+*slower* still — the drift was the whole signal.
+
+`noop` is the row to distrust most: it is process start and nothing else, so it
+measures the machine rather than the runtime. Registering the full BCL rather
+than the console-only subset accounts for about 3 ms of it, measured with
+`--bcl minimal`.
 
 ---
 
@@ -57,6 +82,19 @@ written two ways.
 nothing — the shape the backend has always taken. Compiled it runs in 269 ms
 against 2,971 ms interpreted: **11.0× faster**, moving it from 20× slower than
 .NET to 1.8×.
+
+`arrays` is the third, and the one with the widest gap. An `int[]` that arrives
+as a *parameter* is handed to compiled code as a data pointer and a length, so
+element access is a bounds check and a scaled-index load. Interpreted it takes
+18,401 ms; compiled, 205 ms — **89.8×**, because element access is exactly where
+the interpreter pays most: a handle resolution and a `Value` for every element.
+
+Note what `arrays` does *not* measure. `sieve` and `sort` are array-bound too
+and did not move at all, because they allocate their arrays as locals and the
+backend declines any method that allocates. That is not an oversight in them —
+it is the invariant that makes a raw pointer into the managed heap safe for the
+length of a call, and the reason `arrays` was added beside them rather than
+instead of them.
 
 `inlined` factors the identical arithmetic into small static helpers, which is
 what code in the wild actually looks like. Every one of those calls used to

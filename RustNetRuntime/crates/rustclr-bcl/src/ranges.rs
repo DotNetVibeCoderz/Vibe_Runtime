@@ -246,9 +246,11 @@ fn get_sub_array(interp: &mut Interpreter, args: &[Value]) -> ExecResult<Option<
         return Err(ExecutionError::null_reference());
     }
 
-    let (element_type, length) = match interp.heap.get_as::<ClrArray>(source) {
-        Some(array) => (array.element_type, array.len() as i32),
-        None => return Err(ExecutionError::null_reference()),
+    let described = interp
+        .heap
+        .with::<ClrArray, _>(source, |array| (array.element_type, array.len() as i32));
+    let Some((element_type, length)) = described else {
+        return Err(ExecutionError::null_reference());
     };
 
     let bounds = arg(interp, args, 1)?;
@@ -276,11 +278,13 @@ fn get_sub_array(interp: &mut Interpreter, args: &[Value]) -> ExecResult<Option<
     // source stays primitive in the slice.
     for index in 0..count {
         let value = interp
-            .heap
-            .get_as::<ClrArray>(source)
-            .and_then(|a| a.storage.get(start as usize + index));
-        if let (Some(value), Some(target)) = (value, interp.heap.get_as_mut::<ClrArray>(slice)) {
-            target.storage.set(index, &value);
+            .heap.with::<ClrArray, _>(source, |a| a.storage.get(start as usize + index)).flatten();
+        // The source read above has already finished, so only one borrow is
+        // live here — a tuple pattern holding both would need two at once.
+        if let Some(value) = value {
+            interp
+                .heap
+                .with_mut::<ClrArray, _>(slice, |target| target.storage.set(index, &value));
         }
     }
 

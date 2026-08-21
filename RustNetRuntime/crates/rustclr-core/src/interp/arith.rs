@@ -5,6 +5,7 @@
 //! division by zero throws rather than trapping.
 
 use super::*;
+use crate::value::RawPtr;
 use core::cmp::Ordering;
 
 #[allow(unused_imports)]
@@ -30,6 +31,11 @@ impl Interpreter {
             // emit it; treat it as float so a mis-decode degrades gracefully.
             (F(_), _) | (_, F(_)) => Promoted::Float,
             (Ref(_), _) | (_, Ref(_)) => Promoted::Pointer,
+            // A raw pointer that reaches here is not in an `add` or `sub` —
+            // `pointer_arith` took those — so it is being multiplied or
+            // masked, which is arithmetic on an address this runtime does not
+            // have.
+            (Ptr(_), _) | (_, Ptr(_)) => Promoted::Pointer,
             (I64(_), _) | (_, I64(_)) => Promoted::I64,
             (NativeInt(_), _) | (_, NativeInt(_)) => Promoted::Native,
             (I32(_), I32(_)) => Promoted::I32,
@@ -45,8 +51,43 @@ impl Interpreter {
     }
 
     /// `add`, `sub`, `mul`, `div`, `rem` and their unsigned variants.
+    /// `add` and `sub` where one side is a raw pointer.
+    ///
+    /// `None` when neither is, which is every ordinary arithmetic instruction.
+    fn pointer_arith(&mut self, op: Op, a: &Value, b: &Value) -> ExecResult<Option<Value>> {
+        match (a, b) {
+            // The difference of two pointers is a count of bytes, and is only
+            // meaningful inside one buffer. A program comparing pointers into
+            // different buffers has already left what it can rely on.
+            (Value::Ptr(x), Value::Ptr(y)) if op == Op::Sub => {
+                Ok(Some(Value::NativeInt(x.offset - y.offset)))
+            }
+            (Value::Ptr(p), other) if matches!(op, Op::Add | Op::Sub) => {
+                let step = other.as_i64().unwrap_or(0);
+                let step = if op == Op::Sub { -step } else { step };
+                Ok(Some(Value::Ptr(p.offset_by(step))))
+            }
+            // `4 + p` is as legal as `p + 4`; subtraction the other way round
+            // is not, and falls through to the numeric path that refuses it.
+            (other, Value::Ptr(p)) if op == Op::Add => {
+                let step = other.as_i64().unwrap_or(0);
+                Ok(Some(Value::Ptr(p.offset_by(step))))
+            }
+            _ => Ok(None),
+        }
+    }
+
     pub(super) fn binary_numeric(&mut self, op: Op, unsigned: bool) -> ExecResult<()> {
         let (a, b) = self.pop2()?;
+
+        // Pointer arithmetic, before the numeric promotion: a pointer here is
+        // a buffer plus a byte offset, and adding an integer to one has to
+        // keep the buffer rather than collapse to a number.
+        if let Some(result) = self.pointer_arith(op, &a, &b)? {
+            self.push(result);
+            return Ok(());
+        }
+
         let result = match self.promote(&a, &b)? {
             Promoted::Float => {
                 let x = as_f(&a);
@@ -290,15 +331,36 @@ impl Interpreter {
     /// Unchecked `conv.*`.
     pub(super) fn convert(&mut self, op: Op, v: &Value) -> ExecResult<Value> {
         // `conv.i` / `conv.u` on a managed pointer is how C# turns a `fixed`
-        // reference into a raw pointer. This runtime represents managed
-        // pointers structurally — they have no address — so there is no honest
-        // integer to produce. Silently yielding 0 would surface later as a
-        // null dereference a long way from the cause.
-        if matches!(v, Value::Ref(_)) && matches!(op, Op::ConvI | Op::ConvU) {
-            return Err(ExecutionError::Unsupported(
-                "converting a managed reference to a raw pointer; `unsafe` pointer arithmetic is not supported by this runtime"
-                    .into(),
-            ));
+        // reference into a raw pointer, and `fixed` is always over an array —
+        // which is the one managed pointer that *has* a byte offset, because
+        // the array behind it is laid out in bytes.
+        //
+        // Every other managed pointer is structural: a path to a local, a
+        // field, a slot. There is no honest byte address for one, and yielding
+        // 0 would surface later as a null dereference a long way from here.
+        if matches!(op, Op::ConvI | Op::ConvU) {
+            if let Value::Ref(ByRef::ArrayElement { array, index }) = v {
+                let width = self
+                    .heap
+                    .with::<ClrArray, _>(*array, |a| a.storage.element_width())
+                    .flatten();
+                let Some(width) = width else {
+                    return Err(ExecutionError::Unsupported(
+                        "a raw pointer into an array of references: its elements are handles, not bytes"
+                            .into(),
+                    ));
+                };
+                return Ok(Value::Ptr(RawPtr {
+                    buffer: *array,
+                    offset: *index as i64 * width as i64,
+                }));
+            }
+            if matches!(v, Value::Ref(_)) {
+                return Err(ExecutionError::Unsupported(
+                    "converting a managed reference to a raw pointer: this reference is a path to a slot, not an address"
+                        .into(),
+                ));
+            }
         }
 
         Ok(match op {
@@ -393,6 +455,11 @@ impl Interpreter {
             (F(x), other) | (other, F(x)) => *x == to_i64(other) as f64,
             (Ref(x), Ref(y)) => x == y,
             (FnPtr(x), FnPtr(y)) => x == y,
+            // Same buffer, same offset. Two pointers into different buffers
+            // are never equal, which is what .NET guarantees for pointers into
+            // different objects.
+            (Ptr(x), Ptr(y)) => x == y,
+            (Ptr(x), Null) | (Null, Ptr(x)) => x.is_null(),
             _ => to_i64(a) == to_i64(b),
         }
     }
@@ -411,6 +478,13 @@ impl Interpreter {
             (F(x), other) => x.partial_cmp(&(to_i64(other) as f64)),
             (other, F(y)) => (to_i64(other) as f64).partial_cmp(y),
             (Obj(x), Obj(y)) => Some(x.to_bits().cmp(&y.to_bits())),
+            // Two pointers order by offset. `for (int* p = start; p < start +
+            // n; p++)` is the whole reason this exists, and without it `to_i64`
+            // reads both as zero and the loop never runs.
+            (Ptr(x), Ptr(y)) => Some(x.offset.cmp(&y.offset)),
+            // A pointer against anything else is a null check.
+            (Ptr(x), other) => Some((!x.is_null() as i64).cmp(&to_i64(other))),
+            (other, Ptr(y)) => Some(to_i64(other).cmp(&(!y.is_null() as i64))),
             _ => {
                 if unsigned {
                     Some(to_u64(a).cmp(&to_u64(b)))

@@ -24,10 +24,10 @@ menghasilkan keluaran yang identik di kedua runtime:
 
 ```console
 $ dotnet Conformance.dll
-checks=176 failures=0
+checks=222 failures=0
 
 $ rustnet run Conformance.dll --stats
-checks=176 failures=0
+checks=222 failures=0
 
 ─── execution ──────────────────────────────
   wall clock                  10.505 ms
@@ -340,7 +340,7 @@ handling tetap diinterpretasi. `rustnet run --no-jit` menginterpretasi
 semuanya, dan harus mencetak byte yang sama — ada differential test yang
 menjaminnya.
 
-**Fitur lanjutan C#.** 13 dari 21 fitur yang diuji menghasilkan keluaran identik
+**Fitur lanjutan C#.** 21 dari 21 fitur yang diuji menghasilkan keluaran identik
 di kedua runtime: garbage collection, `IDisposable`/`using`, `async`/`await`,
 threading dengan `lock` dan `Interlocked` (keduanya diserialkan — lihat
 dokumennya), primary constructor, collection expression atas array, extension
@@ -362,7 +362,9 @@ Matriks lengkapnya, beserta alasan tiap baris:
 `Thread` sama-sama dieksekusi inline, jadi hasilnya benar tetapi tidak ada
 paralelisme. *Argumen* tipe generic di-*erase*, sehingga kode generic buatan
 pengguna yang membaca `T` saat runtime — `typeof(T)`, `is T`, static field per
-instansiasi — tidak berperilaku benar, dan comparer kustom diabaikan.
+instansiasi — tidak berperilaku benar. Argumen tipe untuk *metode* generic
+sudah diketahui: `typeof(T)`, `default(T)`, dan `x is T` semuanya menjawab di
+dalam `M<T>`.
 Penghasil kode native hanya menangani metode bilangan bulat — 11,0× lebih cepat
 di tempat ia berlaku, dan kini juga menerima pemanggilan ke metode pembantu
 kecil lewat *inlining*, tetapi tetap menolak apa pun yang memakai array, yang
@@ -384,7 +386,7 @@ belas kombinasinya.
 
 **C# berjalan di mikrokontroler.** Di sebuah ESP32-C3 — RISC-V, SRAM 400 KB,
 tanpa sistem operasi — loader membangun type registry, RustBCL mendaftarkan
-seluruh 821 native binding-nya, dan interpreter mengeksekusi
+seluruh 826 native binding-nya, dan interpreter mengeksekusi
 `HelloWorld.Main`:
 
 ```
@@ -401,6 +403,10 @@ Hello from RustCLR
 il executed      68
 calls            6
 ```
+
+Rekaman itu diambil saat papan terakhir tersambung; sejak itu RustBCL tumbuh
+menjadi 826 binding. Angka pada kutipan adalah yang benar-benar dicetak chip,
+bukan yang akan dicetak build hari ini.
 
 Ketiga baris itu identik byte demi byte dengan keluaran
 `dotnet HelloWorld.dll` di desktop, termasuk CRLF-nya, begitu pula
@@ -543,7 +549,7 @@ handling tetap diinterpretasi. `rustnet run --no-jit` menginterpretasi
 semuanya, dan harus mencetak byte yang sama — ada differential test yang
 menjaminnya.
 
-**Fitur lanjutan C#.** 13 dari 21 fitur yang diuji menghasilkan keluaran identik
+**Fitur lanjutan C#.** 21 dari 21 fitur yang diuji menghasilkan keluaran identik
 di kedua runtime: garbage collection, `IDisposable`/`using`, `async`/`await`,
 threading dengan `lock` dan `Interlocked` (keduanya diserialkan — lihat
 dokumennya), primary constructor, collection expression atas array, extension

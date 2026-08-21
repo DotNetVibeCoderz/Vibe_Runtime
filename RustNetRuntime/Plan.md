@@ -121,7 +121,11 @@ something, and it is not worth what running them would be.
 
 **What it compiles.** Integer arithmetic, comparison, branching, arguments and
 locals, in methods that allocate nothing and have no exception handling. Calls
-are no longer disqualifying when the callee is small enough to inline.
+are no longer disqualifying when the callee is small enough to inline, and
+neither is an `int[]` that arrives as a parameter — element access compiles to a
+bounds check and a scaled-index load. An array created *inside* the method still
+is: `new int[n]` allocates, and "no allocation" is the invariant that makes
+holding a raw pointer into the heap sound for the length of a call.
 `rustnet jit <assembly>` lists what is taken and why the rest is not.
 
 **What it is worth.** Two benchmark workloads, because one number would hide
@@ -129,6 +133,7 @@ the shape of the result:
 
 | Workload | interpreted | compiled | speedup | vs .NET |
 | --- | ---: | ---: | ---: | ---: |
+| `arrays` — an `int[]` passed in and walked | 18,401 ms | 205 ms | **89.8×** | 1.8× |
 | `kernels` — arithmetic written out longhand | 2971 ms | 269 ms | **11.0×** | 1.8× |
 | `inlined` — the same arithmetic, factored into helpers | 1629 ms | 400 ms | **4.1×** | 3.6× |
 
@@ -186,7 +191,7 @@ and `Module` enumeration, and constructing generic types at run time.
 ## Milestone 6 — Embedded targets ◐
 
 **C# runs on a microcontroller.** On an ESP32-C3 — RISC-V, 400 KB of SRAM, no
-operating system — the loader, the interpreter and all 821 of RustBCL's native
+operating system — the loader, the interpreter and all 826 of RustBCL's native
 bindings execute `HelloWorld.Main`, and it prints the same three lines
 `dotnet` does, CRLF included, with the same instruction and call counts:
 [ESP32-C3, executing](docs/logs/esp32c3-interpreter.log).
@@ -233,7 +238,8 @@ print the same thing" only stays true if there is one copy of it.
 | Board | Core | Target | Tier | State |
 | --- | --- | --- | --- | --- |
 | ESP32-C3 | RISC-V 32 | `riscv32imc-unknown-none-elf` | full | **executes IL on hardware** |
-| ESP32-WROOM-32 | Xtensa LX6 | `xtensa-esp32-none-elf` | full | run on hardware (pre-interpreter) |
+| M5Stack Tough | Xtensa LX6 | `xtensa-esp32-none-elf` | full | **executes IL on hardware** |
+| ESP32-WROOM-32 | Xtensa LX6 | `xtensa-esp32-none-elf` | full | same image; run pre-interpreter |
 | Meadow F7 Micro | Arm Cortex-M7 | `thumbv7em-none-eabihf` | full | run on hardware (pre-interpreter) |
 | Sipeed Maix Go | RISC-V 64 | `riscv64gc-unknown-none-elf` | full | **builds; not yet flashed** |
 | Netduino 3 WiFi | Arm Cortex-M4F | `thumbv7em-none-eabihf` | minimal | **builds; not yet flashed** |
@@ -291,8 +297,29 @@ is exactly what reading an assembly out of flash requires.
 | | |
 | --- | --- |
 | Evaluate `catch when` filters during the unwind | ✅ five conformance checks, byte-identical to `dotnet` |
-| `localloc`, `cpblk`, `initblk`, `calli`, `arglist` | ❌ |
+| `calli` | ✅ indirect calls through a function pointer |
+| `localloc`, `cpblk`, `initblk` | ❌ **blocked on the value model**, see below |
+| `arglist` | ❌ varargs; `__arglist` is vanishingly rare in C# |
 | Multi-dimensional arrays with non-zero lower bounds | ❌ |
+
+**`calli` was short because of a decision made much earlier.** A function
+pointer here is a `Value::FnPtr(MethodId)` — it names a *method*, not an
+address. The hard part of an indirect call on a real runtime is working out what
+a raw address refers to, and that question never arises. What it costs is that a
+function pointer does not survive being stored somewhere shaped like an integer:
+an element of a `delegate*<…>[]` is an `IntPtr` slot, and a method identity does
+not fit in one. The runtime says exactly that rather than calling the wrong
+thing.
+
+**The three that are left need a value model this runtime does not have.**
+`localloc`, `cpblk` and `initblk` all address *byte ranges*: fill `n` bytes from
+here, copy `n` bytes from there. A `ByRef` here is structural — `Local`,
+`Field`, `ArrayElement`, `StructField` — a path to a slot rather than an
+address, which is what makes stale pointers impossible and makes the collector's
+job tractable. Byte-range operations have no meaning against a path. Supporting
+them means adding a raw-pointer kind to `Value` and arithmetic over it, which is
+a change to the foundation every other part of the runtime stands on, not an
+addition beside them. It is deliberately not being done incrementally.
 
 **Filters run in their own frame.** The obstacle was never the matching rule —
 it was that a filter is managed code executing *during* the unwind, before the

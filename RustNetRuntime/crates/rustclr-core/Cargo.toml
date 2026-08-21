@@ -10,7 +10,7 @@ rust-version.workspace = true
 
 [features]
 default = ["std"]
-std = ["rustclr-metadata/std", "rustclr-gc/std"]
+std = ["rustclr-metadata/std", "rustclr-gc/std", "dep:rustclr-sched"]
 
 [dependencies]
 # Not `workspace = true`: the workspace entry turns default features on, and a
@@ -18,5 +18,7 @@ std = ["rustclr-metadata/std", "rustclr-gc/std"]
 # without `std`, so it names the paths itself.
 rustclr-metadata = { path = "../rustclr-metadata", version = "0.1.0", default-features = false }
 rustclr-gc = { path = "../rustclr-gc", version = "0.1.0", default-features = false }
+# The thread pool's work queue. `std`-only, because a pool needs threads.
+rustclr-sched = { path = "../rustclr-sched", version = "0.1.0", optional = true }
 
 [dev-dependencies]

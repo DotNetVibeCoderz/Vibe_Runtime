@@ -238,6 +238,17 @@ pub struct MethodInfo {
     pub vtable_slot: Option<u32>,
     /// Fully qualified `Namespace.Type::Method` key, used for native lookup.
     pub qualified_name: String,
+    /// Type arguments, when this is a *constructed* generic method.
+    ///
+    /// `M<int>` and `M<string>` share one body — generics are erased for
+    /// execution — but each `MethodSpec` gets its own entry here, and this is
+    /// what that entry knows that the open definition does not. It is what
+    /// lets `typeof(T)` inside `M<T>` answer, rather than refusing because the
+    /// argument was thrown away.
+    ///
+    /// Empty for an ordinary method and for the open definition itself.
+    pub generic_args: Vec<TypeId>,
+
     /// Declared parameter names, in signature order.
     ///
     /// From the `Param` table, which is separate from the signature: a
@@ -343,6 +354,7 @@ impl RuntimeType {
 
 /// Arena of every loaded type, method and field.
 #[derive(Debug, Default)]
+#[derive(Clone)]
 pub struct TypeRegistry {
     types: Vec<RuntimeType>,
     methods: Vec<MethodInfo>,
@@ -435,6 +447,24 @@ impl TypeRegistry {
         id
     }
 
+    /// Interns a type that is a *closed construction* of a generic definition.
+    ///
+    /// Unlike [`Self::add_type`] this registers no name and no token. Both
+    /// would be wrong: `Box<int>` and `Box<string>` share the name `Box`1`,
+    /// which is what `.Name` reports on .NET, and they carry the definition's
+    /// metadata token — so indexing either by name or by token would make a
+    /// lookup answer arbitrarily, and inserting by token would displace the
+    /// definition itself.
+    ///
+    /// A construction is reached through the `TypeSpec` that names it, which is
+    /// the only place that knows which arguments were meant.
+    pub fn add_constructed_type(&mut self, mut ty: RuntimeType) -> TypeId {
+        let id = TypeId(self.types.len() as u32);
+        ty.id = id;
+        self.types.push(ty);
+        id
+    }
+
     pub fn add_method(&mut self, mut m: MethodInfo) -> MethodId {
         let id = MethodId(self.methods.len() as u32);
         m.id = id;
@@ -450,6 +480,18 @@ impl TypeRegistry {
         let key = (assembly, f.token.raw());
         self.fields.push(f);
         self.field_by_token.insert(key, id);
+        id
+    }
+
+    /// Interns a static field belonging to a closed construction.
+    ///
+    /// No token index, for the same reason [`Self::add_constructed_type`]
+    /// registers none: the clone carries the definition's token, and indexing
+    /// it would displace the definition's own field.
+    pub fn add_constructed_field(&mut self, mut f: FieldInfo) -> FieldId {
+        let id = FieldId(self.fields.len() as u32);
+        f.id = id;
+        self.fields.push(f);
         id
     }
 

@@ -10,7 +10,11 @@
 
 use crate::x64::{NativeMethod, X64Backend};
 use crate::Compiler;
-use rustclr_core::{Loader, MethodId, NativeTier, Value};
+use rustclr_core::{
+    ArrayStorage, ClrArray, ClrExceptionKind, ExecResult, ExecutionError, Loader, MethodId,
+    NativeTier, Value,
+};
+use rustclr_core::gc::{Handle, SharedHeap};
 use rustclr_metadata::TypeSig;
 use std::collections::{HashMap, HashSet};
 
@@ -98,9 +102,10 @@ impl NativeTier for JitTier {
     fn try_execute(
         &mut self,
         loader: &Loader,
+        heap: &SharedHeap,
         method: MethodId,
         args: &[Value],
-    ) -> Option<Option<Value>> {
+    ) -> Option<ExecResult<Option<Value>>> {
         if self.declined.contains(&method) {
             return None;
         }
@@ -117,27 +122,68 @@ impl NativeTier for JitTier {
         }
 
         let native = self.compiled.get(&method)?;
-        let mut marshalled = Vec::with_capacity(native.arg_count.max(1));
+
+        // An `int[]` argument becomes a two-word descriptor — data pointer and
+        // length — and its argument slot carries the descriptor's address.
+        // The descriptors live in this vector for exactly the duration of the
+        // call, and it is sized up front so no reallocation can move one while
+        // the compiled code holds its address.
+        //
+        // Taking a raw pointer into the managed heap is sound here for a reason
+        // worth stating rather than assuming: the backend declines any method
+        // that allocates, so no collection can run while the compiled code is
+        // executing, and this collector never moves an object in any case.
+        // Both would have to change together for the pointer to go stale.
+        let mut descriptors: Vec<[i64; 2]> = Vec::with_capacity(native.arg_count);
         for i in 0..native.arg_count {
-            // Anything that is not an integer means the caller and the compiled
-            // signature disagree, which `can_compile` should have prevented.
-            marshalled.push(as_i64(args.get(i)?)?);
-        }
-        // The emitted code always reads `arg_count` slots; give it a slot even
-        // when there are no arguments so the pointer is never dangling.
-        if marshalled.is_empty() {
-            marshalled.push(0);
+            if let Value::Obj(handle) = args.get(i)? {
+                descriptors.push(int_array_descriptor(heap, *handle)?);
+            }
         }
 
-        // SAFETY: `marshalled` holds at least `arg_count` values, which is
-        // exactly what the emitted prologue reads.
+        let mut marshalled = Vec::with_capacity(native.arg_count + 1);
+        let mut next = 0usize;
+        for i in 0..native.arg_count {
+            match args.get(i)? {
+                Value::Obj(_) => {
+                    let address = descriptors[next].as_ptr() as i64;
+                    next += 1;
+                    marshalled.push(address);
+                }
+                // Anything that is neither an integer nor an array means the
+                // caller and the compiled signature disagree, which
+                // `can_compile` should have prevented.
+                other => marshalled.push(as_i64(other)?),
+            }
+        }
+        // One slot past the arguments is the trap flag the emitted bounds
+        // checks write to. Pushing it unconditionally also keeps the pointer
+        // valid for a method with no arguments at all, which the emitted
+        // prologue still dereferences.
+        marshalled.push(0);
+
+        // SAFETY: `marshalled` holds `arg_count` values plus the trap slot,
+        // which is exactly what the emitted code reads. Each array slot points
+        // at a descriptor that outlives the call.
         let raw = unsafe { native.call(&marshalled) };
 
+        // A failed bounds check cannot throw from compiled code — there is no
+        // frame for the interpreter to unwind — so it flags and returns, and
+        // the exception is raised here. Declining instead would be wrong:
+        // stores that already happened stay done, and re-running the method
+        // interpreted would repeat them.
+        if marshalled[native.arg_count] != 0 {
+            return Some(Err(ExecutionError::exception(
+                ClrExceptionKind::IndexOutOfRange,
+                "Index was outside the bounds of the array.",
+            )));
+        }
+
         if !native.returns_value {
-            return Some(None);
+            return Some(Ok(None));
         }
         let info = loader.registry.method(method);
-        Some(Some(widen(&info.signature.return_type, raw)))
+        Some(Ok(Some(widen(&info.signature.return_type, raw))))
     }
 
     fn stats(&self) -> (usize, usize) {
@@ -202,4 +248,20 @@ mod tests {
         assert!(tier.threshold > 1, "compiling everything on first call defeats tiering");
         assert_eq!(tier.compiled_count(), 0);
     }
+}
+
+/// The `{ data pointer, length }` an `int[]` handle stands for.
+///
+/// `None` when the handle is not an `int[]` — a null reference, or an array of
+/// something else. The caller treats that as "cannot marshal", which sends the
+/// call back to the interpreter rather than guessing at a layout.
+fn int_array_descriptor(heap: &SharedHeap, handle: Handle) -> Option<[i64; 2]> {
+    if handle.is_null() {
+        return None;
+    }
+    heap.with::<ClrArray, _>(handle, |array| match &array.storage {
+        ArrayStorage::I32(values) => Some([values.as_ptr() as i64, values.len() as i64]),
+        _ => None,
+    })
+    .flatten()
 }

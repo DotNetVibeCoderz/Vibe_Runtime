@@ -20,16 +20,25 @@ bash probe.sh
 
 ## The matrix
 
-**13 of 21 probes produce identical output on both runtimes.**
+**21 of 21 probes produce identical output on both runtimes.**
+
+Identical *output* is what a probe can check, and for a while that was worth a
+warning here: `async`, threading and the TPL all produced .NET's answers without
+any concurrency at all, and a probe measuring wall-clock overlap would have
+failed three of them. That is no longer true — threads spawn, `Task.Run` starts
+elsewhere, `Parallel.*` splits across cores and `await` suspends — and the
+conformance fixture now includes checks whose answers *do* depend on work really
+running at once. What remains missing is named in the notes below rather than in
+this number.
 
 ### Asynchronous and parallel programming
 
 | Feature | RustCLR | Why |
 | --- | --- | --- |
-| `async` / `await` | ⚠️ **works, synchronous** | The builders and awaiters are implemented; see the note below |
+| `async` / `await` | ✅ | `await` on a pending task suspends and returns; the completing thread resumes it. See the note below |
 | `Task`, `Task<T>`, `WhenAll`, `TaskCompletionSource` | ✅ | Results, ordering and exception propagation match .NET |
-| Task Parallel Library | ❌ | `Parallel.For` is unimplemented |
-| Threading, `lock`, `Interlocked` | ⚠️ **works, serialised** | See the note below |
+| Task Parallel Library | ✅ **real** | `Task.Run` starts on another thread; `Parallel.For`/`ForEach`/`Invoke` split across cores; `WaitAll` waits |
+| Threading, `lock`, `Interlocked` | ✅ **real threads** | `Thread.Start` spawns; `lock` excludes; `Interlocked` does not lose updates. See the note below |
 
 ### Memory and resource management
 
@@ -37,8 +46,8 @@ bash probe.sh
 | --- | --- | --- |
 | Garbage collection | ✅ | Mark-sweep, handles cycles, pluggable |
 | `IDisposable` / `using` | ✅ | Interface dispatch finds the concrete `Dispose` |
-| `IAsyncDisposable` / `await using` | ❌ | Unimplemented; `async` itself works |
-| `Span<T>`, `Memory<T>` | ❌ | Generic ref structs, and `stackalloc` needs `localloc` |
+| `IAsyncDisposable` / `await using` | ✅ | Works, with `ValueTask` underneath. Disposal runs after the body |
+| `Span<T>`, `Memory<T>` | ✅ | Over an array, a string or `stackalloc`. The element width for raw memory comes from the call site's `TypeSpec` |
 
 ### Modern language features
 
@@ -46,8 +55,8 @@ bash probe.sh
 | --- | --- | --- |
 | Primary constructors (C# 12) | ✅ | Compile to an ordinary constructor and fields |
 | Collection expressions — arrays | ✅ | `[1, 2, 3]` is `newarr` plus `InitializeArray` |
-| Collection expressions — spread | ❌ | `[..a, b]` is lowered through `Span<T>` |
-| Collection expressions — spans | ❌ | `ReadOnlySpan<char> x = ['a']` needs `Span<T>` |
+| Collection expressions — spread | ✅ | `[..a, b]` lowers through `Span<T>` over an array |
+| Collection expressions — spans | ✅ | Through `RuntimeHelpers.CreateSpan` |
 | Extension members (C# 14) | ✅ | Static methods with a receiver parameter |
 | Interceptors | ✅ | Compile-time rewriting; the runtime sees ordinary IL |
 | Union types | **not in .NET 10** | The compiler parses it; `System.Runtime.CompilerServices.IUnion` does not exist |
@@ -59,8 +68,8 @@ bash probe.sh
 | Feature | RustCLR | Why |
 | --- | --- | --- |
 | P/Invoke | ✅ | Real dynamic loading; the probe reads its own process id |
-| Type marshalling | ❌ | `Marshal.SizeOf<T>` / `PtrToStructure<T>` are generic |
-| Unsafe code, pointers | ❌ | Managed pointers here are structural and have no address |
+| Type marshalling | ✅ | Blittable structs round-trip. `AllocHGlobal` uses the managed heap, so the pointer cannot go to native code |
+| Unsafe code, pointers | ✅ | `stackalloc`, `fixed`, arithmetic, comparison and dereference all run. A pointer is a buffer plus a byte offset, not an address |
 
 ### High-level abstractions
 
@@ -129,25 +138,52 @@ interpreter — see the note on threads below, which has the same cause.
 
 ---
 
-## Threads are serialised
+## Threads, tasks and `await` are real
 
-`Thread.Start()` runs the delegate **synchronously on the calling thread**, and
-`Join()` returns immediately because the work is already done. `lock` is a no-op
-for the same reason: with no concurrent execution there is nothing to exclude.
+`Thread.Start()` spawns an OS thread and `Join()` waits for it. Four threads
+incrementing one static reach four thousand, `lock` genuinely excludes, and a
+consumer can block on a flag set by a producer started *afterwards* — the case
+that hangs forever under serialisation. Those four are checks in the
+conformance fixture, because each has an answer that differs if the threads do
+not really overlap.
 
-This is correct for the common start-then-join shape, and for code that uses
-threads to organise work rather than to gain parallelism. It is **wrong** for a
-program that depends on two threads running at the same time — a consumer
-blocking on a producer started afterwards will hang.
+**How it works.** A spawned thread gets a *worker* interpreter: the same heap,
+the same static storage, the same native bindings, its own frame stack. It
+allocates into the same object graph and a collection stops it like any other
+mutator.
 
-The alternative was to refuse `Thread` outright. Serialising it makes more
-programs run, so it is offered with this limitation stated here, in
-`rustnet capabilities`, and in the source, rather than left to be discovered.
+The part worth understanding is the loader. It is not shared and not locked —
+each thread gets an identical **copy**. That works because a loader is finished
+before the first instruction runs: types are registered, tokens are resolved,
+and closed generic constructions are built eagerly at load. A copy taken
+afterwards has the same `TypeId`s and `MethodId`s as the original, so two
+threads reading their own tables behave exactly as if they shared one, and
+neither pays a lock on the path that runs every instruction. Static storage is
+the exception and is genuinely shared, because `static int Total` must be one
+slot.
 
-`rustclr-sched` already has the real substrate — a lock-free run queue, channels
-and a thread pool, all tested. What is missing is a re-entrant interpreter that
-several OS threads could drive at once. That is the one piece both this and
-`async` are waiting on.
+**`await` suspends.** An `async` method that awaits a pending task copies its
+state machine to the heap, queues it on that task and *returns* — so the caller
+gets a pending task back, and whichever thread completes the awaited one runs
+the continuation. Two tasks started and then awaited genuinely overlap.
+
+What that does *not* do is make anything concurrent by itself: awaiting in a
+loop is sequential here exactly as it is on .NET, because that is what awaiting
+in a loop means. Where the work starts is what decides.
+
+**There is a pool.** `Task.Run` and `Parallel.*` queue onto one worker per core,
+each holding its own long-lived interpreter, and a thread waiting on a task runs
+queued work rather than idling — which is what stops a task that awaits another
+task from deadlocking the pool. `Task.Delay` arms a timer instead of sleeping.
+`Thread.Start` still gets a dedicated thread, as `Thread` should.
+
+**The bug this found is worth recording.** A thread waiting in `Join` announces
+itself blocked so the collector does not wait for it — and the first version
+contributed *none of its roots* while it was away. A blocked thread was assumed
+to hold no references, which is true of a thread parked at a safe point and
+false of one sitting in `Join` holding the array of threads it is joining. A
+collection swept it, and an array with four elements came back with zero.
+Blocked threads now hand their roots over on the way out.
 
 ---
 

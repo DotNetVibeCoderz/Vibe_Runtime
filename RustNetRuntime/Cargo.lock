@@ -23,6 +23,7 @@ version = "0.1.0"
 dependencies = [
  "rustclr-gc",
  "rustclr-metadata",
+ "rustclr-sched",
 ]
 
 [[package]]

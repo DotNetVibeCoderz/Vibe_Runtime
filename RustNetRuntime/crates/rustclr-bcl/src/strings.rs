@@ -18,9 +18,7 @@ pub fn register(interp: &mut Interpreter) {
         let h = arg_handle(i, a, 0)?;
         let index = arg_i32(i, a, 1)?;
         let unit = i
-            .heap
-            .get_as::<ClrString>(h)
-            .and_then(|s| s.char_at(index.max(0) as usize));
+            .heap.with::<ClrString, _>(h, |s| s.char_at(index.max(0) as usize)).flatten();
         match unit {
             Some(u) => Ok(Some(Value::I32(u as i32))),
             None => Err(out_of_range("index")),
@@ -225,15 +223,15 @@ pub fn register(interp: &mut Interpreter) {
         let y = arg(i, a, 1)?;
         Ok(Some(Value::I32(!strings_equal(i, &x, &y) as i32)))
     });
-    interp.register_native("System.String::Compare(string,string)", |i, a| {
-        let x = arg_string_or_empty(i, a, 0)?;
-        let y = arg_string_or_empty(i, a, 1)?;
-        Ok(Some(Value::I32(match x.cmp(&y) {
-            core::cmp::Ordering::Less => -1,
-            core::cmp::Ordering::Equal => 0,
-            core::cmp::Ordering::Greater => 1,
-        })))
-    });
+    // `CompareOrdinal` is what a comparison lambda usually reaches for, and
+    // ordinal is what this runtime does anyway: `Compare` here is already a
+    // byte-order comparison with no culture behind it, so the two share an
+    // implementation and the name records which semantics were asked for.
+    interp.register_native("System.String::CompareOrdinal(string,string)", compare_ordinal);
+    interp.register_native("System.String::CompareOrdinal/2", compare_ordinal);
+    interp.register_native("System.String::CompareTo(string)", compare_ordinal);
+    interp.register_native("System.String::Compare(string,string)", compare_ordinal);
+    interp.register_native("System.String::Compare/2", compare_ordinal);
     interp.register_native("System.String::GetHashCode()", |i, a| {
         let s = arg_string_or_empty(i, a, 0)?;
         Ok(Some(Value::I32(string_hash(&s))))
@@ -377,6 +375,22 @@ pub fn register(interp: &mut Interpreter) {
 /// `StringBuilder` is backed by a managed object whose single field holds a
 /// managed string; that keeps its contents visible to the collector without a
 /// bespoke heap object kind.
+/// Ordinal string comparison, returning a sign.
+///
+/// Ordinal rather than culture-aware, which is the only kind this runtime does:
+/// there is no culture data here, and a comparison that claimed to be
+/// culture-aware while being ordinal would be wrong in a way nothing would
+/// notice until it shipped somewhere with a different collation.
+fn compare_ordinal(i: &mut Interpreter, a: &[Value]) -> ExecResult<Option<Value>> {
+    let x = arg_string_or_empty(i, a, 0)?;
+    let y = arg_string_or_empty(i, a, 1)?;
+    Ok(Some(Value::I32(match x.cmp(&y) {
+        core::cmp::Ordering::Less => -1,
+        core::cmp::Ordering::Equal => 0,
+        core::cmp::Ordering::Greater => 1,
+    })))
+}
+
 /// `string.Split(...)`, however the call was spelled.
 ///
 /// The second argument is a separator — a `char`, or an array of them — or a
@@ -488,9 +502,7 @@ fn builder_handle(interp: &mut Interpreter, args: &[Value]) -> ExecResult<Handle
 fn get_builder(interp: &mut Interpreter, args: &[Value]) -> ExecResult<String> {
     let this = builder_handle(interp, args)?;
     let inner = interp
-        .heap
-        .get_as::<ClrObject>(this)
-        .and_then(|o| o.fields.first().cloned());
+        .heap.with::<ClrObject, _>(this, |o| o.fields.first().cloned()).flatten();
     Ok(match inner {
         Some(Value::Obj(h)) => read_string(interp, h),
         _ => String::new(),
@@ -500,13 +512,13 @@ fn get_builder(interp: &mut Interpreter, args: &[Value]) -> ExecResult<String> {
 fn set_builder(interp: &mut Interpreter, args: &[Value], text: String) -> ExecResult<()> {
     let this = builder_handle(interp, args)?;
     let handle = interp.alloc_string(&text);
-    if let Some(o) = interp.heap.get_as_mut::<ClrObject>(this) {
+    interp.heap.with_mut::<ClrObject, _>(this, |o| {
         if o.fields.is_empty() {
             o.fields.push(Value::Obj(handle));
         } else {
             o.fields[0] = Value::Obj(handle);
         }
-    }
+    });
     Ok(())
 }
 
@@ -712,6 +724,14 @@ fn register_span_concat(interp: &mut Interpreter) {
 
 /// `new ReadOnlySpan<char>(ref c)`.
 fn span_ctor(i: &mut Interpreter, a: &[Value]) -> ExecResult<Option<Value>> {
+    // `new Span<T>(void*, int)` — what `Span<int> s = stackalloc int[4]`
+    // compiles to. The buffer exists and the length is given; the width of one
+    // element lives only in `T`, and a framework generic has no runtime type
+    // per construction to ask. The *call site* spells it out, though, and the
+    // loader now records it — see `Loader::member_ref_type_args`.
+    if matches!(a.get(1), Some(Value::Ptr(_))) {
+        return crate::spans::raw_span(i, a);
+    }
     {
         let text = match a.get(1) {
             Some(Value::Ref(target)) => {

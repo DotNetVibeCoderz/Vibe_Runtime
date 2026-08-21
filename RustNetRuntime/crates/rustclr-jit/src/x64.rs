@@ -174,7 +174,7 @@ impl Compiler for X64Backend {
             // once it can see the rewritten body.
             return crate::translate::shape_might_compile_after_inlining(registry, method);
         }
-        crate::translate::shape_is_compilable(registry, method)
+        crate::translate::shape_is_compilable_with(registry, method, true)
     }
 
     fn compile(
@@ -206,6 +206,7 @@ impl Compiler for X64Backend {
             &loader.registry,
             method,
             &instructions,
+            true,
         ) {
             return Err(CompileError::Unsupported(
                 "this method's shape is outside the baseline backend".into(),
@@ -225,7 +226,8 @@ impl Compiler for X64Backend {
         })
         .map_err(CompileError::Invalid)?;
 
-        let bytes = emit(&instructions, &analysis, locals, returns_value)?;
+        // The trap slot sits one past the real arguments; see `X64Emitter`.
+        let bytes = emit(&instructions, &analysis, locals, returns_value, info.arg_count())?;
         self.methods_compiled += 1;
         self.bytes_emitted += bytes.len();
         Ok(CompiledCode { method, tier: Tier::Jit, bytes, analysis })
@@ -408,6 +410,79 @@ impl Assembler {
         self.labels.insert(il_offset, self.code.len());
     }
 
+    /// `jcc rel8` over code emitted immediately after, patched by
+    /// [`Self::patch_short`].
+    ///
+    /// The label table is keyed by IL offset, and a bounds-check's landing pad
+    /// is not at one — it is a few bytes further into the same instruction's
+    /// expansion. Rather than invent synthetic offsets, this patches the
+    /// displacement directly, which works because the skipped range is a fixed
+    /// handful of bytes and cannot overflow `i8`.
+    fn jcc_short_forward(&mut self, condition: u8) -> usize {
+        self.byte(0x70 | condition);
+        self.byte(0);
+        self.code.len() - 1
+    }
+
+    fn patch_short(&mut self, at: usize) {
+        let distance = self.code.len() - at - 1;
+        debug_assert!(distance <= 127, "short branch out of range");
+        self.code[at] = distance as u8;
+    }
+
+    /// `cmp left, right`.
+    fn cmp_rr(&mut self, left: u8, right: u8) {
+        self.alu_rr(0x39, left, right);
+    }
+
+    /// `mov dst, [base + index*scale + disp]` — a scaled-index load.
+    fn mov_r_mem_index(&mut self, dst: u8, base: u8, index: u8, scale: u8) {
+        self.rex_index(true, dst, base, index);
+        self.byte(0x8B);
+        self.modrm(0b00, dst, RSP);
+        self.byte((scale << 6) | ((index & 7) << 3) | (base & 7));
+    }
+
+    /// `mov [base + index*scale], src` — a scaled-index store.
+    fn mov_mem_index_r(&mut self, base: u8, index: u8, scale: u8, src: u8) {
+        self.rex_index(true, src, base, index);
+        self.byte(0x89);
+        self.modrm(0b00, src, RSP);
+        self.byte((scale << 6) | ((index & 7) << 3) | (base & 7));
+    }
+
+    /// `movsxd dst, dword [base + index*4]` — a 32-bit element, sign-extended.
+    ///
+    /// Sign extension is the point: `int[]` elements are 32-bit and the
+    /// evaluation stack is 64-bit, so a negative element read with a plain
+    /// 64-bit load would come back as a huge positive number.
+    fn movsxd_r_mem_index(&mut self, dst: u8, base: u8, index: u8) {
+        self.rex_index(true, dst, base, index);
+        self.byte(0x63);
+        self.modrm(0b00, dst, RSP);
+        self.byte((0b10 << 6) | ((index & 7) << 3) | (base & 7));
+    }
+
+    /// `mov dword [base + index*4], src` — a 32-bit element store.
+    fn mov_mem_index_r32(&mut self, base: u8, index: u8, src: u8) {
+        self.rex_index(false, src, base, index);
+        self.byte(0x89);
+        self.modrm(0b00, src, RSP);
+        self.byte((0b10 << 6) | ((index & 7) << 3) | (base & 7));
+    }
+
+    /// REX for an instruction with a base *and* an index register.
+    fn rex_index(&mut self, w: bool, reg: u8, base: u8, index: u8) {
+        let byte = 0x40
+            | ((w as u8) << 3)
+            | (((reg >> 3) & 1) << 2)
+            | (((index >> 3) & 1) << 1)
+            | ((base >> 3) & 1);
+        if w || byte != 0x40 {
+            self.byte(byte);
+        }
+    }
+
     /// Resolves every recorded jump. A target with no label is a branch to an
     /// offset that is not an instruction boundary, which the verifier should
     /// already have rejected.
@@ -456,11 +531,63 @@ pub struct X64Emitter {
     locals: usize,
     /// Bytes of frame reserved below `rbp`.
     frame: i32,
+    /// Argument slot the emitted code writes to when a bounds check fails.
+    ///
+    /// One past the real arguments. Compiled code cannot throw — it has no
+    /// frame the interpreter can unwind — so an out-of-range index sets this
+    /// flag and returns, and the tier raises `IndexOutOfRangeException` on its
+    /// behalf. Stores that already happened stay done, which is what .NET does
+    /// too: the exception aborts the method, it does not roll it back.
+    trap_slot: usize,
+    /// Frame offset of the scratch word; see [`Self::frame_scratch`].
+    scratch: i32,
 }
 
 impl X64Emitter {
-    fn new() -> Self {
-        Self { asm: Assembler::new(), locals: 0, frame: 0 }
+    fn new(trap_slot: usize) -> Self {
+        Self { asm: Assembler::new(), locals: 0, frame: 0, trap_slot, scratch: 0 }
+    }
+
+    /// A frame slot no local or spill uses, for holding a value while every
+    /// scratch register is busy.
+    ///
+    /// One word past the deepest spill slot. `array_store_i32` is the only
+    /// thing that needs it, and needs it because a store has three live
+    /// operands — array, index, value — and this architecture offers exactly
+    /// three scratch registers, leaving none for the length to compare
+    /// against. The prologue already reserves two spare words, so this costs
+    /// nothing.
+    fn frame_scratch(&self) -> i32 {
+        self.scratch
+    }
+
+    /// Emits `if index >= limit { trap; return }`.
+    ///
+    /// Unsigned, so one comparison covers both ends: a negative index
+    /// sign-extends to a very large unsigned value and fails the same test that
+    /// catches `index >= length`.
+    fn bounds_check(&mut self, index: u8, limit: u8) {
+        self.asm.cmp_rr(index, limit);
+        let skip = self.asm.jcc_short_forward(CC_B);
+        // Out of range: flag it and leave.
+        self.asm.mov_ri(RAX, 1);
+        self.asm.mov_mem_r(ARGS, (self.trap_slot * 8) as i32, RAX);
+        self.asm.mov_ri(RAX, 0);
+        self.epilogue_inline();
+        self.asm.patch_short(skip);
+    }
+
+    /// The epilogue without going through the trait, for the trap path.
+    fn epilogue_inline(&mut self) {
+        self.asm.rex(true, 0, RSP);
+        self.asm.byte(0x81);
+        self.asm.modrm(0b11, 0, RSP);
+        self.asm.imm32(self.frame);
+        self.asm.pop(R15);
+        self.asm.pop(R14);
+        self.asm.pop(RBX);
+        self.asm.pop(RBP);
+        self.asm.ret();
     }
 
     fn finish(self) -> Result<Vec<u8>, CompileError> {
@@ -491,6 +618,9 @@ impl Backend for X64Emitter {
 
     fn prologue(&mut self, locals: usize, max_stack: usize) {
         self.locals = locals;
+        // One word past the deepest spill slot. The reservation below always
+        // covers it, because `words` is at least `locals + max_stack + 2`.
+        self.scratch = -SAVED_BYTES - 8 * (locals as i32 + max_stack as i32 + 1);
 
         self.asm.push(RBP);
         self.asm.mov_rr(RBP, RSP);
@@ -674,6 +804,38 @@ impl Backend for X64Emitter {
     fn label(&mut self, il_offset: u32) {
         self.asm.label(il_offset);
     }
+
+    fn supports_arrays(&self) -> bool {
+        true
+    }
+
+    fn array_length(&mut self, dst: u8, descriptor: u8) {
+        // The descriptor is `{ data pointer, length }`; the length is the
+        // second word.
+        self.asm.mov_r_mem(dst, descriptor, 8);
+    }
+
+    fn array_load_i32(&mut self, dst: u8, descriptor: u8, index: u8) {
+        // Length first, while `descriptor` still holds the descriptor address.
+        let limit = if dst == descriptor { RDX } else { dst };
+        self.asm.mov_r_mem(limit, descriptor, 8);
+        self.bounds_check(index, limit);
+        self.asm.mov_r_mem(descriptor, descriptor, 0);
+        self.asm.movsxd_r_mem_index(dst, descriptor, index);
+    }
+
+    fn array_store_i32(&mut self, descriptor: u8, index: u8, value: u8) {
+        // Every scratch register is live here — descriptor, index and value —
+        // so the length is compared against a frame slot rather than a fourth
+        // register.
+        self.asm.mov_mem_r(RBP, self.frame_scratch(), value);
+        let limit = value;
+        self.asm.mov_r_mem(limit, descriptor, 8);
+        self.bounds_check(index, limit);
+        self.asm.mov_r_mem(descriptor, descriptor, 0);
+        self.asm.mov_r_mem(limit, RBP, self.frame_scratch());
+        self.asm.mov_mem_index_r32(descriptor, index, limit);
+    }
 }
 
 /// The low nibble of a `jcc`/`setcc` opcode for a condition.
@@ -698,8 +860,9 @@ fn emit(
     analysis: &MethodAnalysis,
     locals: usize,
     returns_value: bool,
+    trap_slot: usize,
 ) -> Result<Vec<u8>, CompileError> {
-    let mut e = X64Emitter::new();
+    let mut e = X64Emitter::new(trap_slot);
     translate(&mut e, instructions, analysis, locals, returns_value)?;
     e.finish()
 }
@@ -722,7 +885,8 @@ mod tests {
 
     #[test]
     fn frame_slots_never_overlap_the_saved_registers() {
-        let mut e = X64Emitter::new();
+        // Trap slot 0: this test never emits a bounds check.
+        let mut e = X64Emitter::new(0);
         e.prologue(3, 4);
 
         // Three registers are pushed after `rbp`, occupying [rbp-8..rbp-24].
@@ -756,7 +920,9 @@ mod machine_tests {
             if ins.op == Op::Ret { -1 } else { 0 }
         })
         .expect("verify");
-        let code = emit(&instructions, &analysis, locals, true).expect("emit");
+        // These helpers compile array-free bodies, so the trap slot is never
+        // written; one past the arguments keeps it consistent with the tier.
+        let code = emit(&instructions, &analysis, locals, true, args.len()).expect("emit");
         let page = CodePage::commit(&code).expect("commit");
         // SAFETY: `emit` produced this page and the signature matches.
         let f: extern "C" fn(*const i64) -> i64 =

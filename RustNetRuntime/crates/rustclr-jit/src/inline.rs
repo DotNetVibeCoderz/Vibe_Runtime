@@ -209,7 +209,7 @@ fn candidate(loader: &Loader, method: MethodId) -> Option<Candidate> {
     if info.signature.has_this || !body.exception_clauses.is_empty() {
         return None;
     }
-    if !crate::translate::shape_is_compilable(&loader.registry, method) {
+    if !crate::translate::shape_is_compilable_with(&loader.registry, method, true) {
         return None;
     }
 

@@ -141,8 +141,23 @@ struct Uarths;
 
 impl Uarths {
     fn init(cpu_hz: u32) -> Self {
-        // `baud = cpu_hz / (div + 1)`, so `div = cpu_hz / baud - 1`.
-        wr(HS_DIV, (cpu_hz / BAUD.max(1)).saturating_sub(1));
+        // `baud = cpu_hz / (div + 1)`, so `div = cpu_hz / baud - 1` — but only
+        // when the clock reading is believable.
+        //
+        // Whatever loaded this firmware already had UARTHS working: the mask
+        // ROM used it to greet, and `kflash` used it to download at up to
+        // 1.5 Mbaud. Its divisor is therefore known-good. Overwriting it with
+        // one derived from a misread clock replaces a working UART with a
+        // silent one, and a silent board tells you nothing about why.
+        //
+        // So a divisor is only programmed when the clock reads plausibly.
+        // Otherwise the loader's is kept, and the board talks at whatever baud
+        // the loader used — which is the baud whoever just flashed it already
+        // has a terminal open on.
+        let plausible = (1_000_000..=1_000_000_000).contains(&cpu_hz);
+        if plausible {
+            wr(HS_DIV, (cpu_hz / BAUD.max(1)).saturating_sub(1));
+        }
         wr(HS_TXCTRL, HS_TXEN);
         wr(HS_RXCTRL, HS_RXEN);
         wr(HS_IE, 0);
@@ -187,15 +202,44 @@ fn main() -> ! {
     let mut detail = Detail::new();
     let _ = write!(
         detail,
-        "clock            {} MHz core, read from PLL0; UARTHS at {} baud",
+        "clock            {} MHz core, read from PLL0; UARTHS at {}",
         clock / 1_000_000,
-        BAUD
+        if (1_000_000..=1_000_000_000).contains(&clock) {
+            "115200 baud"
+        } else {
+            "the loader's baud - the clock read implausibly"
+        }
     );
 
-    rustclr_demo_common::run(&mut console, BOARD, detail.as_str(), HELLO_WORLD, HEAP_BYTES);
-
+    // Repeated rather than printed once, and the reason is specific to this
+    // board: the K210 has no internal flash, so the firmware is loaded into
+    // SRAM over the same UART a host would watch. Opening that port asserts
+    // DTR, which resets the chip — and a reset discards SRAM and boots
+    // whatever is on the SPI flash instead. A report printed once is therefore
+    // unobservable: by the time anything is listening, the board is no longer
+    // running this code.
+    //
+    // Repeating it means a host that attaches at any point sees a whole
+    // report. The boards with flash print once, because there the firmware is
+    // still there after the reset.
     loop {
-        riscv::asm::wfi();
+        rustclr_demo_common::run(&mut console, BOARD, detail.as_str(), HELLO_WORLD, HEAP_BYTES);
+        // A fixed cycle count, not one derived from `clock`: if the clock
+        // reading is wrong the delay would be wrong with it, and the report
+        // would repeat either far too often or never again.
+        delay_cycles(600_000_000);
+    }
+}
+
+/// A busy-wait of approximately `cycles` core cycles.
+///
+/// `mcycle` rather than a timer: the timer needs a peripheral clock this
+/// firmware does not otherwise configure, and the only thing waiting on this is
+/// how often the report repeats.
+fn delay_cycles(cycles: u64) {
+    let start = riscv::register::mcycle::read64();
+    while riscv::register::mcycle::read64().wrapping_sub(start) < cycles {
+        core::hint::spin_loop();
     }
 }
 

@@ -32,7 +32,7 @@
 
 use crate::support::*;
 use rustclr_core::{
-    ArrayStorage, ClrArray, ClrBox, ClrExceptionKind, ClrObject, ClrString, ExecResult,
+    ArrayStorage, ClrArray, ClrBox, ClrDelegate, ClrExceptionKind, ClrObject, ClrString, ExecResult,
     ExecutionError, Interpreter, MethodId, MethodKind, TypeId, Value, DEFAULT_COMPARER_FIELD,
 };
 use rustclr_gc::Handle;
@@ -63,18 +63,16 @@ fn key(type_name: &str, member: &str) -> &'static str {
 /// Reads field `slot` of a native collection object.
 pub(crate) fn field(interp: &Interpreter, this: Handle, slot: usize) -> Value {
     interp
-        .heap
-        .get_as::<ClrObject>(this)
-        .and_then(|o| o.fields.get(slot).cloned())
+        .heap.with::<ClrObject, _>(this, |o| o.fields.get(slot).cloned()).flatten()
         .unwrap_or(Value::Null)
 }
 
 pub(crate) fn set_field(interp: &mut Interpreter, this: Handle, slot: usize, value: Value) {
-    if let Some(o) = interp.heap.get_as_mut::<ClrObject>(this) {
+    interp.heap.with_mut::<ClrObject, _>(this, |o| {
         if let Some(f) = o.fields.get_mut(slot) {
             *f = value;
         }
-    }
+    });
 }
 
 pub(crate) fn field_handle(interp: &Interpreter, this: Handle, slot: usize) -> Handle {
@@ -86,18 +84,18 @@ pub(crate) fn field_handle(interp: &Interpreter, this: Handle, slot: usize) -> H
 
 /// The elements of a `Values`-backed array.
 pub(crate) fn elements(interp: &Interpreter, array: Handle) -> Vec<Value> {
-    match interp.heap.get_as::<ClrArray>(array) {
-        Some(a) => (0..a.len()).filter_map(|i| a.storage.get(i)).collect(),
-        None => Vec::new(),
-    }
+    interp
+        .heap
+        .with::<ClrArray, _>(array, |a| (0..a.len()).filter_map(|i| a.storage.get(i)).collect())
+        .unwrap_or_default()
 }
 
 pub(crate) fn element_count(interp: &Interpreter, array: Handle) -> usize {
-    interp.heap.get_as::<ClrArray>(array).map(|a| a.len()).unwrap_or(0)
+    interp.heap.with::<ClrArray, _>(array, |a| a.len()).unwrap_or(0)
 }
 
 pub(crate) fn element_at(interp: &Interpreter, array: Handle, index: usize) -> Option<Value> {
-    interp.heap.get_as::<ClrArray>(array).and_then(|a| a.storage.get(index))
+    interp.heap.with::<ClrArray, _>(array, |a| a.storage.get(index)).flatten()
 }
 
 /// Applies `edit` to the backing vector of a `Values` array.
@@ -110,11 +108,13 @@ pub(crate) fn with_values<R>(
     array: Handle,
     edit: impl FnOnce(&mut Vec<Value>) -> R,
 ) -> Option<R> {
+    // The edit runs *inside* the closure. Returning `values_mut()` and applying
+    // `edit` afterwards is the obvious shape and does not compile: the borrow
+    // would outlive the lock the heap is held under.
     interp
         .heap
-        .get_as_mut::<ClrArray>(array)
-        .and_then(|a| a.storage.values_mut())
-        .map(edit)
+        .with_mut::<ClrArray, _>(array, |a| a.storage.values_mut().map(edit))
+        .flatten()
 }
 
 /// `this` as a handle, refusing a null receiver the way the CLR does.
@@ -162,11 +162,13 @@ pub fn values_equal(interp: &Interpreter, a: &Value, b: &Value) -> bool {
             if x == y {
                 return true;
             }
-            match (
-                interp.heap.get_as::<ClrString>(*x),
-                interp.heap.get_as::<ClrString>(*y),
-            ) {
-                (Some(sx), Some(sy)) => sx.units == sy.units,
+            // One borrow at a time. Two live at once is the only shape in
+            // this runtime that a single heap lock could not serve, so the
+            // units are copied out rather than compared in place.
+            let left = interp.heap.with::<ClrString, _>(*x, |s| s.units.clone());
+            let right = interp.heap.with::<ClrString, _>(*y, |s| s.units.clone());
+            match (left, right) {
+                (Some(sx), Some(sy)) => sx == sy,
                 _ => false,
             }
         }
@@ -196,10 +198,10 @@ pub(crate) fn as_number(v: &Value) -> Option<f64> {
 /// Unwraps a box so a boxed `int` hashes and compares as the `int` it holds.
 fn unbox(interp: &Interpreter, v: &Value) -> Value {
     match v {
-        Value::Obj(h) => match interp.heap.get_as::<ClrBox>(*h) {
-            Some(b) => b.value.clone(),
-            None => v.clone(),
-        },
+        Value::Obj(h) => interp
+            .heap
+            .with::<ClrBox, _>(*h, |b| b.value.clone())
+            .unwrap_or_else(|| v.clone()),
         other => other.clone(),
     }
 }
@@ -221,10 +223,10 @@ pub fn value_hash(interp: &Interpreter, v: &Value) -> u64 {
                 mix(f.to_bits())
             }
         }
-        Value::Obj(h) => match interp.heap.get_as::<ClrString>(*h) {
-            Some(s) => {
+        Value::Obj(h) => match interp.heap.with::<ClrString, _>(*h, |s| s.units.clone()) {
+            Some(units) => {
                 let mut acc = 0xcbf2_9ce4_8422_2325u64;
-                for unit in &s.units {
+                for unit in &units {
                     acc ^= *unit as u64;
                     acc = acc.wrapping_mul(0x0000_0100_0000_01b3);
                 }
@@ -406,6 +408,16 @@ fn register_list(interp: &mut Interpreter) {
         Ok(None)
     });
 
+    // `Sort` with a comparer, which may be a `Comparison<T>` lambda or an
+    // `IComparer<T>`. Both bind through arity; `comparison_from` tells them
+    // apart by what the object is.
+    interp.register_native(key("List`1", "Sort/1"), |i, a| {
+        let this = receiver(i, a)?;
+        let array = list_items(i, this);
+        let comparer = arg(i, a, 1)?;
+        sort_with_comparer(i, array, comparer)
+    });
+
     interp.register_native(key("List`1", "Sort()"), |i, a| {
         let this = receiver(i, a)?;
         let array = list_items(i, this);
@@ -449,16 +461,14 @@ fn sort_in_place(interp: &mut Interpreter, array: Handle) -> ExecResult<Option<V
         });
     } else if values
         .iter()
-        .all(|v| matches!(v, Value::Obj(h) if interp.heap.get_as::<ClrString>(*h).is_some()))
+        .all(|v| matches!(v, Value::Obj(h) if interp.heap.with::<ClrString, _>(*h, |_| ()).is_some()))
     {
         let mut keyed: Vec<(Vec<u16>, Value)> = values
             .into_iter()
             .map(|v| {
                 let units = match &v {
                     Value::Obj(h) => interp
-                        .heap
-                        .get_as::<ClrString>(*h)
-                        .map(|s| s.units.clone())
+                        .heap.with::<ClrString, _>(*h, |s| s.units.clone())
                         .unwrap_or_default(),
                     _ => Vec::new(),
                 };
@@ -477,6 +487,138 @@ fn sort_in_place(interp: &mut Interpreter, array: Handle) -> ExecResult<Option<V
     Ok(None)
 }
 
+/// Orders values with a comparator that is itself managed code.
+///
+/// `list.Sort((a, b) => ...)` and `list.Sort(myComparer)` both end up here, and
+/// so does any LINQ ordering given an `IComparer<T>`. The comparator can run
+/// arbitrary IL, allocate, and throw — which rules out handing it to Rust's
+/// `sort_by`, whose comparator returns an `Ordering` and cannot fail or borrow
+/// the interpreter.
+///
+/// So this is a merge sort written out, calling back into managed code for each
+/// comparison and propagating an exception the moment one escapes. Merge sort
+/// rather than something in-place for two reasons: it makes a fixed
+/// *n* log *n* number of comparisons whatever the input, so a comparator with
+/// side effects sees a predictable number of calls, and it is **stable**.
+///
+/// Stability is worth stating. .NET's `List<T>.Sort` is an introsort and
+/// documents the order of equal elements as unspecified; this keeps them in
+/// their original order. A program that depends on the difference is depending
+/// on something .NET does not promise — but the two runtimes can disagree
+/// there, and that is the one place this is not byte-identical by construction.
+/// `OrderBy`, which .NET *does* document as stable, agrees exactly.
+fn merge_sort_by(
+    interp: &mut Interpreter,
+    values: Vec<Value>,
+    compare: &mut dyn FnMut(&mut Interpreter, &Value, &Value) -> ExecResult<core::cmp::Ordering>,
+) -> ExecResult<Vec<Value>> {
+    if values.len() <= 1 {
+        return Ok(values);
+    }
+    let middle = values.len() / 2;
+    let mut left = values;
+    let right = left.split_off(middle);
+
+    let left = merge_sort_by(interp, left, compare)?;
+    let right = merge_sort_by(interp, right, compare)?;
+
+    let mut merged = Vec::with_capacity(left.len() + right.len());
+    let mut l = left.into_iter().peekable();
+    let mut r = right.into_iter().peekable();
+    loop {
+        match (l.peek(), r.peek()) {
+            (Some(a), Some(b)) => {
+                // `Greater` and only `Greater` takes from the right, which is
+                // what keeps equal elements in their original order.
+                let ordering = compare(interp, a, b)?;
+                if ordering == core::cmp::Ordering::Greater {
+                    merged.push(r.next().expect("peeked"));
+                } else {
+                    merged.push(l.next().expect("peeked"));
+                }
+            }
+            (Some(_), None) => merged.push(l.next().expect("peeked")),
+            (None, Some(_)) => merged.push(r.next().expect("peeked")),
+            (None, None) => break,
+        }
+    }
+    Ok(merged)
+}
+
+/// Turns whatever was passed as a comparer into a comparison function.
+///
+/// Two shapes reach here and they are told apart by what the object *is*, not
+/// by which overload was called: a `Comparison<T>` is a delegate, and an
+/// `IComparer<T>` is an object with a `Compare` method. Binding by arity means
+/// both arrive at the same native, so the distinction has to be made here.
+fn comparison_from(
+    interp: &mut Interpreter,
+    comparer: Value,
+) -> ExecResult<Box<dyn FnMut(&mut Interpreter, &Value, &Value) -> ExecResult<core::cmp::Ordering>>>
+{
+    let handle = comparer
+        .as_handle()
+        .filter(|h| !h.is_null())
+        .ok_or_else(|| invalid_operation("Sort was given a null comparer."))?;
+
+    if interp.heap.with::<ClrDelegate, _>(handle, |_| ()).is_some() {
+        let delegate = comparer.clone();
+        return Ok(Box::new(move |i: &mut Interpreter, a: &Value, b: &Value| {
+            let result = crate::linq::call(i, &delegate, &[a.clone(), b.clone()])?;
+            Ok(ordering_from(result.as_i32().unwrap_or(0)))
+        }));
+    }
+
+    // An `IComparer<T>`. `Compare` is found on the object's own type, so a
+    // class implementing the interface and a class deriving from `Comparer<T>`
+    // both work without either being special-cased.
+    let Some(ty) = interp.type_of(handle) else {
+        return Err(invalid_operation("Sort was given a comparer with no type."));
+    };
+    // By name and arity rather than by signature: the parameter types are the
+    // erased `!0`, so matching a signature would mean matching against nothing
+    // useful.
+    let method = interp
+        .loader
+        .registry
+        .base_chain(ty)
+        .into_iter()
+        .flat_map(|t| interp.loader.registry.ty(t).methods.clone())
+        .find(|m| {
+            let info = interp.loader.registry.method(*m);
+            info.name == "Compare" && info.signature.params.len() == 2
+        })
+        .ok_or_else(|| {
+            invalid_operation("Sort was given a comparer with no Compare(T, T) method.")
+        })?;
+    Ok(Box::new(move |i: &mut Interpreter, a: &Value, b: &Value| {
+        let result = i.invoke(method, vec![Value::Obj(handle), a.clone(), b.clone()])?;
+        Ok(ordering_from(result.and_then(|v| v.as_i32()).unwrap_or(0)))
+    }))
+}
+
+/// .NET comparators return a sign, not an enum.
+fn ordering_from(sign: i32) -> core::cmp::Ordering {
+    match sign {
+        s if s < 0 => core::cmp::Ordering::Less,
+        0 => core::cmp::Ordering::Equal,
+        _ => core::cmp::Ordering::Greater,
+    }
+}
+
+/// `List<T>.Sort(comparer)` and `Array.Sort(array, comparer)`.
+fn sort_with_comparer(
+    interp: &mut Interpreter,
+    array: Handle,
+    comparer: Value,
+) -> ExecResult<Option<Value>> {
+    let mut compare = comparison_from(interp, comparer)?;
+    let values = elements(interp, array);
+    let sorted = merge_sort_by(interp, values, compare.as_mut())?;
+    with_values(interp, array, |v| *v = sorted);
+    Ok(None)
+}
+
 /// Reads anything enumerable into a vector of values.
 ///
 /// The built-in collections are read straight out of their backing arrays,
@@ -491,7 +633,7 @@ pub fn sequence_values(interp: &mut Interpreter, source: &Value) -> Vec<Value> {
         return Vec::new();
     };
     // A plain array.
-    if interp.heap.get_as::<ClrArray>(h).is_some() {
+    if interp.heap.with::<ClrArray, _>(h, |_| ()).is_some() {
         return elements(interp, h);
     }
     let Some(type_id) = interp.type_of(h) else { return Vec::new() };
@@ -825,18 +967,18 @@ fn int_at(interp: &Interpreter, array: Handle, index: usize) -> i32 {
 }
 
 fn set_int(interp: &mut Interpreter, array: Handle, index: usize, value: i32) {
-    if let Some(a) = interp.heap.get_as_mut::<ClrArray>(array) {
+    interp.heap.with_mut::<ClrArray, _>(array, |a| {
         a.storage.set(index, &Value::I32(value));
-    }
+    });
 }
 
 fn push_int(interp: &mut Interpreter, array: Handle, value: i32) {
-    if let Some(a) = interp.heap.get_as_mut::<ClrArray>(array) {
+    interp.heap.with_mut::<ClrArray, _>(array, |a| {
         if let ArrayStorage::I32(v) = &mut a.storage {
             v.push(value);
             a.dimensions = vec![v.len() as u32];
         }
-    }
+    });
 }
 
 /// Finds the entry index for `k`, or `None`.
@@ -1367,11 +1509,11 @@ fn default_comparer(interp: &mut Interpreter, type_name: &str) -> Value {
     };
     if let Value::Obj(h) = interp.loader.static_value(slot) {
         if !h.is_null() {
-            return Value::Obj(*h);
+            return Value::Obj(h);
         }
     }
     let handle = interp.alloc_object(type_id);
-    *interp.loader.static_value_mut(slot) = Value::Obj(handle);
+    interp.loader.set_static(slot, Value::Obj(handle));
     Value::Obj(handle)
 }
 
@@ -1383,7 +1525,7 @@ fn default_comparer(interp: &mut Interpreter, type_name: &str) -> Value {
 /// called when the receiver declares one.
 fn equals_dispatch(interp: &mut Interpreter, x: &Value, y: &Value) -> ExecResult<bool> {
     if let Value::Obj(h) = x {
-        if !h.is_null() && interp.heap.get_as::<ClrString>(*h).is_none() {
+        if !h.is_null() && interp.heap.with::<ClrString, _>(*h, |_| ()).is_none() {
             if let Some(type_id) = interp.type_of(*h) {
                 if let Some(method) = find_equals(interp, type_id) {
                     let result = interp.invoke(method, vec![x.clone(), y.clone()])?;
@@ -1423,8 +1565,8 @@ fn compare_values(interp: &mut Interpreter, x: &Value, y: &Value) -> ExecResult<
     }
     if let (Value::Obj(a), Value::Obj(b)) = (x, y) {
         let (Some(sa), Some(sb)) = (
-            interp.heap.get_as::<ClrString>(*a).map(|s| s.units.clone()),
-            interp.heap.get_as::<ClrString>(*b).map(|s| s.units.clone()),
+            interp.heap.with::<ClrString, _>(*a, |s| s.units.clone()),
+            interp.heap.with::<ClrString, _>(*b, |s| s.units.clone()),
         ) else {
             return Err(invalid_operation(
                 "Comparer<T>.Default on this runtime orders numbers and strings only.",

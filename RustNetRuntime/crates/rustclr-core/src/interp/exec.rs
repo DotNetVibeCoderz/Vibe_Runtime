@@ -6,6 +6,7 @@
 //! spec, the arm says so.
 
 use super::*;
+use crate::value::RawPtr;
 use rustclr_metadata::TableId;
 
 #[allow(unused_imports)]
@@ -271,6 +272,10 @@ impl Interpreter {
                 let token = ins.operand.as_token().ok_or_else(|| self.bad_operand(ins))?;
                 return self.do_call(token, true, constrained);
             }
+            Op::Calli => {
+                let token = ins.operand.as_token().ok_or_else(|| self.bad_operand(ins))?;
+                return self.do_calli(token);
+            }
             Op::Newobj => {
                 let token = ins.operand.as_token().ok_or_else(|| self.bad_operand(ins))?;
                 return self.do_newobj(token);
@@ -374,7 +379,7 @@ impl Interpreter {
                 let field = self.resolve_field(token)?;
                 self.ensure_cctor(self.loader.registry.field(field).declaring_type)?;
                 let v = self.pop()?;
-                *self.loader.static_value_mut(field) = v;
+                self.loader.set_static(field, v);
             }
             Op::Ldsflda => {
                 let token = ins.operand.as_token().ok_or_else(|| self.bad_operand(ins))?;
@@ -388,17 +393,28 @@ impl Interpreter {
             Op::LdindI1 | Op::LdindU1 | Op::LdindI2 | Op::LdindU2 | Op::LdindI4 | Op::LdindU4
             | Op::LdindI8 | Op::LdindI | Op::LdindR4 | Op::LdindR8 | Op::LdindRef => {
                 let addr = self.pop()?;
-                let r = addr.as_byref().ok_or_else(ExecutionError::null_reference)?;
-                let v = self.load_indirect(r)?;
+                // A raw pointer is byte-addressed; a managed one is a path.
+                let v = match addr {
+                    Value::Ptr(p) => self.load_through_pointer(p, ins.op)?,
+                    other => {
+                        let r = other.as_byref().ok_or_else(ExecutionError::null_reference)?;
+                        self.load_indirect(r)?
+                    }
+                };
                 self.push(self.narrow_for_ldind(ins.op, v));
             }
             Op::StindI1 | Op::StindI2 | Op::StindI4 | Op::StindI8 | Op::StindI | Op::StindR4
             | Op::StindR8 | Op::StindRef => {
                 let value = self.pop()?;
                 let addr = self.pop()?;
-                let r = addr.as_byref().ok_or_else(ExecutionError::null_reference)?;
                 let narrowed = self.narrow_for_stind(ins.op, value);
-                self.store_indirect(r, narrowed)?;
+                match addr {
+                    Value::Ptr(p) => self.store_through_pointer(p, narrowed, ins.op)?,
+                    other => {
+                        let r = other.as_byref().ok_or_else(ExecutionError::null_reference)?;
+                        self.store_indirect(r, narrowed)?;
+                    }
+                }
             }
 
             // -- objects ------------------------------------------------------------------
@@ -507,9 +523,7 @@ impl Interpreter {
                     ExecutionError::null_reference,
                 )?;
                 let len = self
-                    .heap
-                    .get_as::<ClrArray>(h)
-                    .map(|a| a.len())
+                    .heap.with::<ClrArray, _>(h, |a| a.len())
                     .ok_or_else(ExecutionError::null_reference)?;
                 self.push(Value::NativeInt(len as i64));
             }
@@ -533,7 +547,7 @@ impl Interpreter {
                     ExecutionError::null_reference,
                 )?;
                 let i = index.as_i64().unwrap_or(-1);
-                let len = self.heap.get_as::<ClrArray>(h).map_or(0, |a| a.len());
+                let len = self.heap.with::<ClrArray, _>(h, |a| a.len()).unwrap_or(0);
                 if i < 0 || i as usize >= len {
                     return Err(ExecutionError::index_out_of_range(i, len));
                 }
@@ -617,7 +631,14 @@ impl Interpreter {
                     // the argument was erased, and `resolve_type` would report
                     // `System.Object`. That is a plausible-looking wrong answer
                     // — the worst kind — so it is refused instead.
-                    if self.token_names_a_generic_parameter(token) {
+                    // A type parameter is answerable when the frame can name
+                    // it — a method one from the instantiation, a class one
+                    // from the receiver. `resolve_type` handles both above.
+                    // What is left is a class parameter in a *static* method,
+                    // where there is no receiver to ask.
+                    if self.frame_generic_argument(token).is_none()
+                        && self.token_names_a_generic_parameter(token)
+                    {
                         return Err(ExecutionError::exception(
                             ClrExceptionKind::NotSupported,
                             "typeof(T) cannot name a generic parameter on this runtime: type arguments are erased. See docs/limitations.md.",
@@ -637,15 +658,36 @@ impl Interpreter {
                 self.push(Value::I32(self.size_of(type_id) as i32));
             }
 
+            // -- raw memory ---------------------------------------------------------------
+            //
+            // `stackalloc` asks for a byte range. It gets one on the managed
+            // heap rather than the native stack: the pointer that comes back
+            // roots it, so it lives exactly as long as something can reach it,
+            // which is a stronger guarantee than the stack frame it would have
+            // had. Nothing observable depends on where it lives.
+            Op::Localloc => {
+                let size = self.pop()?.as_i64().unwrap_or(0).max(0) as usize;
+                let buffer = self.alloc_byte_buffer(size);
+                self.push(Value::Ptr(RawPtr { buffer, offset: 0 }));
+            }
+            Op::Cpblk => {
+                let count = self.pop()?.as_i64().unwrap_or(0).max(0) as usize;
+                let from = self.pop()?;
+                let to = self.pop()?;
+                self.copy_block(to, from, count)?;
+            }
+            Op::Initblk => {
+                let count = self.pop()?.as_i64().unwrap_or(0).max(0) as usize;
+                let fill = self.pop()?.as_i32().unwrap_or(0) as u8;
+                let to = self.pop()?;
+                self.fill_block(to, fill, count)?;
+            }
+
             // -- deliberately unsupported ---------------------------------------------------------
-            Op::Localloc
-            | Op::Cpblk
-            | Op::Initblk
-            | Op::Arglist
+            Op::Arglist
             | Op::Mkrefany
             | Op::Refanyval
             | Op::Refanytype
-            | Op::Calli
             | Op::Jmp => {
                 return Err(ExecutionError::Unsupported(format!(
                     "`{}` is not implemented by this runtime",
@@ -734,10 +776,105 @@ impl Interpreter {
     // -- token resolution ---------------------------------------------------------
 
     pub(super) fn resolve_type(&mut self, token: Token) -> ExecResult<TypeId> {
+        // A `!!N` in the executing method's own body names one of *its* type
+        // arguments, and the instantiation being run knows what those are even
+        // though the shared body does not. Consulting it here is what makes
+        // `typeof(T)`, `default(T)` and `x is T` work inside a generic method.
+        if let Some(resolved) = self.frame_generic_argument(token) {
+            return Ok(resolved);
+        }
         let assembly = self.frame_ref().assembly;
         self.loader
             .resolve_type_token(self.loader.assembly(assembly), token)
             .ok_or(ExecutionError::UnresolvedToken { token, context: "type".into() })
+    }
+
+    /// Type arguments the call site's `TypeSpec` names, for a framework generic.
+    fn call_site_type_arguments(&self, token: Token) -> Vec<TypeId> {
+        let Some(assembly) = self.current_assembly() else { return Vec::new() };
+        self.loader
+            .member_ref_type_args(assembly, token)
+            .map(|a| a.to_vec())
+            .unwrap_or_default()
+    }
+
+    /// The closed construction a member reference names, if it names one.
+    fn constructed_owner(&self, token: Token) -> Option<TypeId> {
+        if token.table() != Some(TableId::MemberRef) {
+            return None;
+        }
+        let assembly = self.frame_ref().assembly;
+        self.loader
+            .assembly(assembly)
+            .member_ref_owner
+            .get(&token.row())
+            .copied()
+    }
+
+    /// The type a `!!N` or `!N` token stands for in the frame currently
+    /// executing.
+    ///
+    /// Two sources, and they are different in kind:
+    ///
+    /// * `!!N` — a **method** type parameter. The call site's `MethodSpec`
+    ///   carried the argument and the instantiation recorded it, so the
+    ///   executing method knows it directly.
+    /// * `!N` — a **class** type parameter. The body is shared by every
+    ///   construction, so the method cannot know; the *receiver* can. `this`
+    ///   is an instance of `Box<int>` or of `Box<string>`, and those are
+    ///   different runtime types carrying different arguments.
+    ///
+    /// `None` when neither source has an answer — a `!N` in a static method on
+    /// a generic type, where there is no receiver to ask, and a `!!N` reached
+    /// without a `MethodSpec`. Both still refuse rather than guessing.
+    fn frame_generic_argument(&self, token: Token) -> Option<TypeId> {
+        if token.table() != Some(TableId::TypeSpec) {
+            return None;
+        }
+        let assembly = self.frame_ref().assembly;
+        let sig = self.loader.assembly(assembly).type_specs.get(&token.row())?;
+
+        match sig {
+            TypeSig::MVar(index) => {
+                let method = self.frame_ref().method;
+                self.loader
+                    .registry
+                    .method(method)
+                    .generic_args
+                    .get(*index as usize)
+                    .copied()
+            }
+            TypeSig::Var(index) => {
+                // The receiver is argument 0 of an instance method.
+                let info = self.loader.registry.method(self.frame_ref().method);
+                if !info.signature.has_this {
+                    // A static method has no receiver, so the answer comes from
+                    // the construction the call site named. Still `None` when
+                    // the call site named the definition, which is the case
+                    // that has to keep refusing.
+                    let construction = self.frame_ref().construction?;
+                    return self
+                        .loader
+                        .registry
+                        .ty(construction)
+                        .generic_args
+                        .get(*index as usize)
+                        .copied();
+                }
+                let handle = self.frame_ref().args.first()?.as_handle()?;
+                if handle.is_null() {
+                    return None;
+                }
+                let receiver = self.type_of(handle)?;
+                self.loader
+                    .registry
+                    .ty(receiver)
+                    .generic_args
+                    .get(*index as usize)
+                    .copied()
+            }
+            _ => None,
+        }
     }
 
     pub(super) fn resolve_method(&mut self, token: Token) -> ExecResult<MethodId> {
@@ -756,12 +893,86 @@ impl Interpreter {
 
     // -- calls -------------------------------------------------------------------
 
+    /// `calli`: an indirect call through a function pointer.
+    ///
+    /// The pointer is whatever `ldftn` or `ldvirtftn` pushed — a [`Value::FnPtr`]
+    /// naming a method, not a machine address. That is the whole reason this is
+    /// short: the hard part of an indirect call on a real runtime is deciding
+    /// what a raw address refers to, and here the answer was never thrown away.
+    ///
+    /// The operand is a `StandAloneSig` describing the *call site*, not the
+    /// callee. It is what says how many arguments to pop, and it can disagree
+    /// with the callee's own signature — a mismatch is a malformed program, and
+    /// reporting it is better than popping the wrong number of values and
+    /// corrupting the evaluation stack underneath.
+    fn do_calli(&mut self, token: Token) -> ExecResult<StepOutcome> {
+        let site = self.call_site_signature(token)?;
+        let arg_count = site.params.len() + usize::from(site.has_this);
+
+        let pointer = self.pop()?;
+        let Value::FnPtr(method) = pointer else {
+            // A function pointer here names a *method*, not an address, which
+            // is what makes `calli` possible at all without a code map. The
+            // cost is that it does not survive being stored somewhere shaped
+            // like an integer: an element of a `delegate*<...>[]` is an
+            // `IntPtr` slot, and putting a method identity into one loses it.
+            // Saying so beats "not a function pointer", which invites the
+            // reader to go looking at the call site.
+            return Err(ExecutionError::exception(
+                ClrExceptionKind::InvalidOperation,
+                format!(
+                    "calli received {pointer:?} rather than a function pointer. A function pointer in this runtime names a method rather than an address, so it does not survive a round trip through integer-shaped storage such as an array element or an `nint`."
+                ),
+            ));
+        };
+
+        let expected = self.loader.registry.method(method).arg_count();
+        if expected != arg_count {
+            return Err(ExecutionError::InvalidProgram(format!(
+                "calli site takes {arg_count} argument(s) but {} takes {expected}",
+                self.loader.registry.method(method).qualified_name
+            )));
+        }
+
+        let mut args = Vec::with_capacity(arg_count);
+        for _ in 0..arg_count {
+            args.push(self.pop()?);
+        }
+        args.reverse();
+
+        match self.enter(method, args)? {
+            Entered::Native(value) => {
+                if let Some(v) = value {
+                    self.push(v);
+                }
+                Ok(StepOutcome::Continue)
+            }
+            Entered::Frame => Ok(StepOutcome::Continue),
+        }
+    }
+
+    /// The signature a `calli` operand names.
+    fn call_site_signature(&self, token: Token) -> ExecResult<rustclr_metadata::MethodSig> {
+        let assembly = self.frame_ref().assembly;
+        self.loader
+            .call_site_signature(self.loader.assembly(assembly), token)
+            .ok_or(ExecutionError::UnresolvedToken {
+                token,
+                context: "calli call-site signature".into(),
+            })
+    }
+
     fn do_call(
         &mut self,
         token: Token,
         virtual_call: bool,
         constrained: Option<Token>,
     ) -> ExecResult<StepOutcome> {
+        // Read before entering: these ask the *calling* frame which assembly
+        // the token belongs to.
+        let construction = self.constructed_owner(token);
+        let call_site_args = self.call_site_type_arguments(token);
+
         let declared = self.resolve_method(token)?;
         let info = self.loader.registry.method(declared);
         let arg_count = info.arg_count();
@@ -817,18 +1028,36 @@ impl Interpreter {
         if has_this {
             let target_type = self.loader.registry.method(target).declaring_type;
             if self.loader.registry.ty(target_type).kind.is_value_like() {
-                if let Some(Value::Obj(h)) = args.first().cloned() {
-                    if let Some(inner) =
-                        self.heap.get_as::<ClrBox>(h).map(|b| b.value.clone())
-                    {
-                        args[0] = inner;
+                match args.first().cloned() {
+                    Some(Value::Obj(h)) => {
+                        if let Some(inner) = self.heap.with::<ClrBox, _>(h, |b| b.value.clone()) {
+                            args[0] = inner;
+                        }
                     }
+                    // A raw pointer used as a value type's receiver. `p[0] + ","`
+                    // compiles to `Int32::ToString()` with the pointer *as*
+                    // `this`, so without this the method reads the pointer
+                    // itself and every such value renders as zero.
+                    //
+                    // The width comes from the declaring type, which is the only
+                    // place it is written down: the pointer does not carry one.
+                    Some(Value::Ptr(ptr)) => {
+                        let size = self.size_of(target_type);
+                        args[0] = self.load_pointer_sized(ptr, size)?;
+                    }
+                    _ => {}
                 }
             }
         }
 
+        self.stage_type_arguments(call_site_args);
         match self.enter(target, args)? {
-            Entered::Frame => Ok(StepOutcome::Continue),
+            Entered::Frame => {
+                if construction.is_some() {
+                    self.frame().construction = construction;
+                }
+                Ok(StepOutcome::Continue)
+            }
             Entered::Native(Some(v)) => {
                 self.push(v);
                 Ok(StepOutcome::Continue)
@@ -957,10 +1186,20 @@ impl Interpreter {
     }
 
     fn do_newobj(&mut self, token: Token) -> ExecResult<StepOutcome> {
+        // `new Span<int>(ptr, 4)` is a `newobj`, and the width of an element
+        // is only in the `int`. Staged the same way a `call` stages it.
+        let call_site_args = self.call_site_type_arguments(token);
         let ctor = self.resolve_method(token)?;
         let info = self.loader.registry.method(ctor);
-        let type_id = info.declaring_type;
         let param_count = info.signature.params.len();
+        // A constructor on a closed construction resolves to the *definition's*
+        // method, because one body serves every construction — so the method's
+        // declaring type is the open definition and would give the new instance
+        // a type whose `T` is unknowable. The member reference remembers which
+        // construction was named; prefer it.
+        let type_id = self
+            .constructed_owner(token)
+            .unwrap_or_else(|| self.loader.registry.method(ctor).declaring_type);
 
         let mut args = Vec::with_capacity(param_count + 1);
         for _ in 0..param_count {
@@ -1009,7 +1248,9 @@ impl Interpreter {
             call_args.push(Value::Ref(ByRef::Field { object: cell, slot: 0 }));
             call_args.extend(args);
 
-            match self.enter(ctor, call_args)? {
+            self.stage_type_arguments(call_site_args.clone());
+            self.stage_type_arguments(call_site_args);
+        match self.enter(ctor, call_args)? {
                 Entered::Frame => {
                     let frame = self.frames.last_mut().expect("ctor frame");
                     frame.pending_newobj = Some(cell);
@@ -1024,9 +1265,7 @@ impl Interpreter {
                 }
                 Entered::Native(None) => {
                     let constructed = self
-                        .heap
-                        .get_as::<ClrObject>(cell)
-                        .and_then(|o| o.fields.first().cloned())
+                        .heap.with::<ClrObject, _>(cell, |o| o.fields.first().cloned()).flatten()
                         .unwrap_or_else(|| self.zero_of(type_id));
                     self.push(constructed);
                     return Ok(StepOutcome::Continue);
@@ -1047,6 +1286,7 @@ impl Interpreter {
         call_args.push(Value::Obj(handle));
         call_args.extend(args);
 
+        self.stage_type_arguments(call_site_args);
         match self.enter(ctor, call_args)? {
             Entered::Frame => {
                 // The constructor returns void; the new object must end up on
@@ -1074,9 +1314,7 @@ impl Interpreter {
             Value::Obj(h) if !h.is_null() => {
                 let type_id = self.type_of(*h).unwrap_or(TypeId::INVALID);
                 let slot = self.field_slot(type_id, field).ok_or_else(|| self.missing_field(field))?;
-                self.heap
-                    .get_as::<ClrObject>(*h)
-                    .and_then(|o| o.fields.get(slot).cloned())
+                self.heap.with::<ClrObject, _>(*h, |o| o.fields.get(slot).cloned()).flatten()
                     .ok_or_else(|| self.missing_field(field))
             }
             Value::Ref(r) => {
@@ -1095,7 +1333,7 @@ impl Interpreter {
         let field = self.resolve_field(token)?;
         if self.loader.registry.field(field).is_static {
             self.ensure_cctor(self.loader.registry.field(field).declaring_type)?;
-            *self.loader.static_value_mut(field) = value;
+            self.loader.set_static(field, value);
             return Ok(());
         }
 
@@ -1113,11 +1351,16 @@ impl Interpreter {
         )?;
         let type_id = self.type_of(h).unwrap_or(TypeId::INVALID);
         let slot = self.field_slot(type_id, field).ok_or_else(|| self.missing_field(field))?;
-        match self.heap.get_as_mut::<ClrObject>(h) {
-            Some(o) if slot < o.fields.len() => {
+        let stored = self.heap.with_mut::<ClrObject, _>(h, |o| {
+            if slot < o.fields.len() {
                 o.fields[slot] = value;
-                Ok(())
+                true
+            } else {
+                false
             }
+        });
+        match stored {
+            Some(true) => Ok(()),
             _ => Err(self.missing_field(field)),
         }
     }
@@ -1155,6 +1398,244 @@ impl Interpreter {
         }
     }
 
+
+    // -- raw pointers --------------------------------------------------------
+    //
+    // A raw pointer is a buffer plus a byte offset. Reading or writing through
+    // one has to land on the right element of that buffer, which means turning
+    // the byte offset back into an index using the storage's element width.
+    // Aligned access is all C# emits for `int*` over `int[]` or over
+    // `stackalloc int[n]`, and an unaligned one is refused rather than
+    // silently reading across two elements.
+
+    /// The byte buffer `stackalloc` gets.
+    ///
+    /// A `byte[]`, so `element_width` is one and offsets are indices. Living
+    /// on the managed heap rather than the native stack is what makes it safe:
+    /// the pointer roots it, so it outlives every reference to it.
+    pub(super) fn alloc_byte_buffer(&mut self, size: usize) -> Handle {
+        let element_type = self.loader.primitive_type(crate::types::Primitive::Byte);
+        let array_type = self
+            .loader
+            .registry
+            .find_sz_array(element_type)
+            .unwrap_or_else(|| self.loader.core().array);
+        self.stats.allocations += 1;
+        self.heap.alloc(ClrArray {
+            array_type,
+            element_type,
+            storage: ArrayStorage::U8(vec![0u8; size]),
+            dimensions: vec![size as u32],
+        })
+    }
+
+    /// How many bytes an indirect instruction touches.
+    ///
+    /// The width is in the opcode, not in the pointer — `int* p` and `byte* q`
+    /// are the same value here, and `*p` versus `*q` is the difference between
+    /// `ldind.i4` and `ldind.u1`. Reading it from the buffer instead truncated
+    /// every `stackalloc int[]` write to one byte, which happened to be
+    /// invisible for values below 256.
+    fn access_width(op: Op) -> Option<(usize, bool)> {
+        Some(match op {
+            Op::LdindI1 | Op::StindI1 => (1, true),
+            Op::LdindU1 => (1, false),
+            Op::LdindI2 | Op::StindI2 => (2, true),
+            Op::LdindU2 => (2, false),
+            Op::LdindI4 | Op::StindI4 | Op::LdindR4 | Op::StindR4 => (4, true),
+            Op::LdindU4 => (4, false),
+            Op::LdindI8 | Op::StindI8 | Op::LdindR8 | Op::StindR8 => (8, true),
+            Op::LdindI | Op::StindI => (8, true),
+            _ => return None,
+        })
+    }
+
+    /// The buffer behind a pointer, and how wide its elements are.
+    fn pointer_buffer(&mut self, p: RawPtr) -> ExecResult<(Handle, usize)> {
+        if p.is_null() {
+            return Err(ExecutionError::null_reference());
+        }
+        let width = self
+            .heap
+            .with::<ClrArray, _>(p.buffer, |a| a.storage.element_width())
+            .flatten()
+            .ok_or_else(|| {
+                ExecutionError::Unsupported(
+                    "dereferencing a pointer into storage that is not laid out in bytes".into(),
+                )
+            })?;
+        if p.offset < 0 {
+            return Err(ExecutionError::exception(
+                ClrExceptionKind::IndexOutOfRange,
+                "a pointer read before the start of its buffer",
+            ));
+        }
+        Ok((p.buffer, width))
+    }
+
+    /// Reads through a pointer at a width taken from a type rather than an
+    /// opcode.
+    pub(super) fn load_pointer_sized(&mut self, p: RawPtr, size: usize) -> ExecResult<Value> {
+        let op = match size {
+            1 => Op::LdindI1,
+            2 => Op::LdindI2,
+            8 => Op::LdindI8,
+            _ => Op::LdindI4,
+        };
+        self.load_through_pointer(p, op)
+    }
+
+    pub(super) fn load_through_pointer(&mut self, p: RawPtr, op: Op) -> ExecResult<Value> {
+        let (buffer, element) = self.pointer_buffer(p)?;
+        let (width, signed) = Self::access_width(op).unwrap_or((element, true));
+
+        // Reading exactly one element of a typed array — what `fixed` over an
+        // `int[]` does — reads the value, not its bytes. The array holds typed
+        // values here rather than a byte image, so there is nothing else it
+        // could honestly mean.
+        if element == width {
+            let index = (p.offset / element as i64) as usize;
+            if p.offset % element as i64 != 0 {
+                return Err(unaligned(p.offset, element));
+            }
+            return self
+                .heap
+                .with::<ClrArray, _>(buffer, |a| a.storage.get(index))
+                .flatten()
+                .ok_or_else(|| past_the_end("read"));
+        }
+
+        // Otherwise the buffer must be bytes — `stackalloc` memory — and the
+        // value is assembled from `width` of them, little-endian.
+        if element != 1 {
+            return Err(ExecutionError::Unsupported(format!(
+                "a {width}-byte read through a pointer into {element}-byte elements"
+            )));
+        }
+        let bytes = self.read_bytes(p, width)?;
+        let mut raw = 0u64;
+        for (n, b) in bytes.iter().enumerate() {
+            raw |= (*b as u64) << (8 * n);
+        }
+        Ok(match (width, signed, op) {
+            (4, _, Op::LdindR4) => Value::F(f32::from_bits(raw as u32) as f64),
+            (8, _, Op::LdindR8) => Value::F(f64::from_bits(raw)),
+            (1, true, _) => Value::I32(raw as u8 as i8 as i32),
+            (1, false, _) => Value::I32(raw as u8 as i32),
+            (2, true, _) => Value::I32(raw as u16 as i16 as i32),
+            (2, false, _) => Value::I32(raw as u16 as i32),
+            (4, true, _) => Value::I32(raw as u32 as i32),
+            (4, false, _) => Value::I32(raw as u32 as i32),
+            _ => Value::I64(raw as i64),
+        })
+    }
+
+    pub(super) fn store_through_pointer(
+        &mut self,
+        p: RawPtr,
+        value: Value,
+        op: Op,
+    ) -> ExecResult<()> {
+        let (buffer, element) = self.pointer_buffer(p)?;
+        let (width, _) = Self::access_width(op).unwrap_or((element, true));
+
+        if element == width {
+            if p.offset % element as i64 != 0 {
+                return Err(unaligned(p.offset, element));
+            }
+            let index = (p.offset / element as i64) as usize;
+            let stored = self
+                .heap
+                .with_mut::<ClrArray, _>(buffer, |a| {
+                    if index < a.storage.len() {
+                        a.storage.set(index, &value);
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .unwrap_or(false);
+            return if stored { Ok(()) } else { Err(past_the_end("write")) };
+        }
+
+        if element != 1 {
+            return Err(ExecutionError::Unsupported(format!(
+                "a {width}-byte write through a pointer into {element}-byte elements"
+            )));
+        }
+        let raw = match (width, op) {
+            (4, Op::StindR4) => (value.as_f64().unwrap_or(0.0) as f32).to_bits() as u64,
+            (8, Op::StindR8) => value.as_f64().unwrap_or(0.0).to_bits(),
+            _ => value.as_i64().unwrap_or(0) as u64,
+        };
+        for n in 0..width {
+            self.store_byte(p.offset_by(n as i64), (raw >> (8 * n)) as u8)?;
+        }
+        Ok(())
+    }
+
+    /// Writes one byte of a byte buffer.
+    fn store_byte(&mut self, p: RawPtr, byte: u8) -> ExecResult<()> {
+        let index = p.offset as usize;
+        let stored = self
+            .heap
+            .with_mut::<ClrArray, _>(p.buffer, |a| {
+                if index < a.storage.len() {
+                    a.storage.set(index, &Value::I32(byte as i32));
+                    true
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false);
+        if stored {
+            Ok(())
+        } else {
+            Err(past_the_end("write"))
+        }
+    }
+
+    /// `cpblk`: copy `count` bytes from one pointer to another.
+    ///
+    /// Both sides must be byte buffers. Copying between arrays of wider
+    /// elements would mean reinterpreting their bytes, and this runtime holds
+    /// them as typed values rather than a byte image, so there is nothing to
+    /// reinterpret — it refuses instead of producing something plausible.
+    pub(super) fn copy_block(&mut self, to: Value, from: Value, count: usize) -> ExecResult<()> {
+        let (Value::Ptr(to), Value::Ptr(from)) = (to, from) else {
+            return Err(ExecutionError::Unsupported(
+                "`cpblk` between anything other than two raw pointers".into(),
+            ));
+        };
+        let bytes = self.read_bytes(from, count)?;
+        for (n, byte) in bytes.into_iter().enumerate() {
+            self.store_byte(to.offset_by(n as i64), byte)?;
+        }
+        Ok(())
+    }
+
+    /// `initblk`: set `count` bytes to `fill`.
+    pub(super) fn fill_block(&mut self, to: Value, fill: u8, count: usize) -> ExecResult<()> {
+        let Value::Ptr(to) = to else {
+            return Err(ExecutionError::Unsupported(
+                "`initblk` on anything other than a raw pointer".into(),
+            ));
+        };
+        for n in 0..count {
+            self.store_byte(to.offset_by(n as i64), fill)?;
+        }
+        Ok(())
+    }
+
+    fn read_bytes(&mut self, from: RawPtr, count: usize) -> ExecResult<Vec<u8>> {
+        let mut out = Vec::with_capacity(count);
+        for n in 0..count {
+            let v = self.load_through_pointer(from.offset_by(n as i64), Op::LdindU1)?;
+            out.push(v.as_i32().unwrap_or(0) as u8);
+        }
+        Ok(out)
+    }
+
     // -- indirect access -----------------------------------------------------------
 
     pub(super) fn load_indirect(&mut self, r: ByRef) -> ExecResult<Value> {
@@ -1172,15 +1653,11 @@ impl Interpreter {
                 .and_then(|f| f.args.get(index as usize).cloned())
                 .unwrap_or(Value::Null),
             ByRef::Field { object, slot } => self
-                .heap
-                .get_as::<ClrObject>(object)
-                .and_then(|o| o.fields.get(slot as usize).cloned())
+                .heap.with::<ClrObject, _>(object, |o| o.fields.get(slot as usize).cloned()).flatten()
                 .ok_or_else(ExecutionError::null_reference)?,
             ByRef::Static { slot, .. } => self.loader.static_value(FieldId(slot)).clone(),
             ByRef::ArrayElement { array, index } => self
-                .heap
-                .get_as::<ClrArray>(array)
-                .and_then(|a| a.storage.get(index as usize))
+                .heap.with::<ClrArray, _>(array, |a| a.storage.get(index as usize)).flatten()
                 .ok_or_else(|| ExecutionError::index_out_of_range(index as i64, 0))?,
             ByRef::StructField { base, slot } => {
                 let container = self.load_indirect(*base)?;
@@ -1210,12 +1687,22 @@ impl Interpreter {
                     }
                 }
             }
-            ByRef::Field { object, slot } => match self.heap.get_as_mut::<ClrObject>(object) {
-                Some(o) if (slot as usize) < o.fields.len() => o.fields[slot as usize] = value,
-                _ => return Err(ExecutionError::null_reference()),
-            },
+            ByRef::Field { object, slot } => {
+                let stored = self.heap.with_mut::<ClrObject, _>(object, |o| {
+                    let at = slot as usize;
+                    if at < o.fields.len() {
+                        o.fields[at] = value;
+                        true
+                    } else {
+                        false
+                    }
+                });
+                if stored != Some(true) {
+                    return Err(ExecutionError::null_reference());
+                }
+            }
             ByRef::Static { slot, .. } => {
-                *self.loader.static_value_mut(FieldId(slot)) = value;
+                self.loader.set_static(FieldId(slot), value);
             }
             ByRef::StructField { base, slot } => {
                 // Value types are copied, not aliased: read the container,
@@ -1239,9 +1726,7 @@ impl Interpreter {
             }
             ByRef::ArrayElement { array, index } => {
                 let ok = self
-                    .heap
-                    .get_as_mut::<ClrArray>(array)
-                    .map(|a| a.storage.set(index as usize, &value))
+                    .heap.with_mut::<ClrArray, _>(array, |a| a.storage.set(index as usize, &value))
                     .unwrap_or(false);
                 if !ok {
                     return Err(ExecutionError::index_out_of_range(index as i64, 0));
@@ -1278,13 +1763,11 @@ impl Interpreter {
             ExecutionError::null_reference,
         )?;
         let i = index.as_i64().unwrap_or(-1);
-        let len = self.heap.get_as::<ClrArray>(h).map_or(0, |a| a.len());
+        let len = self.heap.with::<ClrArray, _>(h, |a| a.len()).unwrap_or(0);
         if i < 0 || i as usize >= len {
             return Err(ExecutionError::index_out_of_range(i, len));
         }
-        self.heap
-            .get_as::<ClrArray>(h)
-            .and_then(|a| a.storage.get(i as usize))
+        self.heap.with::<ClrArray, _>(h, |a| a.storage.get(i as usize)).flatten()
             .ok_or_else(|| ExecutionError::index_out_of_range(i, len))
     }
 
@@ -1293,13 +1776,11 @@ impl Interpreter {
             ExecutionError::null_reference,
         )?;
         let i = index.as_i64().unwrap_or(-1);
-        let len = self.heap.get_as::<ClrArray>(h).map_or(0, |a| a.len());
+        let len = self.heap.with::<ClrArray, _>(h, |a| a.len()).unwrap_or(0);
         if i < 0 || i as usize >= len {
             return Err(ExecutionError::index_out_of_range(i, len));
         }
-        self.heap
-            .get_as_mut::<ClrArray>(h)
-            .map(|a| a.storage.set(i as usize, &value));
+        self.heap.with_mut::<ClrArray, _>(h, |a| a.storage.set(i as usize, &value));
         Ok(())
     }
 
@@ -1309,9 +1790,9 @@ impl Interpreter {
         match v.as_handle() {
             Some(h) if h.is_null() => Err(ExecutionError::null_reference()),
             Some(h) => {
-                if let Some(b) = self.heap.get_as::<ClrBox>(h) {
-                    let inner = b.value.clone();
-                    let boxed_type = b.type_id;
+                if let Some((inner, boxed_type)) =
+                    self.heap.with::<ClrBox, _>(h, |b| (b.value.clone(), b.type_id))
+                {
                     if boxed_type == target
                         || self.loader.registry.is_assignable_to(boxed_type, target)
                     {
@@ -1394,4 +1875,18 @@ impl Interpreter {
         }
         core::mem::size_of::<usize>()
     }
+}
+
+/// A pointer whose offset does not land on an element boundary.
+fn unaligned(offset: i64, width: usize) -> ExecutionError {
+    ExecutionError::Unsupported(alloc::format!(
+        "an unaligned pointer: byte {offset} into {width}-byte elements"
+    ))
+}
+
+fn past_the_end(what: &str) -> ExecutionError {
+    ExecutionError::exception(
+        ClrExceptionKind::IndexOutOfRange,
+        alloc::format!("a pointer {what} past the end of its buffer"),
+    )
 }

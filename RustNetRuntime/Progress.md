@@ -8,7 +8,7 @@ the assistant against a live LLM — produce byte-identical output on RustCLR an
 .NET.
 
 ```
-Conformance    IDENTICAL — checks=176 failures=0
+Conformance    IDENTICAL — checks=285 failures=0
 ModernSyntax   IDENTICAL — checks=35 failures=0
 UserDirectory  IDENTICAL
 PrimeSieve     IDENTICAL   (written by Jack from a prompt)
@@ -22,13 +22,486 @@ SensorGateway  IDENTICAL   (edited by Jack from a prompt)
 | Crate | State | Evidence |
 | --- | --- | --- |
 | `rustclr-metadata` | PE/COFF + ECMA-335 reader, signatures, IL bodies | 27 tests, incl. 9 against a real Roslyn-built assembly |
-| `rustclr-gc` | Handle-based heap, pluggable collectors, mark-sweep | 10 tests; 200k-deep graph marks without stack overflow |
-| `rustclr-core` | Type system, loader, IL interpreter, exception handling | 18 tests |
-| `rustclr-bcl` | Native BCL: Console, String, Math, interpolation, tuples, ranges, Nullable, generic collections, LINQ, Task and async, reflection | 20 unit + 8 integration; 821 bindings |
+| `rustclr-gc` | Handle-based heap, pluggable collectors, mark-sweep, **shared heap + stop-the-world safepoints** | 19 tests; 200k-deep graph marks without stack overflow |
+| `rustclr-core` | Type system, loader, IL interpreter, exception handling | 18 unit + 3 multi-threaded |
+| `rustclr-bcl` | Native BCL: Console, String, Math, interpolation, tuples, ranges, Nullable, generic collections, LINQ, Task and async, reflection | 20 unit + 8 integration; 836 bindings |
 | `rustclr-sched` | Lock-free MS queue, MPMC channel, thread pool | 16 tests |
 | `rustclr-interop` | P/Invoke, dynamic loading, marshalling | 9 tests; calls the real `GetCurrentProcessId` |
 | `rustclr-jit` | Compiler trait, IL verifier, analysis, **x86-64 code generator**, W^X pages, tiering | 25 unit + 3 differential |
 | `rustnet-cli` | `run` / `info` / `disasm` / `verify` / `build` / `capabilities` | Drives every fixture |
+
+### A thread pool, and `rustclr-sched` finally earns its keep
+
+`Task.Run` and `Parallel.*` queue onto one worker per core instead of taking a
+thread each. Two thousand tasks is a conformance check; it used to mean two
+thousand OS threads, each paying for a copy of the loader on the way up.
+
+**The workers hold interpreters**, which is the whole reason the pool could not
+be `rustclr-sched`'s as it stood. A pool of plain closures would have to build
+an interpreter per job — and copying a loader is the expensive part of starting
+a managed thread, not the thread. So each worker builds one at startup and
+reuses it, and a job is `FnOnce(&mut Interpreter)`. The lock-free queue
+underneath *is* `rustclr-sched`'s, tested since the scheduler milestone and
+until now unused by anything.
+
+**A waiting thread helps.** A thread blocked on a task runs queued jobs rather
+than idling. Without that the pool deadlocks in the familiar way — every worker
+blocked on a task whose job is still queued behind it — and `Task.Run(async () =>
+await Task.Run(…))` is exactly that shape. It is also why the pool never needs
+to grow under load.
+
+`Task.Delay` arms a timer and returns a pending task, so a delay overlaps the
+work after it. One timer thread serves every outstanding delay, and it owns no
+interpreter: when a deadline passes it queues the completion like any other job,
+because a continuation is managed code and belongs on a worker.
+
+**The bug this turned up was not about threads at all.** A non-generic
+`TaskAwaiter.GetResult()` returns void, and this runtime was handing back a
+value for it — which leaves that value on the evaluation stack, so everything
+the caller reads afterwards is off by one. It surfaced as a null reference two
+statements later, on a `Stopwatch` that was fine. It had been wrong the whole
+time and stayed invisible while `Task.Delay` returned an already-completed task
+that nothing awaited.
+
+### await suspends
+
+An `async` method that awaits a pending task returns to its caller, and the
+thread completing the task resumes it. Two tasks started and then awaited
+overlap; awaiting in a loop stays sequential, as it is on .NET.
+
+**Almost none of this was new code, and one line of it was mine to undo.** The
+continuation machinery had been right all along: `AwaitUnsafeOnCompleted` copies
+the state machine to the heap — which is what makes a suspension a suspension,
+since it has to outlive the frame it was a local of — and queues it on the task.
+What blocked `await` was that I had made the *awaiter's* `IsCompleted` wait and
+answer `true`, back when `Task.Run` ran inline and a pending task meant a bug.
+With `Task.Run` on a real thread, answering honestly sends the state machine
+down the path that was already there.
+
+**Two things did need building.** Waiting on a task nobody owns: the task an
+`async` method returns has no thread of its own — it is completed by whichever
+thread finishes the *inner* task — so `Result` cannot join anything. It waits
+while another mutator is registered and reports a clear error when none is,
+which is the difference between waiting and hanging.
+
+And a race worth naming: `await_on_completed` checked whether the task was
+pending and *then* joined the queue. A task completing between those two steps
+drained a queue the continuation had not yet entered, and the `await` would
+never resume. Settling a task and taking its waiting list now happen under the
+same gate as checking and queueing. Resuming runs managed code, so it happens
+after the gate is released, never under it.
+
+`Stopwatch` had to become a real object on the way past: it was the number it
+started at, which reads `ElapsedMilliseconds` correctly and cannot express
+`Restart`, because `this` for a class arrives by value and there is nothing to
+write back to.
+
+### Task.Run and Parallel.* run on threads too
+
+`Task.Run` starts its delegate on another thread; `Parallel.For`, `ForEach` and
+`Invoke` split their work one thread per core, capped by the iteration count.
+Two 120 ms tasks finish in 123 ms rather than 240.
+
+Both fell out of the thread work rather than needing anything new: `spawn` and
+`join` were already there, and a parallel loop is a partition plus a join.
+`Task.Run` needed one more idea — the task carries the id of the thread running
+it, and every way of *observing* a task settles it first. That is `Result`,
+`Wait`, `WaitAll`, and an awaiter's `IsCompleted`, which is the gate `await`
+branches on: answering "not yet" would send the state machine down the
+resume-inline path before the body had finished.
+
+**`WaitAll` was waiting for nothing.** It read a params array, and .NET 10 does
+not pass one — `Task.WaitAll(a, b)` lowers through an `InlineArray2<Task>` and a
+`ReadOnlySpan<Task>`. Reading only arrays meant it found no tasks and returned
+at once. It reads a span now.
+
+**A timing check is the wrong test, and the fixture caught me writing one.**
+`elapsed < 200 ms` for two 120 ms tasks passed standalone and failed inside the
+conformance run, where the machine is busy — a margin generous enough to be
+reliable is too generous to prove anything. It is a rendezvous now: each task
+announces itself and waits for the other, with a bounded wait so a runtime that
+serialises them reports `false` rather than hanging. Whether two things
+overlapped is not a question about how long they took.
+
+**`Environment.CurrentManagedThreadId` returned 1 for every thread.** True while
+threads were serialised, and a silent wrong answer once they were not — an
+iterator's state machine uses it to notice cross-thread enumeration, so every
+thread sharing an id would have had them sharing one state machine.
+
+### Threads run at the same time
+
+`Thread.Start` spawns an OS thread and `Join` waits for it. Four threads
+incrementing one static reach four thousand, `lock` excludes, `Interlocked` does
+not lose updates, and a consumer can block on a flag set by a producer started
+*afterwards* — the case that hangs forever under serialisation. All four are
+conformance checks, because each has an answer that differs if the threads do
+not really overlap, and the fixture ran identical to `dotnet` twelve times in a
+row.
+
+**The design is that the loader is copied, not shared.** That is the thing that
+made this tractable, and the earlier conclusion — that it needed either unsafe
+concurrent data structures or a redesign of stub synthesis — was wrong for a
+reason worth writing down. `registry.ty()` is called on nearly every instruction
+and hands back a reference, so a lock underneath it would cost more than the
+heap's did. But a `Loader` is *finished* before the first instruction runs, and
+an identical copy behaves exactly like a shared immutable one, at no cost and
+with no borrow problem at all. Only the genuinely mutable part — static field
+storage — is shared, behind a lock.
+
+The correctness condition is precise and checkable: the copies must not diverge.
+A loader grows in two places after load, an interface stub and
+`MakeGenericType`, and a `MethodId` minted on one thread names nothing on
+another. A thread that grew its registry is caught on `Join` and reported.
+
+**Three bugs, and the second is the one that matters.**
+
+`lock` was a no-op, which was harmless while nothing overlapped and is a data
+race the moment something does. `lock (gate) counter++` on two threads gave
+1,863 of 2,000 — both threads reached the same static, which was the point, and
+neither excluded the other, which was not. `Interlocked` had the same problem
+one layer down: read, add and write are three separate lock acquisitions, so two
+threads interleave between them. It reached 18,828 of 20,000, and only after
+`Increment` was gated as well as `Add` — gating one and not the other is exactly
+the kind of half-fix that looks finished.
+
+**The GC bug is the one to remember.** A thread waiting in `Join` announces
+itself blocked so the collector does not wait for it, and the first version
+contributed *none of its roots* while it was away. "Blocked threads hold no
+references into the heap" is true of a thread parked at a safe point and false
+of one sitting in `Join` holding the array of threads it is joining. A
+collection swept it, and `new Thread[4]` came back with length zero. Blocked
+threads hand their roots over on the way out now, and there is a test.
+
+That bug was invisible until threads were real *and* allocated enough to force a
+collection. The earlier multi-threaded tests passed because nothing was live
+across the wait.
+
+### Every probe passes, and that is not the same as parallelism
+
+`Task.WaitAll(a, b)` written in C# runs, and the advanced-feature matrix is
+**21 of 21**.
+
+The last failure was never about the TPL. `WaitAll(a, b)` does not call a params
+array on .NET 10: it fills a `System.Runtime.CompilerServices.InlineArray2<Task>`
+and makes a `ReadOnlySpan<Task>` over it. That was recorded as "the lowering is
+what this runtime cannot follow" — true when it was written, and the spans and
+raw pointers built since had already removed most of it.
+
+What was left was three small things. `InlineArray<N><T>` is a *framework* type
+on .NET 10, not compiler-generated, so it had to be registered — a struct of N
+slots, and the arity is in the name. `Unsafe.As` is the identity on a managed
+reference, because a reference here is a path to a slot and reinterpreting it
+changes only the type it is read at. `Unsafe.Add` walks that path: to the next
+array element, the next struct field, or — when the reference names something
+whose fields *are* the elements, which is exactly an inline array — to its nth
+slot. The pointer kind and `ByRef::StructField` already existed; nothing new was
+needed to express any of it.
+
+`MemoryMarshal.CreateReadOnlySpan` is the one honest compromise, and it is
+written down where it is done: it copies the elements out rather than making a
+view onto the caller's storage. The callers that reach it build the buffer
+immediately before and never touch it again, and a `ReadOnlySpan` cannot be
+written through, so nothing can observe the difference — but anything needing a
+genuine view over a struct's fields is not served by it.
+
+**21 of 21 is a statement about output, not capability.** `tpl` passes because
+its answers are order-independent: `Task.Run` runs its delegate where it is
+created and `Parallel.For` iterates in order, and the sums come out the same. A
+probe measuring wall-clock overlap would fail. Three rows of the matrix are
+marked with a warning for exactly this reason, and the caveat now sits above the
+table rather than below it, so a reader meets it before the number.
+
+### The call site knows what the type does not
+
+Two probe failures — a span over `stackalloc`, and `Memory<T>` — both came down
+to one missing fact, and the fact was never actually missing. The matrix
+reached **20 of 21**.
+
+A `Span<int>` over `stackalloc` memory needs to know that an element is four
+bytes. The buffer cannot say: `localloc` allocates bytes. The type cannot say
+either, because framework generics are erased here — `List<int>` and
+`List<string>` are deliberately one runtime type, so that native bindings stay
+reachable by declaring-type name. That was recorded as the reason the feature
+could not be built.
+
+It was the wrong conclusion. Erasure applies to the *runtime type*; the call
+site still spells the arguments out, and the loader was already parsing that
+`TypeSpec` to build a name. `new Span<int>(ptr, 4)` says `int` right there.
+Recording the resolved arguments of every member reference — framework generics
+included, which `member_ref_owner` deliberately skipped — and staging them for
+the duration of one native call was the whole change.
+
+That is a general capability, not a span fix. Any native implementation on a
+framework generic can now ask what the call site named.
+
+**A span is three shapes now**, and every accessor reads all three: a window
+onto an array where start counts elements, a window onto raw bytes where start
+counts bytes and the window carries the element width, and a string that *is*
+the span. Indexing raw memory yields a raw pointer rather than a managed
+reference — and the `ldind`/`stind` that follows already knows its own width
+from the instruction, so nothing had to be threaded through.
+
+`Memory<T>` came free: it is the same window. The difference in .NET is that a
+span may not be stored in a field or held across an `await`, and Roslyn has
+enforced that before any of this runs.
+
+### Marshalling blittable structs
+
+`Marshal.SizeOf<T>()`, `AllocHGlobal`, `StructureToPtr` and `PtrToStructure<T>`
+work for a struct of primitive fields, widths intact — the matrix reached
+**19 of 21**.
+
+Nothing here was hard, and that is the point: both halves of marshalling had
+been blocked on things finished earlier in this session. Turning a value into
+bytes needs somewhere to put them, which the raw pointer gave; `SizeOf<T>()`
+needs to know what `T` is, which generic methods already record on their
+instantiation, so the native implementation reads it back rather than being
+handed it. Two features that were built for other reasons met.
+
+**`AllocHGlobal` allocates on the managed heap**, so `FreeHGlobal` does nothing
+and the collector reclaims the buffer when the last pointer to it is gone. A
+program that frees correctly cannot tell; one that uses memory after freeing it
+finds it still valid here and crashes on .NET, which is the safe direction to
+differ in. The pointer cannot go to native code — that needs a real address —
+and `docs/limitations.md` says so rather than leaving it to be discovered.
+
+A struct with a reference field is refused by name. Its field is a handle into
+the GC's table, and writing those bits would produce a number that looks like a
+pointer and is not one.
+
+### Raw pointers, and `unsafe` C# runs
+
+`stackalloc`, `fixed`, pointer arithmetic, comparison and dereference all work,
+along with `cpblk` and `initblk`. The advanced-feature matrix went 16 → 18 of
+21; `unsafe-fixed` and `unsafe-stackalloc` both pass.
+
+**A pointer is not an address.** It is a buffer on the managed heap plus a byte
+offset, which is enough because C# only ever gets one from `stackalloc` — a
+byte range — or from `fixed`, which pins an array. Both name memory this
+runtime already owns. Arithmetic moves the offset, so nothing can point outside
+a buffer the runtime knows about, and the pointer *roots* that buffer, so
+`stackalloc` memory outlives every reference to it instead of dying with a
+frame. That is a stronger guarantee than the native stack would give, and
+nothing observable depends on the difference.
+
+It also explains why this is a separate kind from `ByRef` rather than a widening
+of it. A `ByRef` is a *path* — to a local, a field, an element — and has no byte
+offset. `conv.u` on a `ByRef::ArrayElement` produces a pointer, which is exactly
+what `fixed` compiles to; `conv.u` on any other `ByRef` still refuses.
+
+**Three bugs, and the second is the one worth remembering.**
+
+Pointer *comparison* was missing, so `for (int* p = start; p < start + n; p++)`
+read both sides as zero and the loop body never ran. The probe reported 0 where
+`dotnet` said 10 — a wrong answer, not a refusal.
+
+The access width was being read from the *buffer* rather than the instruction.
+`int* p` and `byte* q` are the same value here, and `*p` versus `*q` is the
+difference between `ldind.i4` and `ldind.u1`, so every `stackalloc int[]` write
+was truncated to one byte. `unsafe-stackalloc` passed anyway, because its
+values are 7, 8 and 9 and all three fit. Writing 300 and 70000 gave back zero.
+A probe passing is not the same as a thing working.
+
+The third: `p[0] + ","` does not emit `ldind.i4` at all — it calls
+`Int32::ToString()` with the *pointer* as `this`. A value type's receiver
+arriving as a raw pointer had no unwrapping path, so the method read the pointer
+itself and every such value rendered as zero. The width for that one comes from
+the declaring type, which is the only place it is written down.
+
+### Spans work over arrays
+
+`Span<T>` and `ReadOnlySpan<T>` over an array: `Length`, `IsEmpty`, indexing,
+`Slice`, `CopyTo`, `ToArray`, the implicit conversion from `T[]`, and both
+collection-expression forms. The advanced-feature matrix went 14 → 16 of 21.
+
+**The reframing is the useful part.** A span was recorded as unimplementable
+because it is a generic ref struct. It is not the ref-struct-ness that was the
+obstacle — a span is a window: something to look at, an offset, and a length,
+and all three are representable whenever the thing being looked at is a managed
+array. Only *raw* memory has no representation here, because a managed pointer
+in this runtime is a path to a slot rather than an address. So `stackalloc`
+still refuses and everything else does not, which is a much narrower line than
+the one that was written down.
+
+Indexing returns `ByRef::ArrayElement` — a reference to the element, which the
+caller loads or stores through. That is what makes `span[1] = 20` visible in
+the array behind it, and it needed no new machinery: the pointer kind already
+existed.
+
+**A span is now one of two shapes**, and both had to keep working. Over an array
+it is a window object with three slots; over a string it *is* the string, which
+is the older representation and the one ordinary C# depends on — `string + char`
+lowers through `ReadOnlySpan<char>` on .NET 10. Every accessor reads both.
+
+**The blob length was the real trap.** `ReadOnlySpan<char> x = ['a', 'b']` puts
+its characters in the image and calls `CreateSpan`, and metadata does not record
+an RVA field's length — `InitializeArray` gets away with that because the array
+it fills bounds the copy. The size is in the name of the synthetic type Roslyn
+emits per distinct size, `__StaticArrayInitTypeSize=4_Align=2`, and taking the
+digits after the *last* `=` reads the alignment instead: a two-character span
+came back with a length of one. Bounded by nothing at all it was 276.
+
+### await foreach over an async iterator runs
+
+`async IAsyncEnumerable<int>` with `await foreach` produces the same answer as
+`dotnet`, including `yield break`, an empty sequence, and breaking out early.
+That completes the async surface: what is still missing is overlap, not syntax.
+
+The compiler lowers an async iterator into a state machine that is its own
+`IAsyncEnumerable<T>`, `IAsyncEnumerator<T>` *and* `IValueTaskSource<bool>` —
+all IL this runtime already executes. Two pieces were the runtime's:
+`AsyncIteratorMethodBuilder`, and `ManualResetValueTaskSourceCore<T>`, the
+promise `MoveNextAsync` hands back. Both are simple here for the same reason the
+rest of `async` is: by the time `MoveNextAsync` returns, the body has already
+run to the next `yield return`, so the promise is always settled and the
+"reset, await, complete later" cycle it exists to manage never happens.
+
+**Three bugs, each found by running it.**
+
+`start_state_machine` passed the *pointer* to the state machine. That is right
+for an async method, whose state machine is a struct, and wrong for an async
+iterator, whose state machine is a class because it has to outlive the call —
+there `this` is the object. Passing a pointer-to-local made every `ldfld` in the
+body read from the wrong thing, surfacing as a null receiver two frames away in
+`DisposeAsync`.
+
+`ValueTask<T>`'s two-argument constructor takes an `IValueTaskSource<T>`, and
+was wrapping the *source object itself* as the result. It asks the source now
+instead — sound only because nothing overlaps, which is written down where it
+is done rather than left to be inferred.
+
+The third ended every `await foreach` at the closing brace. Once an enumeration
+finishes, `DisposeAsync` returns `default(ValueTask)` — all zeroes, so null
+here — and the shared awaiter bindings refuse a null receiver, which is correct
+for a `TaskAwaiter` and wrong for this one. The `ValueTask` awaiters now read
+null as completed, and are registered *after* the shared loop so they win.
+
+### await using and ValueTask run
+
+`await using` works, `IAsyncDisposable` with it, and `ValueTask`/`ValueTask<T>`
+underneath — the advanced-feature matrix is 13 → 14 of 21.
+
+`AsyncValueTaskMethodBuilder` had been registered all along; what was missing
+was `ValueTask` itself and its awaiters. A `ValueTask` is represented by the
+task it stands for, which loses the one thing the type exists for — avoiding an
+allocation when a method completes synchronously — and keeps everything a
+program can observe. `default(ValueTask)` is the case worth naming: a struct's
+default is all zeroes, which arrives here as null, and in .NET it means an
+*already completed* task rather than an absent one, so null reads as completed.
+
+**Two bugs, both found by running it rather than reasoning about it.**
+
+`ConfiguredValueTaskAwaitable` was in the framework type table but
+`ValueTaskAwaiter` was not, so `await using` reached `get_IsCompleted` on a type
+the registry did not have and the member reference would not resolve. The
+binding existed; the type did not. Same shape as the `ParameterInfo` bug earlier
+in this project.
+
+The second was subtler and the trace found it, not the reading. The constructor
+returned the constructed value, which is what `newobj` on a value type takes —
+and `ValueTask<int> v = new ValueTask<int>(11)` does not compile to `newobj` at
+all. Roslyn emits `ldloca v; ldc.i4 11; call .ctor`, so the return value went
+nowhere and the local stayed null, which then read as `default(ValueTask)` —
+*completed*, with no result. `IsCompleted` passed and `Result` returned zero,
+which is exactly the plausible-looking wrong answer that is worth catching.
+Writing through the `this` pointer serves both shapes, since `newobj` reads the
+same slot back out of its cell.
+
+### A static method on a generic type knows its type argument
+
+`Tally<int>.ArgumentName()` returns `"Int32"`. This was the last generic-type
+gap, described as needing something the frame did not have: no receiver exists
+in a static method, and the body is shared by every construction.
+
+It needed nothing new. The call site is a `MemberRef` whose owner is the
+*construction*, and the loader had been recording that since `newobj` on a
+constructed generic needed it — the information was already there, one frame
+away. `do_call` reads it before entering and sets it on the new frame;
+`frame_generic_argument` uses it for `!N` when there is no receiver, and still
+refuses when a call site genuinely names the open definition.
+
+Verified by disabling it: without the change the fixture stops with
+``NotSupportedException ... at Conformance.Tally`1.ArgumentName``, which is the
+proof the six new checks are load-bearing rather than decorative.
+
+### Generic types can be built at run time, and the fixture caught a wrong answer
+
+`MakeGenericType` works. It was recorded as blocked by erasure, and the
+per-construction generic types built earlier in this session removed the block
+without that being noticed — a closed construction is already a real runtime
+type with its own identity and static storage, so `MakeGenericType` only had to
+call the loader path a `TypeSpec` already calls, cache included. That sharing is
+the point: `typeof(Cell<>).MakeGenericType(typeof(int))` returns the *identical
+instance* as `typeof(Cell<int>)`, so reference equality on types stays reliable,
+and `Activator.CreateInstance` on a type built at run time gives an object whose
+methods run normally. `IsGenericType`, `IsGenericTypeDefinition`,
+`ContainsGenericParameters` and `GetGenericTypeDefinition` came with it.
+
+**The fixture found a divergence the other way round.** A new check asserted
+that an open definition has no type arguments. `dotnet` failed it: .NET returns
+the type *parameter* — `typeof(Cell<>).GetGenericArguments()` is `[T]`, not
+`[]` — and this runtime had been quietly answering zero. It refuses now, because
+it records only the arity of a definition and has no runtime type for a
+parameter, and an empty array is exactly the plausible-looking wrong answer the
+project refuses to give. No conformance check covers it: the two runtimes
+deliberately differ there, so a check could not match both.
+
+That is the second time writing the check found the bug rather than confirming
+the fix. Conformance is 204 → 222 checks, byte-identical.
+
+### Several threads share one heap, and the test found a race
+
+The runtime beneath C# can now be driven by more than one OS thread. Three
+things had to hold, and `crates/rustclr-core/tests/parallel.rs` checks each:
+threads allocate into one heap, an object made on one is visible on another,
+and a collection stops everyone and gathers their roots before it sweeps.
+
+**The order was the point.** The safepoint handshake went first, alone, because
+it was the only genuine unknown — if that protocol did not hold, nothing built
+on it would either. The mechanical half came second: 56 call sites that read a
+managed object were moved behind closures so no borrow escaped, one batch at a
+time, each verified against the conformance fixture. Only once none of them held
+a borrow did a lock go underneath, and at that point no call site had to change.
+Attempted together, a failure could have been either half.
+
+The compiler found the one place that could not be mechanical: `with_values` in
+`collections.rs` returned `values_mut()` and applied the edit afterwards, a
+borrow that would have outlived the lock. It does the edit inside the closure
+now. One site out of 56 is roughly the rate the closure conversion was betting
+on.
+
+**The race the test found.** The first multi-threaded test passed, and passed
+for the wrong reason: the interpreter never called `Mutators::register`, so the
+collector waited for nobody. Registering it exposed the real defect. `poll`
+decrements `parked` on the way out, but a thread woken from collection *N* and
+not yet rescheduled is still counted — so a collector starting *N+1* immediately
+afterwards saw four parked threads, concluded everyone had arrived at *this*
+safe point, and swept without their roots. All four workers lost their rooted
+strings. `stop_the_world` now waits for the previous round to drain before
+starting the next. Forty consecutive runs clean afterwards; the same test failed
+four-for-four before.
+
+Back-to-back collections are what make it reproducible. A single collection
+never shows it, which is why the first version of the test — spawn four threads,
+collect once — passed while the bug was live. It also finished in 0.01s with the
+workers already unregistered, so it was measuring nothing.
+
+**What it costs.** Best of five against the same binary built before the lock:
++2% on `fields`, `virtual` and `arrays`, +4% on `alloc` and `calls`, +9% on
+`strings`. On a microcontroller, 1,732 bytes of flash and no RAM at all — `bss`
+and `data` are byte-identical, because without `std` the lock is a `RefCell` and
+the mutator registry is a shim that compiles away. An M5Stack Tough on COM5 runs
+`HelloWorld` with all of it in place, output identical to `dotnet`.
+
+**No C# program can use any of it yet**, and it would be wrong to imply
+otherwise. The loader is still per-interpreter, and it holds three things that
+change while a program runs: static field storage, the interface-dispatch stub
+cache, and the closed generic constructions. Two threads would see two sets of
+statics. Sharing it is not a smaller version of the heap job — `registry.ty()`
+runs on nearly every instruction and hands back a reference, so a lock there
+would cost far more than the heap's did. It needs splitting into a read-only
+part shared without a lock and a mutable part behind one. That is the next
+piece of work. `docs/limitations.md` states the line as it stands.
 
 ### Seven board firmwares, one demonstration
 
@@ -50,6 +523,161 @@ is one copy of it, and four copies would have drifted.
 `tests/firmware.sh` builds all seven. That catches a class `tests/embedded.sh`
 cannot: a change to a shared type breaks a board firmware long before it breaks
 the host build, and otherwise nobody notices until they reach for the hardware.
+
+### Generic types get one runtime type per construction
+
+`Cell<int>` and `Cell<string>` are now two runtime types. They share one body —
+generics remain erased for *execution* — but each carries its own type arguments
+and its own static storage, so `typeof(T)`, `x is T`, `default(T)` and a static
+field per construction all agree with .NET.
+
+**Three pieces had to line up:**
+
+* **Constructions are built at load time**, from the `TypeSpec` that names them.
+  `resolve_type_sig` is `&self` and cannot intern a new type, so building them
+  lazily was never available; a pass beside the existing ones was.
+* **`newobj` had to stop using the constructor's declaring type.** A member
+  reference on a construction resolves to the *definition's* `.ctor`, because
+  one body serves every construction — so the instance it built was a `Cell<T>`
+  whose `T` was unknowable. The member reference now remembers which
+  construction was named.
+* **A class type parameter is answered through the receiver.** The body is
+  shared, so the method cannot know; `this` can.
+
+**Framework generics are left erased on purpose.** Every native binding is keyed
+by its declaring type's name, and giving `List<int>` a name of its own would put
+`List`1::Add` out of reach of the implementation behind it. Nothing in the
+collections needs `T` at run time anyway — their storage is a managed array of
+runtime values, and a value already carries its shape.
+
+**One bug, and it was the kind that only shows up under test.** Static storage is
+indexed by `FieldId`, not by the `slot` an instance field carries. The first
+version set `slot` on each cloned static and grew the table to match, which put
+every value at one index while every read looked at another — a panic in the
+fixture rather than a wrong answer, which is the good outcome.
+
+### Generic methods know their type arguments
+
+`typeof(T)`, `default(T)` and `x is T` now answer inside a generic method, and
+match .NET at every instantiation.
+
+**Nothing had to be inferred — the argument was being thrown away.** Every call
+to `M<int>` emits a `MethodSpec` carrying `int`, and the loader already gave each
+spec its own `MethodInfo` so the *name* could distinguish
+`AppendFormatted<bool>` from `AppendFormatted<int>`. It parsed the arguments,
+used them to build a name, and dropped them. Recording them on the instantiation
+and reading them when a `!!N` token is resolved is the whole change.
+
+**The refusal that was there stays, narrowed.** `typeof(T)` on a *class* type
+parameter still throws rather than answering `System.Object`, because that
+argument really was erased. The check now asks whether the executing frame can
+answer first, and only refuses when it cannot — so the error means "this one is
+genuinely unknown" rather than "generic parameters are unknown".
+
+**The type half is a different size of job**, and is not started. A method
+instantiation only had to record what the call site already said; a type
+instantiation needs a distinct runtime type per closed construction, with its
+own static slots, its own identity, and a shared body whose `!0` resolves
+through the receiver. That touches layout, vtables, statics and identity at
+once.
+
+### Arrays compile, at 89.8×
+
+An `int[]` that arrives as a **parameter** is now handed to compiled code as a
+two-word descriptor — data pointer and length — so `a[i]` becomes a bounds check
+and a scaled-index load. The `arrays` benchmark goes from 18,401 ms interpreted
+to 205 ms compiled: the largest gap in the suite, because element access is
+where the interpreter pays most — a handle resolution and a `Value` per element.
+
+**The design turned on one discovery.** `ArrayStorage` keeps `int[]` as a
+contiguous `Vec<i32>`, not as boxed values. That is what made a pointer viable
+at all; the plan before checking was a call out of compiled code into a runtime
+helper for every element, with Win64 shadow space and volatile-register
+discipline around each one. Reading the representation first turned a risky ABI
+change into two loads.
+
+**Holding a raw pointer into the managed heap is sound for a stated reason.**
+The backend declines any method that allocates, so no collection can run while
+compiled code executes; and this collector never moves an object in any case.
+Both would have to change together for the pointer to go stale. That same
+invariant is why an array created *inside* the method is still declined —
+`new int[n]` allocates, which is exactly what it forbids.
+
+**A bounds failure cannot throw.** Compiled code has no frame for the
+interpreter to unwind, so it writes a flag one slot past the arguments and
+returns, and the tier raises `IndexOutOfRangeException`. Declining and
+re-running interpreted would have been wrong: stores already made stay made,
+which is also what .NET does — the exception aborts the method, it does not roll
+it back. Making that work meant widening `NativeTier::try_execute` to return a
+`Result`, because "ran and faulted" is not the same as "declined".
+
+**Two things the benchmarks caught.** The array workloads already in the suite
+did not speed up at all, because `sieve` and `sort` allocate their arrays as
+locals — the feature was working and the benchmarks could not see it. And
+`rustnet jit` explained the decline of `Fill(int[],int)` as "parameter 0 is not
+an integer", which was false: the explanation tested integers only while the
+backend had moved on. A wrong explanation is worse than none, because it sends
+the reader after the wrong thing. The real reason was `conv.u8`, from a `long`
+in the benchmark I had just written.
+
+### The interpreter runs on Xtensa
+
+An **M5Stack Tough** — ESP32-D0WD rev v3.1, dual core, 16 MB flash — executes
+`HelloWorld.Main` with all 836 native bindings:
+[docs/logs/m5stack-tough.log](docs/logs/m5stack-tough.log). That is the second
+architecture, and the same source file as the RISC-V ESP32-C3: 68 IL
+instructions and 6 calls on x86-64, on RISC-V 32 and on Xtensa LX6 alike.
+
+**The two-region heap was theory until now.** The ESP32's main `dram_seg` tops
+out at 176 KB and the full binding set needs 260,702 bytes, so the firmware adds
+the 96 KB bank at `0x3ffe7e30` that sits past the ROM's data and stacks and that
+the linker will not place ordinary statics in. That reaches 278,528. The
+arrangement was designed for the WROOM-32 during the STM32 work and never run;
+this board is the first hardware confirmation that a heap split across two
+regions actually carries the runtime.
+
+**The banner was asserting something it could not know.** It read
+"ESP32-WROOM-32" because that is the board the `esp32` feature was written for —
+but a firmware knows which *chip* it was compiled for and has no way to tell
+which board that chip is soldered to. Running it on a different ESP32 made the
+report wrong. It now names the chip, and which board a capture came from lives
+in the log header where a person writes it.
+
+The board's previous contents — the user's own RustNet ESP-IDF firmware, on
+`esp-idf-svc 0.51` — were read back to `backups/m5tough-flash-backup.bin`
+(16,777,216 bytes) before anything was written. Same discipline as the Meadow
+F7: a flash that replaces someone's firmware should be reversible before it
+starts, not after.
+
+### Sorting with a comparer, and a docs claim that was wrong
+
+`list.Sort((a, b) => ...)` and `list.Sort(myComparer)` run. Both bind through
+the same arity key and are told apart by what the object *is* — a
+`Comparison<T>` is a delegate, an `IComparer<T>` is an object with a `Compare`
+method — because binding by arity means both arrive at the same native.
+
+The comparator is managed code: it allocates, calls back into the BCL, and can
+throw. That rules out Rust's `sort_by`, whose comparator returns an `Ordering`
+and can do none of those. So it is a merge sort written out, calling
+`Interpreter::invoke` per comparison and propagating an exception the moment one
+escapes.
+
+**Merge sort for two reasons, both deliberate.** It makes a predictable number
+of comparisons whatever the input, so a comparator with side effects is not at
+the mercy of a pivot choice; and it is stable. .NET's `List<T>.Sort` is an
+unstable introsort and documents the order of equal elements as unspecified, so
+this is the one place the two runtimes can legitimately disagree — stated in
+`docs/limitations.md` rather than left to be discovered.
+
+**The claim in the README was wrong in both directions.** It said custom
+comparers were *ignored*, which would have meant silently wrong output — the
+worst failure mode this project has a convention against. They were in fact
+refused with "no implementation", which is the right behaviour for something
+unimplemented. Reading the code to implement the feature is what turned up the
+inaccuracy; the docs now say what the code does.
+
+`String.CompareOrdinal` came with it, because a comparison lambda almost always
+reaches for it and it was unbound.
 
 ### Reflection is finished, apart from loading
 
@@ -153,7 +781,7 @@ template.
 property nothing checked, and the convention says templates carrying it must
 actually run there. The command scaffolds all 20 templates, builds them, runs
 them on both runtimes and diffs the output — board templates against
-`--bcl minimal`, since passing with all 821 bindings says nothing about a 192 KB
+`--bcl minimal`, since passing with all 836 bindings says nothing about a 192 KB
 board. It found four real things on its first run:
 
 1. **`Console.ReadLine()` hung the runner.** `ProcessRunner` redirected stdout
@@ -212,7 +840,7 @@ carries on with the metadata reader and the collector.
 **An unplanned result worth recording: it does not pay flash for what it cannot
 use.** `Tier::for_budget` is a `const fn` and `HEAP_BYTES` is a constant, so LTO
 folds the decision, finds the `Full` and `Minimal` arms unreachable, and strips
-the loader and all 821 native bindings. `.text` is 21 KB on the F401RE against
+the loader and all 836 native bindings. `.text` is 21 KB on the F401RE against
 282 KB on the F427VI, from the same source file. That fell out of making the
 tier a constant expression rather than a runtime check — worth knowing, because
 it means adding a board below the threshold costs nothing but its own bring-up.
@@ -285,7 +913,7 @@ reached only `lib.rs`, and `Image` was gated on `std` in its entirety when only
 ### The interpreter runs on the chip
 
 **C# executes on an ESP32-C3** — RISC-V, 400 KB of SRAM, no operating system.
-The loader builds a type registry, RustBCL registers all 821 of its native
+The loader builds a type registry, RustBCL registers all 836 of its native
 bindings, and `HelloWorld.Main` prints the same three lines `dotnet` prints,
 CRLF included, with the same 68 IL instructions and 6 calls:
 [docs/logs/esp32c3-interpreter.log](docs/logs/esp32c3-interpreter.log).
@@ -606,43 +1234,62 @@ attribute constructors do not bury the real findings.
 
 Ordered as in [Plan.md](Plan.md):
 
-1. **Generic types** — still erased to `object`. The collections and LINQ work
-   anyway, because their storage is self-describing; what erasure still costs is
-   user-written generic code that reads `T` at run time (`default(T)`,
-   `typeof(T)`, per-instantiation statics), and custom comparers.
-2. **Real concurrency** — `async`/`await` and `Thread` both run, but neither
-   overlaps: a task runs to completion where it is created and `Thread.Start`
-   runs its body inline. `rustclr-sched` has the substrate; what is missing is a
-   re-entrant interpreter several OS threads can drive at once. TPL
-   (`Parallel.For`) and `await using` are unimplemented.
-3. **Native code generation beyond integer methods** — the x86-64 backend is
-   11.0× faster where it applies, and inlining widened "where" to include
-   methods that call small helpers. It still declines anything using arrays,
-   allocation or exception handling, which is most of a real program. Arrays are
-   the next piece. The AArch64 and RISC-V backends emit and disassemble
-   correctly but **have never executed a single instruction** — running them
-   needs hardware this host is not.
-4. **Reflection breadth** — only two gaps left, and both are about *loading*
-   rather than inspecting: `Assembly.Load` needs a search path and a resolver,
-   and constructing a generic type at run time is blocked by erasure. Types,
-   members, properties, parameters and their names, assemblies, modules,
-   invocation and attributes all work.
-5. **IL execution on more hardware** — an ESP32-C3 runs the interpreter with
-   the whole of RustBCL. The other six board images build but have not been
-   flashed since; the Pico and the Netduino clear only the reduced binding set,
-   the Nucleo-F401RE clears neither, and no board was connected for any of
-   them. Ahead-of-time compilation additionally needs the Arm and RISC-V
-   backends to actually execute.
-6. **`Span<T>`** — not implemented as a type. Slicing, indexing and `stackalloc`
-   still refuse, and the `span` probe in the advanced-feature matrix still
-   fails. What *does* work is the string-building path: `string + char` lowers
-   through `ReadOnlySpan<char>` on .NET 10, so three BCL members are
-   implemented for it and a span over characters is represented by the string
-   it stands for. That is a representation for one path, not a span — and the
-   members that would expose the difference are deliberately unregistered.
-7. **The remaining IL** — `localloc`, `cpblk`, `initblk`, `calli`, `arglist`,
-   and multi-dimensional arrays with non-zero lower bounds. Exception filters
-   were the other half of this milestone and now work.
+1. **Generic types** — done for user types and methods, including a class type
+   parameter in a *static* method: the call site's `MemberRef` names the
+   construction, so the frame carries it. What is left is framework generics,
+   which stay erased by choice because native bindings are keyed by declaring
+   type name.
+2. **Real concurrency** — done. `Thread.Start`, `Task.Run` and `Parallel.*` run
+   on real threads sharing the heap and static storage; `lock` and `Interlocked`
+   exclude; `await` suspends and the completing thread resumes; tasks run on a
+   pool of one worker per core, and `Task.Delay` arms a timer. `rustclr-sched`
+   is no longer unused — its lock-free queue is the pool's. `await using`, `ValueTask` and now `await foreach` over
+   an `async IAsyncEnumerable<T>` all work, so the async surface itself is
+   complete — what is missing is overlap, not syntax.
+
+   The runtime beneath it has moved. The thread-safe heap and collector that
+   this was waiting on are done and tested: several OS threads allocate into one
+   heap, share objects, and stop at safe points so a collection sees every
+   root — see "Several threads share one heap" above. What now blocks the C#
+   surface is one specific thing, the per-interpreter `Loader`: two threads
+   would see two sets of static fields. It needs splitting into a read-only part
+   shared without a lock and a mutable part behind one, because a lock across
+   `registry.ty()` — called on nearly every instruction — would cost more than
+   the whole heap change did.
+3. **Native code generation beyond integer methods and `int[]`** — the x86-64
+   backend is 11.0× faster on arithmetic and 89.8× on an array walk. It still
+   declines allocation, exception handling, floating point and object field
+   access; an array created *inside* a method falls under allocation, which is
+   why `sieve` and `sort` are still interpreted. The AArch64 and RISC-V backends
+   emit and disassemble correctly but **have never executed a single
+   instruction**, and deliberately decline arrays — adding untested encodings to
+   an untested backend would be stacking one unknown on another.
+4. **Reflection breadth** — constructing a generic type at run time now works;
+   `MakeGenericType` calls the same loader path a `TypeSpec` does and shares its
+   cache, so it returns the identical instance as `typeof`. The gap that
+   replaced it is narrower: `GetGenericArguments()` on an *open* definition,
+   where .NET returns the type parameter `T` and this runtime has no runtime
+   type for one — so it refuses. `Assembly.Load` works on
+   a host but resolves by probing where .NET reads `deps.json`, so an
+   unreferenced DLL beside the app loads here and does not there — noted in
+   `docs/limitations.md` because it is a divergence in the risky direction.
+   Everything else works: types, members, properties, parameters and their
+   names, assemblies, modules, invocation and attributes.
+5. **IL execution on more hardware** — an ESP32-C3 (RISC-V 32) and an M5Stack
+   Tough (Xtensa LX6) run the interpreter with the whole of RustBCL. The
+   remaining images build but have not been flashed since; the Pico and the
+   Netduino clear only the reduced binding set, the Nucleo-F401RE clears
+   neither, and no board was connected for any of them. Ahead-of-time
+   compilation additionally needs the Arm and RISC-V backends to execute.
+6. **`Span<T>`** — done. Over an array, over a string, and over `stackalloc`
+   memory; `Memory<T>`, `AsSpan` and `AsMemory` too. Slicing a span that
+   *stands for* a string still refuses, because the string is the whole
+   representation and there is no offset in it.
+7. **The remaining IL** — `localloc`, `cpblk` and `initblk` work: `Value` has a
+   raw-pointer kind now, and it is a buffer plus a byte offset rather than an
+   address. What is left is `arglist` (varargs), `mkrefany`/`refanyval`/
+   `refanytype`, `jmp`, and multi-dimensional arrays with non-zero lower
+   bounds. Exception filters and `calli` work.
 
 `rustnet capabilities` prints this from the runtime itself, and
 `rustnet verify <assembly>` names what a specific program would hit.
@@ -651,8 +1298,12 @@ Ordered as in [Plan.md](Plan.md):
 
 `tests/fixtures/AdvancedFeatures/` is 21 single-feature probes plus a real
 incremental source generator. `probe.sh` runs each on both runtimes and diffs —
-**13 of 21 pass on RustCLR today**, and the failures print the runtime's own
-error rather than a guess. Results and reasoning:
+**21 of 21 pass on RustCLR today**.
+
+That measures *output*, and output is not capability. `async`, threading and the
+TPL all produce the answers .NET produces while nothing overlaps, so a probe
+that measured wall-clock time would fail three of these. The matrix marks those
+rows with a warning rather than a tick for that reason. Results and reasoning:
 [docs/advanced-features.md](docs/advanced-features.md) ·
 [Bahasa Indonesia](docs/id/fitur-lanjutan.md).
 
@@ -661,11 +1312,10 @@ Two findings from that run were not obvious beforehand:
 - **Source generators and interceptors need no runtime support at all.** Both
   are Roslyn-side; the runtime only ever sees ordinary IL. Proven with a
   generator that actually intercepts a call, not by reasoning about it.
-- **`Thread` works, but serialised.** `Thread.Start` runs the body on the
-  calling thread and `Join` returns immediately. Start-then-join programs are
-  correct; anything needing two threads to make progress together hangs. Said
-  in exactly those words in `capabilities`, because "supported" would be a lie
-  and "unsupported" would be wrong.
+- **`Thread` spawns for real.** `Thread.Start` starts an OS thread and `Join`
+  waits for it; `lock` excludes and `Interlocked` does not lose updates. `Task`
+  and `Parallel.For` still run their work where it is created, so a
+  `Thread`-based program overlaps and a task-based one does not.
 
 Also measured: **union types and closed hierarchies do not exist in .NET 10** —
 `IUnion` and `IsClosedTypeAttribute` are absent from the BCL, so there is

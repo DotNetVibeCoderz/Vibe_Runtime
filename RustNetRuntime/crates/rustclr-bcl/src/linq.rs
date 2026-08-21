@@ -66,7 +66,7 @@ pub fn register(interp: &mut Interpreter) {
 /// This mirrors the interpreter's own `Invoke` intrinsic: a multicast delegate
 /// runs every target and yields the last result, which is what a `Func` used as
 /// a selector would do on .NET.
-fn call(interp: &mut Interpreter, delegate: &Value, args: &[Value]) -> ExecResult<Value> {
+pub(crate) fn call(interp: &mut Interpreter, delegate: &Value, args: &[Value]) -> ExecResult<Value> {
     let handle = delegate.as_handle().filter(|h| !h.is_null()).ok_or_else(|| {
         ExecutionError::exception(
             rustclr_core::ClrExceptionKind::ArgumentNull,
@@ -74,9 +74,7 @@ fn call(interp: &mut Interpreter, delegate: &Value, args: &[Value]) -> ExecResul
         )
     })?;
     let targets = interp
-        .heap
-        .get_as::<ClrDelegate>(handle)
-        .map(|d| d.targets.clone())
+        .heap.with::<ClrDelegate, _>(handle, |d| d.targets.clone())
         .ok_or_else(ExecutionError::null_reference)?;
 
     let mut result = Value::Null;
@@ -98,8 +96,8 @@ fn call(interp: &mut Interpreter, delegate: &Value, args: &[Value]) -> ExecResul
 /// `Enumerable`, and only the lambda's own shape tells them apart.
 fn delegate_arity(interp: &Interpreter, delegate: &Value) -> usize {
     let Some(handle) = delegate.as_handle() else { return 1 };
-    let Some(d) = interp.heap.get_as::<ClrDelegate>(handle) else { return 1 };
-    let Some(target) = d.targets.first() else { return 1 };
+    let first = interp.heap.with::<ClrDelegate, _>(handle, |d| d.targets.first().cloned());
+    let Some(Some(target)) = first else { return 1 };
     let method = target.method;
     let info = interp.loader.registry.method(method);
     let declared = info.signature.params.len();
@@ -440,8 +438,8 @@ pub(crate) fn compare(interp: &Interpreter, x: &Value, y: &Value) -> ExecResult<
     }
     if let (Value::Obj(a), Value::Obj(b)) = (x, y) {
         if let (Some(sa), Some(sb)) = (
-            interp.heap.get_as::<ClrString>(*a).map(|s| s.units.clone()),
-            interp.heap.get_as::<ClrString>(*b).map(|s| s.units.clone()),
+            interp.heap.with::<ClrString, _>(*a, |s| s.units.clone()),
+            interp.heap.with::<ClrString, _>(*b, |s| s.units.clone()),
         ) {
             return Ok(match sa.cmp(&sb) {
                 core::cmp::Ordering::Less => -1,
@@ -710,7 +708,7 @@ fn register_grouping(interp: &mut Interpreter) {
     interp.register_native("System.Linq.Grouping`2::get_Count()", |i, a| {
         let this = arg_handle(i, a, 0)?;
         let items = field_handle(i, this, 1);
-        let count = i.heap.get_as::<ClrArray>(items).map(|x| x.len()).unwrap_or(0);
+        let count = i.heap.with::<ClrArray, _>(items, |x| x.len()).unwrap_or(0);
         Ok(Some(Value::I32(count as i32)))
     });
     interp.register_native("System.Linq.Grouping`2::GetEnumerator()", |i, a| {

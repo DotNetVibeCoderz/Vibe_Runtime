@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Reflection;
+using System.Runtime.InteropServices;
 
 namespace Conformance;
 
@@ -81,6 +83,42 @@ sealed class Reading
     public double Fahrenheit { get { return Celsius * 9 / 5 + 32; } }
     public static string Origin { get; set; } = "lab";
     public int Scale(int by, int offset) { return (int)Celsius * by + offset; }
+}
+
+/// Orders strings by length, for `List<T>.Sort(IComparer<T>)`.
+sealed class ByLength : IComparer<string>
+{
+    public int Compare(string a, string b)
+    {
+        int left = a == null ? 0 : a.Length;
+        int right = b == null ? 0 : b.Length;
+        return left - right;
+    }
+}
+
+/// A user generic type, for the per-construction behaviour below.
+///
+/// `Cell<int>` and `Cell<string>` are two runtime types here. They share one
+/// body — generics are still erased for *execution* — but each carries its own
+/// type arguments and its own static storage.
+sealed class Cell<T>
+{
+    public T Value;
+    public string ArgumentName() { return typeof(T).Name; }
+    public bool Accepts(object o) { return o is T; }
+    public T Empty() { return default(T); }
+}
+
+/// Statics belong to the construction, not the definition.
+static class Tally<T>
+{
+    public static int Count;
+
+    /// No receiver exists here, so `typeof(T)` can only be answered by the
+    /// construction the *call site* named.
+    public static string ArgumentName() { return typeof(T).Name; }
+    public static bool Accepts(object o) { return o is T; }
+    public static T Empty() { return default(T); }
 }
 
 sealed class Node
@@ -166,10 +204,431 @@ static class Program
         return total;
     }
 
+    // `ValueTask` and `await using`. `DisposeAsync` returns a `ValueTask`, so
+    // neither runs without one.
+
+    sealed class AsyncResource : IAsyncDisposable
+    {
+        public static string Log = "";
+        public AsyncResource() { Log += "open;"; }
+        public async ValueTask DisposeAsync()
+        {
+            await Task.Yield();
+            Log += "closed;";
+        }
+    }
+
+    static async Task<string> UsedAsync()
+    {
+        AsyncResource.Log = "";
+        await using (var r = new AsyncResource())
+        {
+            AsyncResource.Log += "body;";
+            await Task.Yield();
+        }
+        return AsyncResource.Log;
+    }
+
+    static async ValueTask<int> TripledAsync(int n)
+    {
+        await Task.Yield();
+        return n * 3;
+    }
+
+    static async ValueTask NothingAsync()
+    {
+        await Task.Yield();
+    }
+
     static async Task Throwing()
     {
         await Task.Yield();
         throw new InvalidOperationException("async boom");
+    }
+
+    // Async iterators. The compiler lowers one into a state machine that is
+    // its own `IAsyncEnumerable<T>`, `IAsyncEnumerator<T>` and
+    // `IValueTaskSource<bool>`, so none of this runs without the builder that
+    // drives it and the promise `MoveNextAsync` hands back.
+
+    static string StackallocSpan()
+    {
+        Span<int> numbers = stackalloc int[4];
+        for (int i = 0; i < numbers.Length; i++) numbers[i] = i * i;
+
+        string seen = "";
+        foreach (int v in numbers) seen += (seen.Length == 0 ? "" : ",") + v;
+
+        Span<int> tail = numbers.Slice(2);
+        int total = 0;
+        for (int i = 0; i < tail.Length; i++) total += tail[i];
+        return seen + "/" + total;
+    }
+
+    struct Blit { public int X; public int Y; }
+    struct Small { public byte A; public byte B; }
+    struct Wide { public int A; public short B; public long C; }
+
+    static string RoundTrip()
+    {
+        IntPtr buffer = Marshal.AllocHGlobal(Marshal.SizeOf<Blit>());
+        try
+        {
+            Marshal.StructureToPtr(new Blit { X = 3, Y = 4 }, buffer, false);
+            Blit back = Marshal.PtrToStructure<Blit>(buffer);
+            return back.X + "/" + back.Y;
+        }
+        finally { Marshal.FreeHGlobal(buffer); }
+    }
+
+    static string WideRoundTrip()
+    {
+        IntPtr buffer = Marshal.AllocHGlobal(Marshal.SizeOf<Wide>());
+        try
+        {
+            Marshal.StructureToPtr(new Wide { A = 70000, B = -5, C = 9000000000L }, buffer, false);
+            Wide back = Marshal.PtrToStructure<Wide>(buffer);
+            return back.A + "/" + back.B + "/" + back.C;
+        }
+        finally { Marshal.FreeHGlobal(buffer); }
+    }
+
+    // Threads. `Thread.Start` spawns a real OS thread that shares this one's
+    // heap and static storage.
+
+    static int threadedTotal;
+    static int lockedTotal;
+    static readonly object threadGate = new object();
+
+    static int ThreadedSum()
+    {
+        threadedTotal = 0;
+        Thread[] workers = new Thread[4];
+        for (int t = 0; t < 4; t++)
+        {
+            workers[t] = new Thread(() =>
+            {
+                for (int i = 0; i < 1000; i++) Interlocked.Increment(ref threadedTotal);
+            });
+            workers[t].Start();
+        }
+        for (int t = 0; t < 4; t++) workers[t].Join();
+        return threadedTotal;
+    }
+
+    static int LockedCounter()
+    {
+        lockedTotal = 0;
+        Thread[] workers = new Thread[4];
+        for (int t = 0; t < 4; t++)
+        {
+            workers[t] = new Thread(() =>
+            {
+                for (int i = 0; i < 2000; i++) lock (threadGate) { lockedTotal++; }
+            });
+            workers[t].Start();
+        }
+        for (int t = 0; t < 4; t++) workers[t].Join();
+        return lockedTotal;
+    }
+
+    static int InterlockedCounter()
+    {
+        int counter = 0;
+        Thread[] workers = new Thread[4];
+        for (int t = 0; t < 4; t++)
+        {
+            workers[t] = new Thread(() =>
+            {
+                for (int i = 0; i < 5000; i++) Interlocked.Increment(ref counter);
+            });
+            workers[t].Start();
+        }
+        for (int t = 0; t < 4; t++) workers[t].Join();
+        return counter;
+    }
+
+    /// The one that cannot pass without overlap: this thread waits for a flag
+    /// set by a thread started after it began waiting.
+    static bool Overlaps()
+    {
+        bool ready = false;
+        Thread producer = new Thread(() => { Thread.Sleep(20); Volatile.Write(ref ready, true); });
+        producer.Start();
+        int spins = 0;
+        while (!Volatile.Read(ref ready) && spins < 20000) { Thread.Sleep(1); spins++; }
+        producer.Join();
+        return ready;
+    }
+
+    static int manyTotal;
+
+    static int ManyTasks()
+    {
+        manyTotal = 0;
+        Task[] tasks = new Task[2000];
+        for (int i = 0; i < tasks.Length; i++)
+            tasks[i] = Task.Run(() => Interlocked.Increment(ref manyTotal));
+        Task.WaitAll(tasks);
+        return manyTotal;
+    }
+
+    /// A task that awaits another. A pool with no way to help would deadlock
+    /// here once every worker was busy.
+    static int NestedTask()
+    {
+        return Task.Run(async () =>
+        {
+            int inner = await Task.Run(() => 40);
+            return inner + 2;
+        }).GetAwaiter().GetResult();
+    }
+
+    /// `Task.Delay` arms a timer and returns; it does not stop its caller.
+    static bool DelayOverlaps()
+    {
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        Task delayed = Task.Delay(300);
+        Thread.Sleep(300);
+        delayed.GetAwaiter().GetResult();
+        return watch.ElapsedMilliseconds < 550;
+    }
+
+    static int awaitFirst;
+    static int awaitSecond;
+
+    /// The same rendezvous as `TasksOverlap`, reached through `await`.
+    ///
+    /// If `await` blocked instead of suspending, the first task would have to
+    /// finish before the second started — and the first cannot finish, because
+    /// it is waiting for the second.
+    static async Task<bool> AwaitedOverlap()
+    {
+        Volatile.Write(ref awaitFirst, 0);
+        Volatile.Write(ref awaitSecond, 0);
+
+        Task<bool> a = Task.Run(() =>
+        {
+            Volatile.Write(ref awaitFirst, 1);
+            return WaitForFlag(ref awaitSecond);
+        });
+        Task<bool> b = Task.Run(() =>
+        {
+            Volatile.Write(ref awaitSecond, 1);
+            return WaitForFlag(ref awaitFirst);
+        });
+        return await a && await b;
+    }
+
+    static async Task<int> AwaitChain()
+    {
+        int x = await Task.Run(() => 1);
+        int y = await Task.Run(() => 2);
+        return x + y;
+    }
+
+    static int firstArrived;
+    static int secondArrived;
+
+    /// Two tasks that each wait for the other.
+    ///
+    /// A rendezvous rather than a stopwatch: whether two things overlapped is
+    /// not a question about how long they took, and a timing margin that is
+    /// generous enough to be reliable is too generous to prove anything. Each
+    /// task announces itself and then waits for the other, so both can only
+    /// finish if both were running. The wait is bounded, so a runtime that
+    /// serialises them reports `false` instead of hanging.
+    static bool TasksOverlap()
+    {
+        Volatile.Write(ref firstArrived, 0);
+        Volatile.Write(ref secondArrived, 0);
+
+        Task<bool> a = Task.Run(() =>
+        {
+            Volatile.Write(ref firstArrived, 1);
+            return WaitForFlag(ref secondArrived);
+        });
+        Task<bool> b = Task.Run(() =>
+        {
+            Volatile.Write(ref secondArrived, 1);
+            return WaitForFlag(ref firstArrived);
+        });
+        Task.WaitAll(a, b);
+        return a.Result && b.Result;
+    }
+
+    static bool WaitForFlag(ref int flag)
+    {
+        for (int spins = 0; spins < 20000; spins++)
+        {
+            if (Volatile.Read(ref flag) == 1) return true;
+            Thread.Sleep(1);
+        }
+        return false;
+    }
+
+    static int parallelTotal;
+
+    static int ParallelSum()
+    {
+        parallelTotal = 0;
+        Parallel.For(0, 1000, i => Interlocked.Add(ref parallelTotal, i));
+        return parallelTotal;
+    }
+
+    static int ParallelForEachSum()
+    {
+        parallelTotal = 0;
+        Parallel.ForEach(new int[] { 1, 2, 3, 4, 5 }, v => Interlocked.Add(ref parallelTotal, v));
+        return parallelTotal;
+    }
+
+    static int ParallelInvokeCount()
+    {
+        parallelTotal = 0;
+        Parallel.Invoke(
+            () => Interlocked.Increment(ref parallelTotal),
+            () => Interlocked.Increment(ref parallelTotal),
+            () => Interlocked.Increment(ref parallelTotal));
+        return parallelTotal;
+    }
+
+    static bool ParallelUsesThreads()
+    {
+        var ids = new HashSet<int>();
+        object gate = new object();
+        Parallel.For(0, 200, i =>
+        {
+            lock (gate) { ids.Add(Environment.CurrentManagedThreadId); }
+            Thread.Sleep(1);
+        });
+        return ids.Count > 1;
+    }
+
+    static int WaitAllTotal()
+    {
+        Task<int> a = Task.Run(() => 20);
+        Task<int> b = Task.Run(() => 22);
+        Task.WaitAll(a, b);
+        return a.Result + b.Result;
+    }
+
+    static int WaitAllThree()
+    {
+        Task<int> a = Task.Run(() => 1);
+        Task<int> b = Task.Run(() => 2);
+        Task<int> c = Task.Run(() => 3);
+        Task.WaitAll(a, b, c);
+        return a.Result + b.Result + c.Result;
+    }
+
+    // Raw pointers. `stackalloc` gives a byte range; `fixed` pins an array.
+    // Both are memory this runtime already owns, which is why a pointer can be
+    // a buffer plus an offset and never name anything outside one.
+
+    static unsafe string Stackalloc()
+    {
+        int* p = stackalloc int[3];
+        p[0] = 300;
+        p[1] = 70000;
+        p[2] = -5;
+        return p[0] + "," + p[1] + "," + p[2];
+    }
+
+    static unsafe long WidePointer()
+    {
+        long* q = stackalloc long[2];
+        q[1] = 9000000000L;
+        return q[1];
+    }
+
+    static unsafe string FixedOverArray()
+    {
+        int[] values = new int[] { 1, 2, 3, 4 };
+        int total = 0;
+        string seen = "";
+        fixed (int* start = values)
+        {
+            for (int* p = start; p < start + values.Length; p++)
+            {
+                total += *p;
+                seen += (seen.Length == 0 ? "" : ",") + *p;
+            }
+        }
+        return total + "/" + seen;
+    }
+
+    static unsafe int FixedWrite()
+    {
+        int[] values = new int[] { 1, 2, 3, 4 };
+        fixed (int* start = values) { *(start + 1) = 99; }
+        int total = 0;
+        foreach (int v in values) total += v;
+        return total;
+    }
+
+    static unsafe string InitBlock()
+    {
+        byte* b = stackalloc byte[4];
+        for (int i = 0; i < 4; i++) b[i] = 1;
+        System.Runtime.CompilerServices.Unsafe.InitBlock(b, 7, 4);
+        return b[0] + "," + b[1] + "," + b[2] + "," + b[3];
+    }
+
+    static unsafe string CopyBlock()
+    {
+        byte* from = stackalloc byte[4];
+        byte* to = stackalloc byte[4];
+        for (int i = 0; i < 4; i++) from[i] = (byte)(i + 1);
+        System.Runtime.CompilerServices.Unsafe.CopyBlock(to, from, 4);
+        return to[0] + "," + to[1] + "," + to[2] + "," + to[3];
+    }
+
+    static async IAsyncEnumerable<int> Counting(int n)
+    {
+        for (int i = 1; i <= n; i++)
+        {
+            await Task.Yield();
+            yield return i * 10;
+        }
+    }
+
+    static async Task<int> SumCounting(int n)
+    {
+        int total = 0;
+        await foreach (int v in Counting(n)) total += v;
+        return total;
+    }
+
+    static async Task<string> FirstTwo()
+    {
+        string seen = "";
+        await foreach (int v in Counting(5))
+        {
+            seen += v + ";";
+            if (seen.Length >= 6) break;
+        }
+        return seen;
+    }
+
+    static async IAsyncEnumerable<int> Empty()
+    {
+        await Task.Yield();
+        yield break;
+    }
+
+    static async Task<int> CountEmpty()
+    {
+        int n = 0;
+        await foreach (int v in Empty()) n += v + 1;
+        return n;
+    }
+
+    static async Task<int> AwaitedValueTask()
+    {
+        int a = await TripledAsync(4);
+        int b = await TripledAsync(6);
+        return a + b;
     }
 
     static async Task<string> CaughtAcrossAwait()
@@ -324,6 +783,70 @@ static class Program
         foreach (int x in xs) total += x;
         return total;
     }
+
+    /// Array access from compiled code. Milestone 4.
+    ///
+    /// An `int[]` that arrives as a *parameter* is handed to the backend as a
+    /// data pointer and a length, so element access compiles to a bounds check
+    /// and a scaled-index load rather than a handle lookup. An indexed `for`
+    /// rather than `foreach`, because the enumerator's local is not an integer
+    /// and the method would be declined.
+    static int ArraySum(int[] xs)
+    {
+        int total = 0;
+        for (int i = 0; i < xs.Length; i++) total += xs[i];
+        return total;
+    }
+
+    /// Stores as well as loads, and a length read.
+    static int ArrayReverse(int[] xs)
+    {
+        int lo = 0;
+        int hi = xs.Length - 1;
+        while (lo < hi)
+        {
+            int t = xs[lo];
+            xs[lo] = xs[hi];
+            xs[hi] = t;
+            lo++;
+            hi--;
+        }
+        return xs[0] * 100 + xs[xs.Length - 1];
+    }
+
+    /// A bounds failure has to raise the same exception compiled or not.
+    static int ArrayAt(int[] xs, int at) { return xs[at]; }
+
+    /// `calli` — an indirect call through a function pointer. Milestone 7.
+    ///
+    /// A function pointer here names a method rather than an address, which is
+    /// what makes an indirect call possible without a code map. It does not
+    /// survive being stored somewhere shaped like an integer, and the runtime
+    /// says so rather than calling the wrong thing.
+    static unsafe int CallIndirect(int seed)
+    {
+        delegate*<int, int> f = &FnDoubled;
+        int a = f(seed);
+        f = &FnNegated;
+        int b = f(seed);
+        delegate*<int, int, int> g = &FnSummed;
+        return g(a, b);
+    }
+
+    static int FnDoubled(int n) { return n * 2; }
+    static int FnNegated(int n) { return -n; }
+    static int FnSummed(int a, int b) { return a + b; }
+
+    /// Type arguments of a generic *method* are known at run time.
+    ///
+    /// Each call site emits a `MethodSpec` carrying the arguments, and the
+    /// instantiation records them — so the shared body can still ask what `T`
+    /// was. Generic *types* remain erased; see `docs/limitations.md`.
+    static string NameOfArg<T>() { return typeof(T).Name; }
+
+    static T DefaultOfArg<T>() { return default(T); }
+
+    static bool ArgHolds<T>(object o) { return o is T; }
 
     static int TryCatchFinally()
     {
@@ -578,6 +1101,22 @@ static class Program
 
         // exceptions
         CheckEq("try/catch/finally", TryCatchFinally(), 111);
+
+        // `Parallel` runs the body once per item, in order, on this thread.
+        // Nothing here overlaps — that limitation is documented — but a loop
+        // whose body is order-independent, which is what `Parallel.For`
+        // requires, gets the answer it would get anywhere.
+        int parallelTotal = 0;
+        System.Threading.Tasks.Parallel.For(0, 10,
+            i => System.Threading.Interlocked.Add(ref parallelTotal, i));
+        CheckEq("Parallel.For", parallelTotal, 45);
+
+        int invoked = 0;
+        System.Threading.Tasks.Parallel.Invoke(
+            () => System.Threading.Interlocked.Add(ref invoked, 5),
+            () => System.Threading.Interlocked.Add(ref invoked, 6));
+        CheckEq("Parallel.Invoke", invoked, 11);
+        unsafe { CheckEq("calli through a function pointer", CallIndirect(21), 21); }
         CheckEq("nested catch", NestedCatch(), 21);
         CheckEq("filter selects a handler", FilterSelects(7), 7);
         CheckEq("filter declines to the next clause", FilterSelects(3), 0);
@@ -606,6 +1145,27 @@ static class Program
         CheckEq("List<T> indexer", gnums[1], 9);
         gnums.Sort();
         CheckEq("List<T> sort", gnums[0], 1);
+
+        // Sorting with a comparator that is itself managed code. The lambda
+        // form and the `IComparer<T>` form bind through the same arity key and
+        // are told apart by what the object is.
+        List<int> bycustom = new List<int>();
+        bycustom.Add(5); bycustom.Add(1); bycustom.Add(4); bycustom.Add(2);
+        bycustom.Sort((a, b) => b - a);
+        CheckStr("List<T>.Sort with a lambda", string.Join(",", bycustom), "5,4,2,1");
+
+        List<string> bylength = new List<string>();
+        bylength.Add("pear"); bylength.Add("fig"); bylength.Add("banana");
+        bylength.Sort(new ByLength());
+        CheckStr("List<T>.Sort with an IComparer", string.Join(",", bylength),
+            "fig,pear,banana");
+
+        // A comparison lambda that calls back into the BCL.
+        List<string> ordinal = new List<string>();
+        ordinal.Add("pear"); ordinal.Add("fig"); ordinal.Add("banana");
+        ordinal.Sort((a, b) => string.CompareOrdinal(a, b));
+        CheckStr("Sort through CompareOrdinal", string.Join(",", ordinal),
+            "banana,fig,pear");
         CheckEq("List<T> foreach", SumSequence(gnums), 14);
         Check("List<T> contains", gnums.Contains(9));
         gnums.Remove(9);
@@ -758,6 +1318,23 @@ static class Program
         CheckEq("jit deep stack", DeepStack(3, 4, 5), 14 + (-4) + (-6) + 24);
         CheckEq("jit division truncates toward zero", Arithmetic(-7, 2), -3);
         CheckEq("jit inlined leaf call", Blend(9, 4), 40);
+
+        // Arrays through the backend. These run interpreted on a cold run and
+        // compiled under `--jit-threshold 1`; both must agree with .NET.
+        int[] cells = new int[6];
+        for (int i = 0; i < 6; i++) cells[i] = (i + 1) * 4;
+        CheckEq("jit array sum", ArraySum(cells), 84);
+        CheckEq("jit array length", cells.Length, 6);
+        CheckEq("jit array reverse", ArrayReverse(cells), 2404);
+        CheckEq("jit array element after reverse", cells[0], 24);
+
+        bool threwHigh = false;
+        try { ArrayAt(cells, 6); } catch (IndexOutOfRangeException) { threwHigh = true; }
+        Check("jit array index past the end throws", threwHigh);
+
+        bool threwLow = false;
+        try { ArrayAt(cells, -1); } catch (IndexOutOfRangeException) { threwLow = true; }
+        Check("jit array negative index throws", threwLow);
         CheckEq("jit inlined call in a loop", BlendLoop(64), 14752);
 
         // reflection
@@ -810,8 +1387,42 @@ static class Program
         CheckStr("missing type is null",
             asm.GetType("Conformance.Nope") == null ? "null" : "found", "null");
         CheckStr("module name is the file name", typeof(Reading).Module.Name, "Conformance.dll");
+        // Loading an assembly already loaded returns it rather than a second
+        // copy — the case both runtimes resolve the same way.
+        CheckStr("Assembly.Load of a loaded assembly",
+            System.Reflection.Assembly.Load("Conformance").GetName().Name, "Conformance");
+        bool refusedMissing = false;
+        try { System.Reflection.Assembly.Load("NoSuchAssembly"); }
+        catch (Exception) { refusedMissing = true; }
+        Check("Assembly.Load refuses a missing assembly", refusedMissing);
         CheckStr("entry assembly",
             System.Reflection.Assembly.GetEntryAssembly().GetName().Name, "Conformance");
+
+        // A user generic *type* knows its argument through the receiver.
+        var cellInt = new Cell<int>();
+        var cellText = new Cell<string>();
+        CheckStr("typeof(T) on a generic type", cellInt.ArgumentName(), "Int32");
+        CheckStr("typeof(T) at a second construction", cellText.ArgumentName(), "String");
+        Check("o is T on a generic type", cellInt.Accepts(7));
+        Check("o is T rejects the other argument", !cellInt.Accepts("seven"));
+        CheckEq("default(T) on a generic type", cellInt.Empty(), 0);
+        CheckStr("default(T) for a reference argument",
+            cellText.Empty() == null ? "null" : "?", "null");
+
+        // Each construction has its own static slot.
+        Tally<int>.Count = 3;
+        Tally<string>.Count = 7;
+        CheckEq("static per construction", Tally<int>.Count, 3);
+        CheckEq("the other construction is separate", Tally<string>.Count, 7);
+
+        // Generic methods know their type arguments.
+        CheckStr("typeof(T) in a generic method", NameOfArg<int>(), "Int32");
+        CheckStr("typeof(T) at a second instantiation", NameOfArg<string>(), "String");
+        CheckEq("default(T) for a value type", DefaultOfArg<int>(), 0);
+        CheckStr("default(T) for a reference type",
+            DefaultOfArg<string>() == null ? "null" : "?", "null");
+        Check("x is T matches", ArgHolds<int>(5));
+        Check("x is T rejects", !ArgHolds<int>("five"));
 
         CheckStr("typeof name", typeof(Tag).Name, "Tag");
         CheckStr("typeof full name", typeof(Tag).FullName, "Conformance.Tag");
@@ -869,6 +1480,227 @@ static class Program
         CheckStr("attribute on a field", ((MarkAttribute)fieldMarks[0]).Text, "on a field");
         object[] methodMarks = typeof(Marked).GetMethod("Twice").GetCustomAttributes(false);
         CheckStr("attribute on a method", ((MarkAttribute)methodMarks[0]).Text, "on a method");
+
+        // -- threads that actually run at the same time ------------------------
+        //
+        // Each of these has an answer that differs if the threads are
+        // serialised, so passing them is evidence rather than decoration.
+
+        CheckEq("four threads share one static", ThreadedSum(), 4000);
+        CheckEq("lock excludes", LockedCounter(), 8000);
+        CheckEq("Interlocked does not lose updates", InterlockedCounter(), 20000);
+        Check("a thread started later can unblock an earlier one", Overlaps());
+
+        // -- the thread pool --------------------------------------------------
+        //
+        // Two thousand tasks used to mean two thousand OS threads, each paying
+        // for a copy of the loader. These run on one worker per core.
+
+        CheckEq("two thousand tasks", ManyTasks(), 2000);
+        CheckEq("a task awaiting a task", NestedTask(), 42);
+        Check("Task.Delay overlaps its caller", DelayOverlaps());
+
+        // -- await suspends rather than blocking ------------------------------
+        //
+        // The rendezvous again, but reached through `await`: an async method
+        // that awaits a pending task must *return* to its caller, or the two
+        // tasks below can never both be running.
+
+        Check("awaited tasks overlap", AwaitedOverlap().GetAwaiter().GetResult());
+        CheckEq("an async method still returns its value",
+            AwaitChain().GetAwaiter().GetResult(), 3);
+
+        // -- Task.Run and Parallel really overlap -----------------------------
+        //
+        // Timing is the only way to tell these apart from the sequential
+        // version, so these measure it. The margins are wide: two 120 ms tasks
+        // finish under 200 ms overlapped and over 240 ms serialised.
+
+        Check("two tasks overlap", TasksOverlap());
+        CheckEq("Parallel.For visits every index", ParallelSum(), 499500);
+        CheckEq("Parallel.ForEach visits every item", ParallelForEachSum(), 15);
+        CheckEq("Parallel.Invoke runs every action", ParallelInvokeCount(), 3);
+        Check("Parallel.For uses more than one thread", ParallelUsesThreads());
+
+        // -- Task.WaitAll written in C# ---------------------------------------
+        //
+        // `WaitAll(a, b)` does not call a params array on .NET 10. It fills an
+        // `InlineArray2<Task>` and makes a `ReadOnlySpan<Task>` over it, so
+        // this exercises the lowering rather than the method.
+        //
+        // It says nothing about concurrency: both tasks have already run to
+        // completion by the time `WaitAll` sees them.
+
+        CheckEq("WaitAll over two tasks", WaitAllTotal(), 42);
+        CheckEq("WaitAll over three tasks", WaitAllThree(), 6);
+
+        // -- ValueTask and await using ---------------------------------------
+
+        CheckEq("async ValueTask<T> returns", TripledAsync(7).GetAwaiter().GetResult(), 21);
+        NothingAsync().GetAwaiter().GetResult();
+        Check("async ValueTask completes", true);
+
+        ValueTask completed = ValueTask.CompletedTask;
+        Check("ValueTask.CompletedTask is completed", completed.IsCompleted);
+        ValueTask<int> wrapped = new ValueTask<int>(11);
+        Check("a wrapped result is completed", wrapped.IsCompleted);
+        CheckEq("a wrapped result reads back", wrapped.Result, 11);
+        CheckEq("AsTask carries the result", wrapped.AsTask().GetAwaiter().GetResult(), 11);
+        CheckEq("await a ValueTask<T>", AwaitedValueTask().GetAwaiter().GetResult(), 30);
+
+        // The ordering is the point: dispose runs after the body, and the
+        // `await` inside `DisposeAsync` does not reorder it.
+        CheckStr("await using disposes after the body",
+            UsedAsync().GetAwaiter().GetResult(), "open;body;closed;");
+
+        // -- marshalling a blittable struct -----------------------------------
+        //
+        // Turning a struct into bytes and back. Both halves needed the raw
+        // pointer above; `SizeOf<T>` additionally needed the generic method to
+        // know what `T` is.
+
+        CheckEq("SizeOf a two-int struct", Marshal.SizeOf<Blit>(), 8);
+        CheckEq("SizeOf a byte struct", Marshal.SizeOf<Small>(), 2);
+        CheckStr("a struct survives a round trip", RoundTrip(), "3/4");
+        CheckStr("field widths are respected", WideRoundTrip(), "70000/-5/9000000000");
+
+        // -- raw pointers -----------------------------------------------------
+        //
+        // A pointer here is a buffer plus a byte offset, not an address, so
+        // nothing can be made to point outside memory the runtime owns. What
+        // a program can observe is unchanged.
+
+        CheckStr("stackalloc and pointer arithmetic", Stackalloc(), "300,70000,-5");
+        CheckStr("a wide value survives a pointer round trip", WidePointer().ToString(), "9000000000");
+        CheckStr("fixed over an array", FixedOverArray(), "10/1,2,3,4");
+        CheckEq("a pointer write reaches the array", FixedWrite(), 1 + 99 + 3 + 4);
+        CheckStr("initblk fills bytes", InitBlock(), "7,7,7,7");
+        CheckStr("cpblk copies bytes", CopyBlock(), "1,2,3,4");
+
+        // -- spans over arrays ------------------------------------------------
+        //
+        // A span is a window onto something. Over an array all three parts of
+        // one — the thing, the offset, the length — are representable here.
+        // Over stackalloc they are not, and that still refuses.
+
+        int[] backing = new int[] { 1, 2, 3, 4, 5 };
+        Span<int> all = backing;
+        CheckEq("a span spans its array", all.Length, 5);
+        CheckEq("a span reads through", all[0], 1);
+        CheckEq("a span reads the last", all[4], 5);
+
+        Span<int> middle = all.Slice(1, 3);
+        CheckEq("a slice is shorter", middle.Length, 3);
+        CheckEq("a slice is offset", middle[0], 2);
+        CheckEq("a slice to the end", all.Slice(3).Length, 2);
+
+        // A span is a window, not a copy: writing through it is visible in the
+        // array behind it. That is the whole point of the type.
+        middle[0] = 20;
+        CheckEq("a write through a span reaches the array", backing[1], 20);
+
+        int[] target = new int[3];
+        middle.CopyTo(target);
+        CheckEq("CopyTo copies the window", target[0] + target[1] + target[2], 20 + 3 + 4);
+        int[] taken = middle.ToArray();
+        CheckEq("ToArray copies out", taken.Length, 3);
+        taken[0] = 99;
+        CheckEq("ToArray really copies", backing[1], 20);
+
+        Check("an empty span is empty", all.Slice(5).IsEmpty);
+
+        // A span over `stackalloc`. The element width is not in the buffer —
+        // that is bytes — nor in the type, since framework generics are erased
+        // here. It comes from the call site, which spells `int` out.
+        CheckStr("a span over stackalloc", StackallocSpan(), "0,1,4,9/13");
+
+        // `Memory<T>` is the same window and is not a ref struct.
+        Memory<int> window = backing.AsMemory(2, 2);
+        CheckEq("AsMemory takes a range", window.Length, 2);
+        Span<int> fromMemory = window.Span;
+        CheckEq("a memory hands back its span", fromMemory[0], 3);
+        CheckEq("the span is the same window", fromMemory[1], 4);
+        CheckEq("AsSpan over the whole array", backing.AsSpan().Length, 5);
+
+        // The collection expression forms that lower through a span.
+        int[] spread = [..backing, 6];
+        CheckEq("a spread collection expression", spread.Length, 6);
+        CheckEq("the spread keeps order", spread[0] + spread[5], 1 + 6);
+        ReadOnlySpan<char> letters = ['a', 'b', 'c'];
+        CheckEq("a collection expression to a span", letters.Length, 3);
+
+        // -- async iterators and await foreach --------------------------------
+
+        CheckEq("await foreach sums the sequence", SumCounting(4).GetAwaiter().GetResult(), 100);
+        CheckEq("a longer sequence", SumCounting(6).GetAwaiter().GetResult(), 210);
+        // Breaking out early runs the enumerator's DisposeAsync, which returns
+        // `default(ValueTask)` — the case that ended every await foreach in a
+        // null reference until the awaiters tolerated it.
+        CheckStr("break disposes cleanly", FirstTwo().GetAwaiter().GetResult(), "10;20;");
+        CheckEq("an empty async sequence", CountEmpty().GetAwaiter().GetResult(), 0);
+
+        // -- a class type parameter in a static method -----------------------
+        //
+        // The body is shared by every construction and there is no receiver to
+        // ask which one is running. The call site is what knows.
+
+        CheckStr("static method knows T", Tally<int>.ArgumentName(), "Int32");
+        CheckStr("a second construction differs", Tally<string>.ArgumentName(), "String");
+        Check("static is-check against T", Tally<int>.Accepts(7));
+        Check("static is-check rejects", !Tally<int>.Accepts("seven"));
+        CheckEq("static default(T)", Tally<int>.Empty(), 0);
+        Check("static default(T) for a reference type", Tally<string>.Empty() == null);
+
+        // -- generic types through reflection --------------------------------
+        //
+        // A closed construction is a real runtime type with its own identity,
+        // so the question these ask is whether one named at run time is the
+        // same object as one named by `typeof`.
+
+        Check("a construction is generic", typeof(Cell<int>).IsGenericType);
+        Check("a construction is not a definition",
+            !typeof(Cell<int>).IsGenericTypeDefinition);
+        Check("an open definition is a definition",
+            typeof(Cell<>).IsGenericTypeDefinition);
+        Check("an open definition contains parameters",
+            typeof(Cell<>).ContainsGenericParameters);
+        Check("a plain type is not generic", !typeof(Node).IsGenericType);
+
+        Type[] cellArgs = typeof(Cell<int>).GetGenericArguments();
+        CheckEq("one type argument", cellArgs.Length, 1);
+        CheckStr("the type argument is Int32", cellArgs[0].Name, "Int32");
+        // `typeof(Cell<>).GetGenericArguments()` is deliberately absent: .NET
+        // returns the type parameter `T` and this runtime has no runtime type
+        // for one, so it refuses. A check here could not match both.
+
+        Check("definition of a construction",
+            typeof(Cell<int>).GetGenericTypeDefinition() == typeof(Cell<>));
+        Check("a definition is its own definition",
+            typeof(Cell<>).GetGenericTypeDefinition() == typeof(Cell<>));
+
+        // The one that matters: built at run time, and the *same instance* as
+        // the one the compiler named. Anything less would make reference
+        // equality on types unreliable.
+        Type madeInt = typeof(Cell<>).MakeGenericType(typeof(int));
+        Check("MakeGenericType equals typeof", madeInt == typeof(Cell<int>));
+        CheckStr("the made type reports its name", madeInt.Name, "Cell`1");
+        Type madeString = typeof(Cell<>).MakeGenericType(typeof(string));
+        Check("different arguments give different types", madeInt != madeString);
+        Check("MakeGenericType is stable",
+            typeof(Cell<>).MakeGenericType(typeof(int)) == madeInt);
+
+        // An instance of a type built at run time behaves as the compiler's.
+        object madeCell = Activator.CreateInstance(madeInt);
+        Check("an instance of the made type", madeCell is Cell<int>);
+        CheckStr("the made instance runs its methods",
+            ((Cell<int>)madeCell).ArgumentName(), "Int32");
+
+        try { typeof(Node).GetGenericTypeDefinition(); Check("non-generic definition throws", false); }
+        catch (InvalidOperationException) { Check("non-generic definition throws", true); }
+        try { typeof(Cell<int>).MakeGenericType(typeof(int)); Check("closed MakeGenericType throws", false); }
+        catch (InvalidOperationException) { Check("closed MakeGenericType throws", true); }
+        try { typeof(Cell<>).MakeGenericType(typeof(int), typeof(string)); Check("wrong arity throws", false); }
+        catch (ArgumentException) { Check("wrong arity throws", true); }
 
         Console.WriteLine("checks=" + checks + " failures=" + failures);
     }

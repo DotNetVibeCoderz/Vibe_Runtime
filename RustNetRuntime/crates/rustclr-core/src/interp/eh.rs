@@ -21,9 +21,7 @@ impl Interpreter {
     pub(super) fn exception_from_handle(&mut self, handle: Handle) -> ExecutionError {
         let type_name = self.type_name_of(handle);
         let message = self
-            .heap
-            .get_as::<ClrException>(handle)
-            .map(|e| e.message.clone())
+            .heap.with::<ClrException, _>(handle, |e| e.message.clone())
             .unwrap_or_default();
         ExecutionError::Exception {
             kind: ClrExceptionKind::Managed(type_name),
@@ -184,6 +182,9 @@ impl Interpreter {
             finally_resume: None,
             in_flight: None,
             constrained: None,
+            // A filter runs in the frame it is filtering for, so it answers
+            // `!N` from the same construction that frame does.
+            construction: template.construction,
             pending_newobj: None,
             pending_newobj_is_cell: false,
             is_filter: true,

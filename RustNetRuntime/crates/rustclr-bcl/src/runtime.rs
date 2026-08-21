@@ -1,6 +1,7 @@
 //! `System.Object`, `System.Environment`, `System.GC`, `System.Array`,
 //! diagnostics and time.
 
+use crate::collections::{field, set_field};
 use crate::support::*;
 use rustclr_core::{ClrArray, ClrException, Interpreter, Value};
 use rustclr_gc::Handle;
@@ -112,10 +113,7 @@ fn initialize_array(
         return Ok(None);
     };
 
-    let Some(a) = interp.heap.get_as_mut::<ClrArray>(array) else {
-        return Ok(None);
-    };
-    copy_initial_data(&mut a.storage, &data);
+    interp.heap.with_mut::<ClrArray, _>(array, |a| copy_initial_data(&mut a.storage, &data));
     Ok(None)
 }
 
@@ -175,9 +173,7 @@ fn register_exceptions(interp: &mut Interpreter) {
     interp.register_native("System.Exception::get_StackTrace()", |i, a| {
         let h = arg_handle(i, a, 0)?;
         let trace = i
-            .heap
-            .get_as::<ClrException>(h)
-            .map(|e| e.stack_trace.join("\n"))
+            .heap.with::<ClrException, _>(h, |e| e.stack_trace.join("\n"))
             .unwrap_or_default();
         Ok(Some(string_value(i, &trace)))
     });
@@ -217,15 +213,15 @@ fn register_exceptions(interp: &mut Interpreter) {
 /// shape is what made `e.Message` come back empty for every exception a program
 /// threw itself.
 pub fn exception_message(interp: &Interpreter, handle: Handle) -> String {
-    if let Some(e) = interp.heap.get_as::<ClrException>(handle) {
-        return e.message.clone();
+    if let Some(message) = interp.heap.with::<ClrException, _>(handle, |e| e.message.clone()) {
+        return message;
     }
-    match interp.heap.get_as::<rustclr_core::ClrObject>(handle) {
-        Some(o) => match o.fields.first() {
-            Some(Value::Obj(text)) => read_string(interp, *text),
-            _ => String::new(),
-        },
-        None => String::new(),
+    let first = interp
+        .heap
+        .with::<rustclr_core::ClrObject, _>(handle, |o| o.fields.first().cloned());
+    match first {
+        Some(Some(Value::Obj(text))) => read_string(interp, text),
+        _ => String::new(),
     }
 }
 
@@ -239,18 +235,23 @@ fn set_exception_message(
 ) -> rustclr_core::ExecResult<Option<Value>> {
     let this = arg_handle(interp, args, 0)?;
     let message = arg_string_or_empty(interp, args, 1)?;
-    if let Some(e) = interp.heap.get_as_mut::<ClrException>(this) {
-        e.message = message;
+    // `message` is moved into the exception when there is one, so it is
+    // handed to the closure and taken back if the handle names something else.
+    let mut message = Some(message);
+    let stored = interp
+        .heap
+        .with_mut::<ClrException, _>(this, |e| e.message = message.take().unwrap_or_default());
+    if stored.is_some() {
         return Ok(None);
     }
-    let handle = interp.alloc_string(&message);
-    if let Some(o) = interp.heap.get_as_mut::<rustclr_core::ClrObject>(this) {
+    let handle = interp.alloc_string(&message.unwrap_or_default());
+    interp.heap.with_mut::<rustclr_core::ClrObject, _>(this, |o| {
         if o.fields.is_empty() {
             o.fields.push(Value::Obj(handle));
         } else {
             o.fields[0] = Value::Obj(handle);
         }
-    }
+    });
     Ok(None)
 }
 
@@ -268,11 +269,15 @@ fn register_environment(interp: &mut Interpreter) {
         Ok(Some(Value::I32(i.host.monotonic_millis() as i32)))
     });
     // An iterator method's state machine records the thread that created it, so
-    // that enumerating from another thread hands out a fresh instance. Managed
-    // threads are serialised here (see `capabilities`), so there is exactly one
-    // id — and returning it is what makes `yield return` work.
+    // that enumerating it from another thread hands out a fresh instance. Now
+    // that `Thread.Start` really spawns, every thread needs an id of its own:
+    // returning 1 everywhere would make two threads enumerating the same
+    // iterator share one state machine and interleave through it.
+    //
+    // The numbering is arbitrary, as it is on .NET — the only guarantees are
+    // that it is stable for a thread and distinct between them.
     interp.register_native("System.Environment::get_CurrentManagedThreadId()", |_i, _a| {
-        Ok(Some(Value::I32(1)))
+        Ok(Some(Value::I32(managed_thread_id())))
     });
     interp.register_native("System.Environment::get_ProcessorCount()", |_i, _a| {
         #[cfg(feature = "std")]
@@ -314,21 +319,19 @@ fn register_gc(interp: &mut Interpreter) {
 fn register_array(interp: &mut Interpreter) {
     interp.register_native("System.Array::get_Length()", |i, a| {
         let h = arg_handle(i, a, 0)?;
-        let len = i.heap.get_as::<ClrArray>(h).map(|x| x.len()).unwrap_or(0);
+        let len = i.heap.with::<ClrArray, _>(h, |x| x.len()).unwrap_or(0);
         Ok(Some(Value::I32(len as i32)))
     });
     interp.register_native("System.Array::get_Rank()", |i, a| {
         let h = arg_handle(i, a, 0)?;
-        let rank = i.heap.get_as::<ClrArray>(h).map(|x| x.dimensions.len()).unwrap_or(1);
+        let rank = i.heap.with::<ClrArray, _>(h, |x| x.dimensions.len()).unwrap_or(1);
         Ok(Some(Value::I32(rank as i32)))
     });
     interp.register_native("System.Array::GetLength(int)", |i, a| {
         let h = arg_handle(i, a, 0)?;
         let dim = arg_i32(i, a, 1)?.max(0) as usize;
         let len = i
-            .heap
-            .get_as::<ClrArray>(h)
-            .and_then(|x| x.dimensions.get(dim).copied())
+            .heap.with::<ClrArray, _>(h, |x| x.dimensions.get(dim).copied()).flatten()
             .unwrap_or(0);
         Ok(Some(Value::I32(len as i32)))
     });
@@ -347,14 +350,68 @@ fn register_time(interp: &mut Interpreter) {
         Ok(Some(Value::I64(arg_i64(i, a, 0)? * 10_000)))
     });
 
+    // A `Stopwatch` is an object with two slots: when the current run began,
+    // and how much time earlier runs added up to. `_start` is -1 while stopped.
+    //
+    // It used to be a bare number — the moment it was started — which reads
+    // `ElapsedMilliseconds` correctly and cannot express `Restart`, because
+    // `this` for a class arrives by value and there is nothing to write back to.
     interp.register_native("System.Diagnostics.Stopwatch::StartNew()", |i, _a| {
-        let start = i.host.monotonic_millis();
-        Ok(Some(Value::I64(start as i64)))
-    });
-    interp.register_native("System.Diagnostics.Stopwatch::get_ElapsedMilliseconds()", |i, a| {
-        let start = arg_i64(i, a, 0)?;
+        let watch = new_stopwatch(i)?;
         let now = i.host.monotonic_millis() as i64;
-        Ok(Some(Value::I64((now - start).max(0))))
+        set_field(i, watch, WATCH_START, Value::I64(now));
+        Ok(Some(Value::Obj(watch)))
+    });
+    for ctor in ["System.Diagnostics.Stopwatch::.ctor()", "System.Diagnostics.Stopwatch::.ctor/0"] {
+        interp.register_native(ctor, |i, a| {
+            // `newobj` made the instance; this only has to initialise it.
+            if let Some(watch) = arg(i, a, 0)?.as_handle().filter(|h| !h.is_null()) {
+                set_field(i, watch, WATCH_START, Value::I64(-1));
+                set_field(i, watch, WATCH_ELAPSED, Value::I64(0));
+            }
+            Ok(None)
+        });
+    }
+    interp.register_native("System.Diagnostics.Stopwatch::get_ElapsedMilliseconds()", |i, a| {
+        let watch = arg(i, a, 0)?.as_handle().unwrap_or(rustclr_gc::Handle::NULL);
+        Ok(Some(Value::I64(elapsed_millis(i, watch))))
+    });
+    interp.register_native("System.Diagnostics.Stopwatch::get_IsRunning()", |i, a| {
+        let watch = arg(i, a, 0)?.as_handle().unwrap_or(rustclr_gc::Handle::NULL);
+        let running = field(i, watch, WATCH_START).as_i64().unwrap_or(-1) >= 0;
+        Ok(Some(Value::I32(running as i32)))
+    });
+    interp.register_native("System.Diagnostics.Stopwatch::Start()", |i, a| {
+        let watch = arg(i, a, 0)?.as_handle().unwrap_or(rustclr_gc::Handle::NULL);
+        if field(i, watch, WATCH_START).as_i64().unwrap_or(-1) < 0 {
+            let now = i.host.monotonic_millis() as i64;
+            set_field(i, watch, WATCH_START, Value::I64(now));
+        }
+        Ok(None)
+    });
+    interp.register_native("System.Diagnostics.Stopwatch::Stop()", |i, a| {
+        let watch = arg(i, a, 0)?.as_handle().unwrap_or(rustclr_gc::Handle::NULL);
+        let start = field(i, watch, WATCH_START).as_i64().unwrap_or(-1);
+        if start >= 0 {
+            let now = i.host.monotonic_millis() as i64;
+            let accumulated = field(i, watch, WATCH_ELAPSED).as_i64().unwrap_or(0);
+            set_field(i, watch, WATCH_ELAPSED, Value::I64(accumulated + (now - start).max(0)));
+            set_field(i, watch, WATCH_START, Value::I64(-1));
+        }
+        Ok(None)
+    });
+    interp.register_native("System.Diagnostics.Stopwatch::Reset()", |i, a| {
+        let watch = arg(i, a, 0)?.as_handle().unwrap_or(rustclr_gc::Handle::NULL);
+        set_field(i, watch, WATCH_START, Value::I64(-1));
+        set_field(i, watch, WATCH_ELAPSED, Value::I64(0));
+        Ok(None)
+    });
+    interp.register_native("System.Diagnostics.Stopwatch::Restart()", |i, a| {
+        let watch = arg(i, a, 0)?.as_handle().unwrap_or(rustclr_gc::Handle::NULL);
+        let now = i.host.monotonic_millis() as i64;
+        set_field(i, watch, WATCH_START, Value::I64(now));
+        set_field(i, watch, WATCH_ELAPSED, Value::I64(0));
+        Ok(None)
     });
 
     interp.register_native("System.Threading.Thread::Sleep(int)", |i, a| {
@@ -438,4 +495,52 @@ fn load_random_state() -> u64 {
 #[cfg(not(feature = "std"))]
 fn store_random_state(x: u64) {
     unsafe { core::ptr::write(&raw mut RANDOM_STATE, x) }
+}
+
+/// A small, stable, per-thread number.
+#[cfg(feature = "std")]
+fn managed_thread_id() -> i32 {
+    use core::sync::atomic::{AtomicI32, Ordering};
+    static NEXT: AtomicI32 = AtomicI32::new(1);
+    std::thread_local! {
+        static ID: i32 = NEXT.fetch_add(1, Ordering::Relaxed);
+    }
+    ID.with(|id| *id)
+}
+
+/// One thread, one id.
+#[cfg(not(feature = "std"))]
+fn managed_thread_id() -> i32 {
+    1
+}
+
+/// Slots of a `Stopwatch`.
+const WATCH_START: usize = 0;
+const WATCH_ELAPSED: usize = 1;
+
+fn new_stopwatch(interp: &mut Interpreter) -> rustclr_core::ExecResult<rustclr_gc::Handle> {
+    let Some(type_id) = interp
+        .loader
+        .registry
+        .find_type_by_name("System.Diagnostics.Stopwatch")
+    else {
+        return Err(rustclr_core::ExecutionError::MissingImplementation(
+            "Stopwatch is not registered".into(),
+        ));
+    };
+    let watch = interp.alloc_object(type_id);
+    set_field(interp, watch, WATCH_START, Value::I64(-1));
+    set_field(interp, watch, WATCH_ELAPSED, Value::I64(0));
+    Ok(watch)
+}
+
+/// Time on the clock: what earlier runs added up to, plus the current run.
+fn elapsed_millis(interp: &mut Interpreter, watch: rustclr_gc::Handle) -> i64 {
+    let accumulated = field(interp, watch, WATCH_ELAPSED).as_i64().unwrap_or(0);
+    let start = field(interp, watch, WATCH_START).as_i64().unwrap_or(-1);
+    if start < 0 {
+        return accumulated;
+    }
+    let now = interp.host.monotonic_millis() as i64;
+    accumulated + (now - start).max(0)
 }

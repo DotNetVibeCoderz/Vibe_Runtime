@@ -113,9 +113,58 @@ pub trait Backend {
 
     /// Record that `il_offset` begins here, so branches can be resolved.
     fn label(&mut self, il_offset: u32);
+
+    // -- arrays ---------------------------------------------------------
+    //
+    // An `int[]` argument does not arrive as a handle. The tier resolves it to
+    // a two-word descriptor — `{ data pointer, length }` — and passes the
+    // descriptor's *address* in the argument slot. `ldarg` then loads that
+    // address like any other integer, so by the time `ldelem.i4` runs the
+    // descriptor is already on the evaluation stack and these operations take
+    // registers rather than argument indices. Compiled code reads elements
+    // with ordinary loads and never calls back into the runtime.
+    //
+    // That is sound for a narrow, checkable reason: this backend declines any
+    // method that allocates, so no collection can run while compiled code is
+    // executing, and the mark-sweep collector never moves an object even when
+    // it does. The pointer is stable for exactly as long as the call.
+
+    /// Whether this backend implements the operations below.
+    ///
+    /// Only x86-64 does. The other two have never executed an instruction, so
+    /// giving them array support would be adding untested encodings to
+    /// untested backends — `shape_is_compilable_with` keeps array methods away
+    /// from them instead.
+    fn supports_arrays(&self) -> bool {
+        false
+    }
+
+    /// `dst = descriptor.length`. `dst` may be the same register as
+    /// `descriptor`.
+    fn array_length(&mut self, dst: u8, descriptor: u8) {
+        let _ = (dst, descriptor);
+        unreachable!("this backend declines array access");
+    }
+
+    /// `dst = descriptor.data[index]`, trapping if `index` is out of range.
+    fn array_load_i32(&mut self, dst: u8, descriptor: u8, index: u8) {
+        let _ = (dst, descriptor, index);
+        unreachable!("this backend declines array access");
+    }
+
+    /// `descriptor.data[index] = value`, trapping if `index` is out of range.
+    fn array_store_i32(&mut self, descriptor: u8, index: u8, value: u8) {
+        let _ = (descriptor, index, value);
+        unreachable!("this backend declines array access");
+    }
 }
 
 /// Whether an opcode the walk understands is one this crate emits code for.
+/// Opcodes that only compile when the backend supports arrays.
+pub fn is_array_op(op: Op) -> bool {
+    matches!(op, Op::Ldlen | Op::LdelemI4 | Op::StelemI4)
+}
+
 pub fn is_supported(op: Op) -> bool {
     use Op::*;
     matches!(
@@ -220,6 +269,55 @@ fn integer_shaped(sig: &rustclr_metadata::TypeSig) -> bool {
 /// Shared rather than per-architecture: the backends differ in how they encode,
 /// not in what they take. Duplicating this is how one of them quietly starts
 /// accepting a method the others refuse.
+/// Whether a signature entry is an `int[]`.
+///
+/// Only `int[]`, and only as a parameter. A wider set would mean more element
+/// widths in the emitter for no more coverage of the loops that matter, and an
+/// array *local* would have to be tracked through the frame rather than
+/// arriving as a descriptor the caller built.
+pub fn is_int_array(sig: &rustclr_metadata::TypeSig) -> bool {
+    matches!(sig.unwrap_modifiers(), rustclr_metadata::TypeSig::SzArray(inner)
+        if matches!(inner.unwrap_modifiers(), rustclr_metadata::TypeSig::I4))
+}
+
+/// The shape check, told whether the backend can take arrays.
+///
+/// Only x86-64 can. The AArch64 and RISC-V backends have never executed an
+/// instruction, and giving them array encodings would be stacking untested
+/// code on untested code — so they keep the narrower shape and this parameter
+/// is how that stays explicit rather than implicit.
+pub fn shape_is_compilable_with(
+    registry: &rustclr_core::TypeRegistry,
+    method: rustclr_core::MethodId,
+    arrays: bool,
+) -> bool {
+    let info = registry.method(method);
+    let rustclr_core::MethodKind::Il(body) = &info.kind else { return false };
+    if !body.exception_clauses.is_empty() || info.signature.has_this {
+        return false;
+    }
+    if !integer_shaped(&info.signature.return_type) && !info.returns_void() {
+        return false;
+    }
+    let param_ok = |p: &rustclr_metadata::TypeSig| {
+        integer_shaped(p) || (arrays && is_int_array(p))
+    };
+    if !info.signature.params.iter().all(param_ok) {
+        return false;
+    }
+    // Locals stay integer-only even with arrays on: a descriptor stored to a
+    // local and read back would work, but an array local declared as `int[]`
+    // and assigned from `newarr` would not, and the two are indistinguishable
+    // from the local's signature alone.
+    if !body.locals.iter().all(integer_shaped) {
+        return false;
+    }
+    let Ok(instructions) = rustclr_core::opcode::decode_all(&body.il) else { return false };
+    instructions
+        .iter()
+        .all(|i| is_supported(i.op) || (arrays && is_array_op(i.op)))
+}
+
 pub fn shape_is_compilable(
     registry: &rustclr_core::TypeRegistry,
     method: rustclr_core::MethodId,
@@ -266,14 +364,21 @@ pub fn shape_might_compile_after_inlining(
     if !integer_shaped(&info.signature.return_type) && !info.returns_void() {
         return false;
     }
-    if !info.signature.params.iter().all(integer_shaped) {
+    if !info
+        .signature
+        .params
+        .iter()
+        .all(|p| integer_shaped(p) || is_int_array(p))
+    {
         return false;
     }
     if !body.locals.iter().all(integer_shaped) {
         return false;
     }
     let Ok(instructions) = rustclr_core::opcode::decode_all(&body.il) else { return false };
-    instructions.iter().all(|i| is_supported(i.op) || i.op == Op::Call)
+    instructions
+        .iter()
+        .all(|i| is_supported(i.op) || is_array_op(i.op) || i.op == Op::Call)
 }
 
 /// The shape check, judged against an already-rewritten instruction stream.
@@ -286,6 +391,7 @@ pub fn shape_is_compilable_after_inlining(
     registry: &rustclr_core::TypeRegistry,
     method: rustclr_core::MethodId,
     instructions: &[Instruction],
+    arrays: bool,
 ) -> bool {
     let info = registry.method(method);
     let rustclr_core::MethodKind::Il(body) = &info.kind else { return false };
@@ -295,13 +401,18 @@ pub fn shape_is_compilable_after_inlining(
     if !integer_shaped(&info.signature.return_type) && !info.returns_void() {
         return false;
     }
-    if !info.signature.params.iter().all(integer_shaped) {
+    let param_ok = |p: &rustclr_metadata::TypeSig| {
+        integer_shaped(p) || (arrays && is_int_array(p))
+    };
+    if !info.signature.params.iter().all(param_ok) {
         return false;
     }
     if !body.locals.iter().all(integer_shaped) {
         return false;
     }
-    instructions.iter().all(|i| is_supported(i.op))
+    instructions
+        .iter()
+        .all(|i| is_supported(i.op) || (arrays && is_array_op(i.op)))
 }
 
 /// Reads evaluation-stack slot `depth` into `dst`.
@@ -367,6 +478,7 @@ fn one<B: Backend>(
 
     let t0 = b.temp(0);
     let t1 = b.temp(1);
+    let t2 = b.temp(2);
 
     match ins.op {
         Nop => {}
@@ -531,6 +643,32 @@ fn one<B: Backend>(
             read_slot(b, t0, depth - 2);
             read_slot(b, t1, depth - 1);
             b.branch_compare(cond, t0, t1, target);
+        }
+
+        // -- arrays ---------------------------------------------------
+        //
+        // The array operand is always an argument here, because
+        // `shape_is_compilable_with` only admits arrays that arrive as
+        // parameters. That is what lets the descriptor live in an argument
+        // slot and the index arithmetic stay in registers.
+        Ldlen => {
+            read_slot(b, t0, depth - 1);
+            b.array_length(t0, t0);
+            write_slot(b, depth - 1, t0);
+        }
+
+        LdelemI4 => {
+            read_slot(b, t0, depth - 2);
+            read_slot(b, t1, depth - 1);
+            b.array_load_i32(t0, t0, t1);
+            write_slot(b, depth - 2, t0);
+        }
+
+        StelemI4 => {
+            read_slot(b, t0, depth - 3);
+            read_slot(b, t1, depth - 2);
+            read_slot(b, t2, depth - 1);
+            b.array_store_i32(t0, t1, t2);
         }
 
         Ret => {

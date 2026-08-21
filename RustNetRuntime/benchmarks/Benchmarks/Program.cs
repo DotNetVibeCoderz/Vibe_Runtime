@@ -32,8 +32,9 @@ public static class Program
             case "fields": return Report("fields", FieldAccess(3000000 * scale));
             case "kernels": return Report("kernels", Kernels(60000 * scale));
             case "inlined": return Report("inlined", Inlined(400000 * scale));
+            case "arrays": return Report("arrays", Arrays(3000 * scale));
             default:
-                Console.WriteLine("workloads: noop fib sieve strings matrix sort alloc virtual exceptions fields kernels inlined");
+                Console.WriteLine("workloads: noop fib sieve strings matrix sort alloc virtual exceptions fields kernels inlined arrays");
                 return 2;
         }
     }
@@ -66,6 +67,55 @@ public static class Program
             total += Gcd(i, 360);
         }
         return total;
+    }
+
+    // ── Arrays through a compiled method ────────────────────────────────────
+    //
+    // The array is *allocated by the caller and passed in*, which is the shape
+    // the backend takes: an array that arrives as a parameter can be handed to
+    // compiled code as a data pointer and a length, because nothing inside the
+    // method allocates and so no collection can move or free it.
+    //
+    // `sieve` and `sort` above allocate their arrays as locals and are declined
+    // for exactly that reason. Both shapes are worth having in the suite: this
+    // one measures what the backend does with arrays, and those measure how
+    // often a real program hands it something it cannot take.
+    private static long Arrays(int rounds)
+    {
+        int[] data = new int[4096];
+        long total = 0;
+        for (int round = 0; round < rounds; round++)
+        {
+            Fill(data, round);
+            total += Sum(data);
+            total += MaxOf(data);
+        }
+        return total;
+    }
+
+    // Deliberately all 32-bit: a `long` here would emit `conv.u8`, which the
+    // backend does not take, and the method would be interpreted while the two
+    // beside it compiled — measuring the wrong thing.
+    private static void Fill(int[] a, int seed)
+    {
+        for (int i = 0; i < a.Length; i++)
+        {
+            a[i] = ((i * 31) ^ seed) & 0xFFFF;
+        }
+    }
+
+    private static long Sum(int[] a)
+    {
+        long total = 0;
+        for (int i = 0; i < a.Length; i++) total += a[i];
+        return total;
+    }
+
+    private static long MaxOf(int[] a)
+    {
+        int best = a[0];
+        for (int i = 1; i < a.Length; i++) { if (a[i] > best) best = a[i]; }
+        return best;
     }
 
     // ── Inlinable calls ─────────────────────────────────────────────────────

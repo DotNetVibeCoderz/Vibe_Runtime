@@ -45,11 +45,18 @@ static HELLO_WORLD: &[u8] = include_bytes!(env!("RUSTCLR_APP_PATH"));
 // one. This macro emits it.
 esp_bootloader_esp_idf::esp_app_desc!();
 
-/// The board this firmware was built for, for the banner.
+/// The chip this firmware was built for, for the banner.
+///
+/// The *chip*, not the board. A firmware knows which part it was compiled for
+/// and has no way to tell which board that part is soldered to — this said
+/// "ESP32-WROOM-32" until it was run on an M5Stack Tough, which is a different
+/// board carrying the same ESP32. Naming what is actually known keeps the
+/// report from asserting something it cannot check; which board a capture came
+/// from belongs in the log's header, where a person writes it.
 #[cfg(feature = "esp32")]
-const BOARD: &str = "ESP32-WROOM-32 (Xtensa LX6)";
+const BOARD: &str = "ESP32 (Xtensa LX6)";
 #[cfg(feature = "esp32c3")]
-const BOARD: &str = "ESP32-C3 (RISC-V)";
+const BOARD: &str = "ESP32-C3 (RISC-V 32)";
 
 /// How much RAM the allocator gets, and where it comes from.
 ///
@@ -62,7 +69,7 @@ const BOARD: &str = "ESP32-C3 (RISC-V)";
 /// | --- | ---: |
 /// | loader, 202 pre-registered framework types | 127 K |
 /// | managed heap, 512 slots at 41 bytes | 21 K |
-/// | RustBCL, 821 native bindings | 106 K |
+/// | RustBCL, 826 native bindings | 106 K |
 /// | loading and running `HelloWorld` | 6 K |
 /// | **peak** | **260,702** |
 ///

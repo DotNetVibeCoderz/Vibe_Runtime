@@ -44,7 +44,7 @@ use rustclr_metadata::{Image, TableId};
 /// | --- | ---: |
 /// | loader, 202 pre-registered framework types | 127 K |
 /// | managed heap slot table | 21 K |
-/// | RustBCL, 821 native bindings | 106 K |
+/// | RustBCL, 826 native bindings | 106 K |
 /// | loading and running `HelloWorld` | 6 K |
 /// | **peak** | **260,702** |
 pub const FULL_BCL_BYTES: usize = 260_702;
@@ -52,7 +52,7 @@ pub const FULL_BCL_BYTES: usize = 260_702;
 /// Peak allocation with only the bindings a console program needs.
 ///
 /// `System.Object`, `Console`, `String`, `Math` and interpolated strings — 300
-/// bindings instead of 821. No LINQ, no collections, no reflection, no tasks.
+/// bindings instead of 826. No LINQ, no collections, no reflection, no tasks.
 /// That is 68 KB less, which is the difference between running and not running
 /// on a board with 256 KB of usable RAM.
 pub const MINIMAL_BCL_BYTES: usize = 192_045;
@@ -101,7 +101,7 @@ impl Tier {
 ///
 /// Measured rather than guessed: a slot costs 41 bytes, so 512 slots is 21 KB.
 /// The rest of the budget is the runtime itself — 127 KB for the loader's 202
-/// pre-registered framework types, and 106 KB for RustBCL's 821 native
+/// pre-registered framework types, and 106 KB for RustBCL's 826 native
 /// bindings. `HelloWorld` uses exactly one slot; the other 511 are headroom.
 pub const EXEC_SLOTS: usize = 512;
 
@@ -264,7 +264,7 @@ fn execute_assembly<W: Write>(out: &mut W, assembly: &[u8], heap_bytes: usize) {
     let mut interp = Interpreter::with_host(Box::new(CaptureHost::new()));
     // A hard ceiling here too: the interpreter allocates every string and boxed
     // value the program makes, and it must not be able to take the whole chip.
-    interp.heap = Heap::embedded(EXEC_SLOTS);
+    interp.heap = Heap::embedded(EXEC_SLOTS).into();
     match tier {
         Tier::Full => rustclr_bcl::install(&mut interp),
         // Pay for what you use. `install_minimal` is the same subset

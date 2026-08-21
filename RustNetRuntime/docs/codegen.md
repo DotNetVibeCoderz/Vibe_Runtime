@@ -268,7 +268,7 @@ dotnet bin/Release/net10.0/CodeGen.dll --verify-templates [id] [--keep]
 
 It scaffolds each template, builds it, runs it on .NET and on RustCLR, and
 compares the output byte for byte. Templates written for a board run against
-`--bcl minimal`, because passing with all 821 bindings says nothing about
+`--bcl minimal`, because passing with all 836 bindings says nothing about
 whether a 192 KB board could run them.
 
 Web, desktop and mobile templates are built but not run — they need a host — and

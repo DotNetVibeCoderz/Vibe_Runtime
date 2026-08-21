@@ -6,5 +6,8 @@
     <Nullable>disable</Nullable>
     <LangVersion>latest</LangVersion>
     <InvariantGlobalization>true</InvariantGlobalization>
+      <!-- `calli` is only reachable from C# through a function pointer, which
+         needs `unsafe`. Nothing else in the fixture uses it. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 </Project>

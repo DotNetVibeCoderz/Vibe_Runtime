@@ -98,6 +98,10 @@ pub fn display(interp: &mut Interpreter, v: &Value) -> String {
         Value::NativeInt(i) => i.to_string(),
         Value::F(f) => format_double(*f),
         Value::FnPtr(_) => "System.IntPtr".into(),
+        // .NET renders a pointer as its address. There is no address here, so
+        // the offset stands in: it is what distinguishes two pointers into the
+        // same buffer, which is the only comparison a program can make.
+        Value::Ptr(p) => p.offset.to_string(),
         Value::Ref(r) => match interp.load_indirect_public(r.clone()) {
             Ok(inner) => display(interp, &inner),
             Err(_) => String::new(),
@@ -115,21 +119,24 @@ fn display_handle(interp: &mut Interpreter, h: Handle) -> String {
         return s;
     }
     // A boxed primitive prints as its payload.
-    if let Some(b) = interp.heap.get_as::<ClrBox>(h) {
-        let inner = b.value.clone();
-        let type_id = b.type_id;
+    // Each of these copies what it needs out before consulting the loader, so
+    // no borrow into the heap is live across another call.
+    if let Some((inner, type_id)) =
+        interp.heap.with::<ClrBox, _>(h, |b| (b.value.clone(), b.type_id))
+    {
         if interp.loader.registry.ty(type_id).kind == TypeKind::Enum {
             return inner.as_i64().unwrap_or(0).to_string();
         }
         return display(interp, &inner);
     }
-    if let Some(e) = interp.heap.get_as::<ClrException>(h) {
-        let name = interp.loader.registry.ty(e.type_id).full_name();
-        let message = e.message.clone();
+    if let Some((type_id, message)) =
+        interp.heap.with::<ClrException, _>(h, |e| (e.type_id, e.message.clone()))
+    {
+        let name = interp.loader.registry.ty(type_id).full_name();
         return if message.is_empty() { name } else { format!("{name}: {message}") };
     }
-    if let Some(a) = interp.heap.get_as::<ClrArray>(h) {
-        let element = interp.loader.registry.ty(a.element_type).full_name();
+    if let Some(element_type) = interp.heap.with::<ClrArray, _>(h, |a| a.element_type) {
+        let element = interp.loader.registry.ty(element_type).full_name();
         return format!("{element}[]");
     }
 
@@ -241,11 +248,11 @@ pub fn char_array(interp: &mut Interpreter, s: &str) -> Handle {
     let char_type = interp.loader.primitive_type(Primitive::Char);
     let units: Vec<u16> = s.encode_utf16().collect();
     let array = interp.alloc_array(char_type, units.len());
-    if let Some(a) = interp.heap.get_as_mut::<ClrArray>(array) {
+    interp.heap.with_mut::<ClrArray, _>(array, |a| {
         for (i, u) in units.iter().enumerate() {
             a.storage.set(i, &Value::I32(*u as i32));
         }
-    }
+    });
     array
 }
 
@@ -255,19 +262,19 @@ pub fn string_array(interp: &mut Interpreter, items: &[String]) -> Handle {
     let array = interp.alloc_array(string_type, items.len());
     for (i, s) in items.iter().enumerate() {
         let h = interp.alloc_string(s);
-        if let Some(a) = interp.heap.get_as_mut::<ClrArray>(array) {
+        interp.heap.with_mut::<ClrArray, _>(array, |a| {
             a.storage.set(i, &Value::Obj(h));
-        }
+        });
     }
     array
 }
 
 /// Reads a managed array into a vector of values.
 pub fn array_values(interp: &Interpreter, h: Handle) -> Vec<Value> {
-    match interp.heap.get_as::<ClrArray>(h) {
-        Some(a) => (0..a.len()).filter_map(|i| a.storage.get(i)).collect(),
-        None => Vec::new(),
-    }
+    interp
+        .heap
+        .with::<ClrArray, _>(h, |a| (0..a.len()).filter_map(|i| a.storage.get(i)).collect())
+        .unwrap_or_default()
 }
 
 /// Throws `ArgumentOutOfRangeException`.
@@ -289,18 +296,14 @@ pub fn bad_format(what: &str) -> ExecutionError {
 /// Reads the field values of a plain managed object, for diagnostics.
 pub fn object_fields(interp: &Interpreter, h: Handle) -> Vec<Value> {
     interp
-        .heap
-        .get_as::<ClrObject>(h)
-        .map(|o| o.fields.clone())
+        .heap.with::<ClrObject, _>(h, |o| o.fields.clone())
         .unwrap_or_default()
 }
 
 /// Reads a managed string handle, or the empty string when it is not one.
 pub fn read_string(interp: &Interpreter, h: Handle) -> String {
     interp
-        .heap
-        .get_as::<ClrString>(h)
-        .map(|s| s.to_rust_string())
+        .heap.with::<ClrString, _>(h, |s| s.to_rust_string())
         .unwrap_or_default()
 }
 

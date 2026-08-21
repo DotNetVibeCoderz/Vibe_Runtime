@@ -84,6 +84,23 @@ pub enum ArrayStorage {
 }
 
 impl ArrayStorage {
+    /// Bytes per element, as the CLR lays the array out.
+    ///
+    /// This is what turns a raw pointer's byte offset back into an index:
+    /// `fixed (int* p = values)` gives a pointer into `values`, `p + 1` moves
+    /// it four bytes, and reading through it has to land on element one.
+    /// `None` for storage whose elements are not a fixed width of bytes —
+    /// references and boxed values — where byte addressing has no meaning.
+    pub fn element_width(&self) -> Option<usize> {
+        Some(match self {
+            ArrayStorage::Bool(_) | ArrayStorage::I8(_) | ArrayStorage::U8(_) => 1,
+            ArrayStorage::I16(_) | ArrayStorage::U16(_) | ArrayStorage::Char(_) => 2,
+            ArrayStorage::I32(_) | ArrayStorage::U32(_) | ArrayStorage::F32(_) => 4,
+            ArrayStorage::I64(_) | ArrayStorage::U64(_) | ArrayStorage::F64(_) => 8,
+            ArrayStorage::Refs(_) | ArrayStorage::Values(_) => return None,
+        })
+    }
+
     /// Allocates zero-initialised storage of `len` elements.
     pub fn zeroed(primitive: Option<Primitive>, is_reference: bool, len: usize) -> Self {
         match primitive {

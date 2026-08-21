@@ -79,6 +79,10 @@ pub mod error;
 pub mod host;
 pub mod interp;
 pub mod loader;
+pub mod monitor;
+#[cfg(feature = "std")]
+pub mod pool;
+pub mod statics;
 pub mod naming;
 pub mod objects;
 pub mod opcode;
@@ -103,7 +107,7 @@ pub use types::{
     AssemblyId, CctorState, FieldId, FieldInfo, IlBody, MethodId, MethodInfo, MethodKind, Primitive,
     PropertyId, PropertyInfo, RuntimeType, TypeId, TypeKind, TypeRegistry,
 };
-pub use value::{ByRef, StructValue, Value};
+pub use value::{ByRef, StructValue, Value, RawPtr};
 
 pub use rustclr_gc as gc;
 pub use rustclr_metadata as metadata;
