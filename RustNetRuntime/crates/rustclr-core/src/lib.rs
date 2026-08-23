@@ -75,6 +75,7 @@ pub(crate) mod prelude {
 #[allow(unused_imports)]
 use crate::prelude::*;
 
+pub mod debug;
 pub mod error;
 pub mod host;
 pub mod interp;

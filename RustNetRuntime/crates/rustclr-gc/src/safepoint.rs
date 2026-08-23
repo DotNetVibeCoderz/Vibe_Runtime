@@ -51,6 +51,8 @@
 //! the shim compiles away.
 
 #[cfg(feature = "std")]
+use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "std")]
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::handle::Handle;
@@ -111,6 +113,22 @@ pub struct Mutators {
 
 #[derive(Default)]
 struct Inner {
+    /// `stopping`, mirrored where it can be read without taking the lock.
+    ///
+    /// [`Mutators::stopping`] reads the authoritative copy inside `State`, and
+    /// a mutex is fine for the handful of places the interpreter polls. It is
+    /// not fine for *compiled* code, which polls on every iteration of every
+    /// loop: taking a lock there would cost more than the collection it is
+    /// looking for. So the flag is mirrored into a word that a single `mov`
+    /// can read, and [`Mutators::stopping_flag`] hands out its address.
+    ///
+    /// The mirror is written under the lock, always alongside the field it
+    /// mirrors, so the two cannot disagree about anything except for the
+    /// instant between a relaxed store and another core observing it. That
+    /// window is harmless in both directions: a mutator that reads a stale
+    /// `false` polls again on its next back-edge, and one that reads a stale
+    /// `true` takes the slow path and finds nothing to do.
+    stopping_flag: AtomicUsize,
     state: Mutex<State>,
     /// Signalled when a mutator parks, so a waiting collector can re-check.
     parked: Condvar,
@@ -145,6 +163,18 @@ impl Mutators {
     /// is no.
     pub fn stopping(&self) -> bool {
         self.inner.state.lock().map(|s| s.stopping).unwrap_or(false)
+    }
+
+    /// The address of the lock-free mirror of `stopping`.
+    ///
+    /// Non-zero means a collection has been requested. Compiled code reads
+    /// this word directly at each loop back-edge; see [`Inner::stopping_flag`]
+    /// for why the mirror exists and why a stale read is harmless.
+    ///
+    /// The pointer is valid for as long as this registry lives, and every
+    /// clone of `Mutators` names the same one.
+    pub fn stopping_flag(&self) -> *const usize {
+        self.inner.stopping_flag.as_ptr() as *const usize
     }
 
     /// A safe point.
@@ -217,6 +247,7 @@ impl Mutators {
         }
 
         state.stopping = true;
+        self.inner.stopping_flag.store(1, Ordering::Relaxed);
         state.roots.clear();
         state.roots.extend(own_roots);
         // A thread away in a blocking call cannot hand its roots over now, so
@@ -237,6 +268,7 @@ impl Mutators {
         let result = collect(&all);
 
         state.stopping = false;
+        self.inner.stopping_flag.store(0, Ordering::Relaxed);
         state.epoch = state.epoch.wrapping_add(1);
         self.inner.resumed.notify_all();
         result
@@ -552,10 +584,19 @@ impl RootSet for AllRoots {
 /// The single-threaded shim. Every method is a no-op or a direct call.
 #[cfg(not(feature = "std"))]
 #[derive(Clone, Default)]
-pub struct Mutators;
+pub struct Mutators {
+    /// Always zero. Present so compiled code has an address to read on every
+    /// target, rather than a `cfg` at the one place that reads it.
+    stopping_flag: usize,
+}
 
 #[cfg(not(feature = "std"))]
 impl Mutators {
+    /// One thread, so a collection is never *requested* — it just happens.
+    pub fn stopping_flag(&self) -> *const usize {
+        &self.stopping_flag
+    }
+
     pub fn register(&self) -> Registration {
         Registration
     }

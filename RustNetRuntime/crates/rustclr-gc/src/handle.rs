@@ -16,7 +16,20 @@ use core::num::NonZeroU32;
 ///
 /// Layout is a packed `u64`: 32 bits of slot index and 32 bits of generation.
 /// `Handle::NULL` is the all-zero value, so `Default` gives null for free.
+///
+/// `repr(transparent)` is load-bearing, not decoration. Compiled code holds
+/// handles — in a register, in an array descriptor — and reads them back as
+/// 64-bit integers, so this type's representation is part of the code
+/// generator's ABI. `transparent` is the language's own promise that a
+/// single-field wrapper *is* its field, which is why a handle can cross that
+/// boundary when a [`Value`](../../rustclr_core/enum.Value.html) cannot: a
+/// handle is one `u64` with no discriminant and no payload to reorder.
+///
+/// It stays safe as well as stable because a handle is an opaque token rather
+/// than an address. Compiled code cannot dereference one, so the worst a wrong
+/// value can do is fail a generation check and be reported.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[repr(transparent)]
 pub struct Handle(u64);
 
 impl Handle {

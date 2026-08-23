@@ -94,6 +94,22 @@ pub trait Backend {
     fn load_frame(&mut self, dst: u8, offset: i32);
     fn store_frame(&mut self, offset: i32, src: u8);
     /// Read argument `index` from the incoming array.
+    /// Reads local `index` into `dst`.
+    ///
+    /// Index-based rather than offset-based so a backend can answer from a
+    /// register instead of the frame. The default is the frame, which is what
+    /// every backend did before any of them kept a local anywhere else.
+    fn load_local(&mut self, dst: u8, index: usize) {
+        let off = self.local_offset(index);
+        self.load_frame(dst, off);
+    }
+
+    /// Writes `src` into local `index`.
+    fn store_local(&mut self, index: usize, src: u8) {
+        let off = self.local_offset(index);
+        self.store_frame(off, src);
+    }
+
     fn load_arg(&mut self, dst: u8, index: usize);
     /// Write argument `index` back to the incoming array, for `starg`.
     fn store_arg(&mut self, index: usize, src: u8);
@@ -244,6 +260,31 @@ pub trait Backend {
         unreachable!("this backend declines array access");
     }
 
+    /// `dst = receiver.field[slot]`, converted according to `kind`.
+    ///
+    /// A call rather than a load: the heap's value representation is not part
+    /// of this backend's ABI, and it is not going to become one.
+    fn field_load(&mut self, dst: u8, receiver: u8, slot: usize, kind: i64) {
+        let _ = (dst, receiver, slot, kind);
+        unreachable!("this backend declines field access");
+    }
+
+    /// `receiver.field[slot] = value`, converted according to `kind`.
+    fn field_store(&mut self, receiver: u8, slot: usize, kind: i64, value: u8) {
+        let _ = (receiver, slot, kind, value);
+        unreachable!("this backend declines field access");
+    }
+
+    /// Polls for a requested collection, parking if one is under way.
+    ///
+    /// Only emitted at a loop back-edge, where the evaluation stack is empty,
+    /// so the frame's roots are exactly its reference-typed locals and
+    /// arguments — slots whose offsets the compiler knows from declared types
+    /// alone, with no inference over the stream.
+    fn safepoint(&mut self) {
+        unreachable!("this backend declines methods that need a safe point");
+    }
+
     /// Whether this backend can call itself recursively.
     fn supports_self_calls(&self) -> bool {
         false
@@ -252,6 +293,14 @@ pub trait Backend {
     /// Writes outgoing argument `index` for a self-call.
     fn outgoing_arg(&mut self, _index: usize, _src: u8) {
         unreachable!("this backend declines calls");
+    }
+
+    /// Calls table entry `index`, leaving any result in `dst`.
+    ///
+    /// `arg_count` is the callee's, which is what the outgoing frame's trap and
+    /// context slots sit past — they are at a different place for every callee.
+    fn call_other(&mut self, _dst: u8, _index: usize, _arg_count: usize) {
+        unreachable!("this backend declines calls to other methods");
     }
 
     /// Calls the method being compiled, recursively, leaving any result in
@@ -275,6 +324,45 @@ pub trait Backend {
     fn alloc_array(&mut self, _dst: u8, _kind: i64, _length: u8) {
         unreachable!("this backend declines allocation");
     }
+
+    /// `dst = descriptor.data[index]` for a reference array — one handle.
+    ///
+    /// A handle is eight bytes and `repr(transparent)` over `u64`, so this is
+    /// the same load `array_load_f64` performs. It is named separately anyway,
+    /// so a backend cannot start treating a reference as a number by accident.
+    fn array_load_ref(&mut self, dst: u8, descriptor: u8, index: u8) {
+        let _ = (dst, descriptor, index);
+        unreachable!("this backend declines reference arrays");
+    }
+
+    /// `descriptor.data[index] = value`, storing a handle.
+    fn array_store_ref(&mut self, descriptor: u8, index: u8, value: u8) {
+        let _ = (descriptor, index, value);
+        unreachable!("this backend declines reference arrays");
+    }
+
+    /// Allocates one instance of the class the compiler numbered `shape`,
+    /// leaving its handle in `dst`; takes the trap path when the heap cannot
+    /// satisfy it.
+    ///
+    /// The constructor is not run — only classes whose constructor does
+    /// nothing but chain to `System.Object`'s reach here.
+    fn alloc_object(&mut self, _dst: u8, _shape: i64) {
+        unreachable!("this backend declines allocation");
+    }
+
+    /// Guarded devirtualisation: `dst` becomes the value the override for the
+    /// receiver's runtime type returns.
+    ///
+    /// `candidates` pairs a type's registry index with the constant its
+    /// override produces. The list is exhaustive by class-hierarchy analysis —
+    /// the compiler only emits this when no assembly can introduce another
+    /// subtype — so the fall-through is an assertion rather than a fallback.
+    /// It has to be: there is no on-stack replacement here, and a compiled body
+    /// that has already allocated has no sound way back to the interpreter.
+    fn devirt_dispatch(&mut self, _dst: u8, _receiver: u8, _candidates: &[(i64, i64)]) {
+        unreachable!("this backend declines virtual calls");
+    }
 }
 
 /// Whether an opcode the walk understands is one this crate emits code for.
@@ -290,6 +378,78 @@ pub fn is_array_op(op: Op) -> bool {
             | Op::LdelemU1
             | Op::StelemI1
             | Op::Newarr
+            | Op::LdelemRef
+            | Op::StelemRef
+    )
+}
+
+/// Opcodes that only compile when the backend can create and dispatch on
+/// objects.
+///
+/// Separate from [`is_array_op`] because they carry a heavier obligation: a
+/// `newobj` here runs no constructor, and a `callvirt` is only emitted when
+/// every answer it can give is already known.
+pub fn is_object_op(op: Op) -> bool {
+    matches!(op, Op::Newobj | Op::Callvirt | Op::Ldfld | Op::Stfld | Op::Ldnull)
+}
+
+/// Slot and conversion kind for every `ldfld` and `stfld` in a body.
+///
+/// `None` when one of them names a field this backend cannot carry — a struct
+/// field, or one whose declaring type it cannot lay out. Static fields are
+/// excluded too: they live in the loader's static storage rather than in an
+/// object, and reach compiled code by a different route or not at all.
+pub fn field_accesses(
+    loader: &rustclr_core::Loader,
+    assembly: rustclr_core::AssemblyId,
+    instructions: &[Instruction],
+) -> Option<BTreeMap<u32, (usize, i64)>> {
+    let mut out = BTreeMap::new();
+    for ins in instructions {
+        if !matches!(ins.op, Op::Ldfld | Op::Stfld) {
+            continue;
+        }
+        let token = ins.operand.as_token()?;
+        let field = loader.resolve_field_token(loader.assembly(assembly), token)?;
+        let info = loader.registry.field(field);
+        if info.is_static {
+            return None;
+        }
+        let kind = field_kind(&info.signature)?;
+        out.insert(ins.offset, (loader.instance_field_slot(field)?, kind));
+    }
+    Some(out)
+}
+
+/// How a field's declared type crosses into a register.
+fn field_kind(sig: &rustclr_metadata::TypeSig) -> Option<i64> {
+    use rustclr_metadata::TypeSig as T;
+    Some(match sig.unwrap_modifiers() {
+        T::Boolean | T::Char | T::I1 | T::U1 | T::I2 | T::U2 | T::I4 | T::U4 => {
+            crate::alloc::FIELD_I4
+        }
+        T::I8 | T::U8 => crate::alloc::FIELD_I8,
+        T::R8 | T::R4 => crate::alloc::FIELD_R8,
+        T::Class(_) | T::Object => crate::alloc::FIELD_REF,
+        // A struct field is stored as a `Value::Struct`, which is not one
+        // word and has no register representation here.
+        _ => return None,
+    })
+}
+
+/// Whether a signature is an array of references.
+///
+/// Its elements are handles, which compiled code holds as opaque 64-bit tokens
+/// — it can neither dereference one nor learn anything from it without asking
+/// a helper.
+pub fn is_ref_array(sig: &rustclr_metadata::TypeSig) -> bool {
+    matches!(
+        sig.unwrap_modifiers(),
+        rustclr_metadata::TypeSig::SzArray(inner)
+            if matches!(
+                inner.unwrap_modifiers(),
+                rustclr_metadata::TypeSig::Class(_) | rustclr_metadata::TypeSig::Object
+            )
     )
 }
 
@@ -390,6 +550,76 @@ fn integer_shaped(sig: &rustclr_metadata::TypeSig) -> bool {
         sig.unwrap_modifiers(),
         T::Boolean | T::Char | T::I1 | T::U1 | T::I2 | T::U2 | T::I4 | T::U4 | T::I8 | T::U8
     )
+}
+
+/// Whether scalar replacement could plausibly rescue this method.
+///
+/// The cheap screen, on declared types alone: a body that creates an object and
+/// keeps it in a class-typed local *might* be one where that object never
+/// escapes, and `escape::scalarise` asks the real question once it can see the
+/// rewritten body.
+///
+/// Screening on the declared locals instead would reject every such method
+/// before the analysis ever ran — which is precisely what happened to floats,
+/// and left a differential test comparing the interpreter with itself.
+pub fn scalarisation_possible(
+    registry: &rustclr_core::TypeRegistry,
+    method: rustclr_core::MethodId,
+) -> bool {
+    let info = registry.method(method);
+    let rustclr_core::MethodKind::Il(body) = &info.kind else { return false };
+    if !body.exception_clauses.is_empty() || info.signature.has_this {
+        return false;
+    }
+    if !integer_shaped(&info.signature.return_type) && !info.returns_void() {
+        return false;
+    }
+    if !info.signature.params.iter().all(|p| integer_shaped(p) || is_int_array(p)) {
+        return false;
+    }
+    // Every local is either something the backend already takes, or a class
+    // reference that scalar replacement might retire. Anything else — a
+    // struct, a byref, a pointer — is beyond this pass.
+    let plausible = |t: &rustclr_metadata::TypeSig| {
+        integer_shaped(t)
+            || crate::floats::is_float_sig(t)
+            || is_int_array(t)
+            || is_double_array(t)
+            || is_bool_array(t)
+            || matches!(t.unwrap_modifiers(), rustclr_metadata::TypeSig::Class(_))
+    };
+    if !body.locals.iter().all(plausible) {
+        return false;
+    }
+    // No object to retire means nothing for the pass to do.
+    matches!(rustclr_core::opcode::decode_all(&body.il),
+        Ok(instructions) if instructions.iter().any(|i| i.op == Op::Newobj))
+}
+
+/// Whether a slot of this type holds a *handle* at run time.
+///
+/// The distinction that matters for a safe point. A class-typed slot holds a
+/// handle, which the collector must be told about or it will reclaim the
+/// object. An array-typed slot holds a **descriptor address** — compiled code
+/// receives arrays as a data pointer and a length, not as a handle — so it is
+/// not a root, and the array behind it is kept alive by a pin taken for the
+/// duration of the call instead. Reading a descriptor address as a handle
+/// would hand the collector a garbage slot index.
+pub fn is_reference_sig(sig: &rustclr_metadata::TypeSig) -> bool {
+    matches!(
+        sig.unwrap_modifiers(),
+        rustclr_metadata::TypeSig::Class(_) | rustclr_metadata::TypeSig::Object
+    )
+}
+
+/// Whether a signature is a scalar the backend keeps in a register.
+///
+/// The union of the two kinds it can hold: an integer widened to 64 bits, or a
+/// double as its bit pattern. A reference, a struct or an array is none of
+/// these, which is what makes this the test for whether a field can become a
+/// local.
+pub fn is_scalar_sig(sig: &rustclr_metadata::TypeSig) -> bool {
+    integer_shaped(sig) || crate::floats::is_float_sig(sig)
 }
 
 /// Whether a method is the shape every baseline backend accepts.
@@ -520,7 +750,7 @@ pub fn shape_might_compile_after_inlining(
     // see the rewritten body; this only has to avoid rejecting something that
     // would have compiled.
     let slot_ok = |p: &rustclr_metadata::TypeSig| {
-        integer_shaped(p) || is_int_array(p) || is_bool_array(p)
+        integer_shaped(p) || is_int_array(p) || is_bool_array(p) || is_ref_array(p) || is_reference_sig(p)
     };
     if !info.signature.params.iter().all(slot_ok) {
         return false;
@@ -531,7 +761,7 @@ pub fn shape_might_compile_after_inlining(
     let Ok(instructions) = rustclr_core::opcode::decode_all(&body.il) else { return false };
     instructions
         .iter()
-        .all(|i| is_supported(i.op) || is_array_op(i.op) || i.op == Op::Call)
+        .all(|i| is_supported(i.op) || is_array_op(i.op) || is_object_op(i.op) || i.op == Op::Call)
 }
 
 /// The shape check, judged against an already-rewritten instruction stream.
@@ -560,11 +790,74 @@ pub fn self_calls(
         let token = ins.operand.as_token()?;
         let target = loader.resolve_method_token(loader.assembly(assembly), token)?;
         if target != method {
-            return None;
+            continue;
         }
         offsets.insert(ins.offset);
     }
     Some(offsets)
+}
+
+/// Where each `call` to *another* method goes, and what it needs.
+///
+/// The address of a compiled method does not exist when its caller is emitted —
+/// it may not be compiled yet, and two methods may call each other — so the
+/// call is indirect through a table the tier fills in before the caller runs.
+/// This decides the table: one entry per distinct callee, and the index each
+/// call site loads.
+///
+/// `None` when a callee is one this backend would not compile. Whether it
+/// *will* be compiled is settled at run time; whether it *could* be has to be
+/// settled here, or the caller would be emitted around a call that can never
+/// be filled in.
+pub struct CallTargets {
+    /// Call site offset to (table index, the callee's argument count).
+    pub sites: BTreeMap<u32, (usize, usize)>,
+    /// The callees, in table order.
+    pub table: Vec<rustclr_core::MethodId>,
+    /// Arguments the widest callee takes, for sizing the outgoing frame.
+    pub widest: usize,
+}
+
+pub fn call_targets(
+    loader: &rustclr_core::Loader,
+    assembly: rustclr_core::AssemblyId,
+    method: rustclr_core::MethodId,
+    instructions: &[Instruction],
+    eligible: impl Fn(rustclr_core::MethodId) -> bool,
+) -> Option<CallTargets> {
+    let mut sites = BTreeMap::new();
+    let mut table: Vec<rustclr_core::MethodId> = Vec::new();
+    let mut widest = 0usize;
+    for ins in instructions {
+        if ins.op != Op::Call {
+            continue;
+        }
+        let token = ins.operand.as_token()?;
+        let target = loader.resolve_method_token(loader.assembly(assembly), token)?;
+        if target == method {
+            continue;
+        }
+        if !eligible(target) {
+            return None;
+        }
+        let info = loader.registry.method(target);
+        // An instance method has a receiver this convention does not carry, and
+        // a void one leaves nothing where the caller expects a result.
+        if info.signature.has_this {
+            return None;
+        }
+        let arg_count = info.arg_count();
+        widest = widest.max(arg_count);
+        let index = match table.iter().position(|m| *m == target) {
+            Some(i) => i,
+            None => {
+                table.push(target);
+                table.len() - 1
+            }
+        };
+        sites.insert(ins.offset, (index, arg_count));
+    }
+    Some(CallTargets { sites, table, widest })
 }
 
 /// The element kind each `newarr` allocates, when every one of them is
@@ -577,31 +870,118 @@ pub fn self_calls(
 ///   compiled code never collects — so a loop allocating would exhaust the
 ///   heap where the interpreter would not. A program that runs interpreted and
 ///   fails compiled is the one difference this runtime will not accept.
+/// `polls` says whether the body reaches a safe point at every loop back-edge.
+/// When it does, an allocation inside a loop is no longer unbounded: the
+/// collector can stop this method mid-body and reclaim what it has finished
+/// with, exactly as it can between two interpreted instructions. When it does
+/// not, the old rule stands and such a method is declined.
 pub fn newarr_kinds(
     loader: &rustclr_core::Loader,
     assembly: rustclr_core::AssemblyId,
     instructions: &[Instruction],
+    shapes: &mut ShapeTable,
+    polls: bool,
 ) -> Option<BTreeMap<u32, i64>> {
     let mut kinds = BTreeMap::new();
     for ins in instructions {
         if ins.op != Op::Newarr {
             continue;
         }
-        if inside_a_loop(instructions, ins.offset) {
+        if !polls && inside_a_loop(instructions, ins.offset) {
             return None;
         }
         let token = ins.operand.as_token()?;
         let element = loader.resolve_type_token(loader.assembly(assembly), token)?;
-        let primitive = loader.registry.ty(element).primitive?;
-        let kind = match primitive {
-            rustclr_core::Primitive::Int32 => crate::alloc::ELEMENT_I4,
-            rustclr_core::Primitive::Double => crate::alloc::ELEMENT_R8,
-            rustclr_core::Primitive::Boolean => crate::alloc::ELEMENT_U1,
-            _ => return None,
+        let kind = match loader.registry.ty(element).primitive {
+            Some(rustclr_core::Primitive::Int32) => crate::alloc::ELEMENT_I4,
+            Some(rustclr_core::Primitive::Double) => crate::alloc::ELEMENT_R8,
+            Some(rustclr_core::Primitive::Boolean) => crate::alloc::ELEMENT_U1,
+            Some(_) => return None,
+            // A reference array. Its elements are handles, and the shape table
+            // says which class — `ELEMENT_REF` plus that index.
+            None => {
+                let index = shapes.intern(loader, element)?;
+                crate::alloc::ELEMENT_REF + index
+            }
         };
         kinds.insert(ins.offset, kind);
     }
     Some(kinds)
+}
+
+/// Shape index for the `newobj` at each offset, when every one of them
+/// constructs a class this backend can allocate.
+///
+/// The constructor must do nothing but chain to `System.Object`'s — the same
+/// test scalar replacement applies, and for the same reason: the backend runs
+/// no constructor, so one that did work would silently not happen.
+pub fn newobj_shapes(
+    loader: &rustclr_core::Loader,
+    assembly: rustclr_core::AssemblyId,
+    instructions: &[Instruction],
+    shapes: &mut ShapeTable,
+    polls: bool,
+) -> Option<BTreeMap<u32, i64>> {
+    let mut out = BTreeMap::new();
+    for ins in instructions {
+        if ins.op != Op::Newobj {
+            continue;
+        }
+        // Allocation inside a loop was unbounded while nothing could collect
+        // during a compiled call. A body that polls at its back-edges can be
+        // stopped there, so the bound is the same one interpreted code has.
+        if !polls && inside_a_loop(instructions, ins.offset) {
+            return None;
+        }
+        let token = ins.operand.as_token()?;
+        let ctor = loader.resolve_method_token(loader.assembly(assembly), token)?;
+        if !crate::escape::constructor_does_nothing(loader, ctor) {
+            return None;
+        }
+        let declaring = loader.registry.method(ctor).declaring_type;
+        if loader.registry.ty(declaring).kind != rustclr_core::TypeKind::Class {
+            return None;
+        }
+        out.insert(ins.offset, shapes.intern(loader, declaring)?);
+    }
+    Some(out)
+}
+
+/// The classes one compiled body refers to, numbered as its code numbers them.
+///
+/// Interned rather than looked up globally, because the index is baked into the
+/// emitted instructions and means nothing outside that body.
+#[derive(Default)]
+pub struct ShapeTable {
+    pub entries: Vec<(rustclr_core::TypeId, usize, rustclr_core::TypeId)>,
+}
+
+impl ShapeTable {
+    /// The index for `ty`, adding it if this body has not named it yet.
+    fn intern(&mut self, loader: &rustclr_core::Loader, ty: rustclr_core::TypeId) -> Option<i64> {
+        if let Some(i) = self.entries.iter().position(|(t, _, _)| *t == ty) {
+            return Some(i as i64);
+        }
+        let info = loader.registry.ty(ty);
+        if info.kind != rustclr_core::TypeKind::Class {
+            return None;
+        }
+        // Every field the type *has*, not just the ones it declares. A
+        // subclass's instance is laid out base-first, so counting only the
+        // declaring type's own fields would allocate an object too small for
+        // the slots its own code addresses.
+        let field_count = loader.registry.base_chain(ty).map(|t| {
+            loader.registry.ty(t).instance_fields.len()
+        }).sum::<usize>();
+        // `find_sz_array` only knows constructions something has already named;
+        // `System.Array` stands in, as it does for the primitive element types.
+        let array = loader
+            .registry
+            .find_sz_array(ty)
+            .unwrap_or_else(|| loader.core().array);
+        self.entries.push((ty, field_count, array));
+        Some((self.entries.len() - 1) as i64)
+    }
 }
 
 /// Whether `offset` lies inside a loop body.
@@ -609,7 +989,7 @@ pub fn newarr_kinds(
 /// A backward branch at `b` to `t` means everything in `t..=b` runs repeatedly.
 /// Conservative in the safe direction: an offset it calls looped is declined,
 /// and declining compiles nothing rather than compiling something unbounded.
-fn inside_a_loop(instructions: &[Instruction], offset: u32) -> bool {
+pub(crate) fn inside_a_loop(instructions: &[Instruction], offset: u32) -> bool {
     instructions.iter().any(|ins| {
         match ins.operand.as_target() {
             Some(target) if target <= ins.offset => target <= offset && offset <= ins.offset,
@@ -642,7 +1022,7 @@ pub fn float_shape_possible(
         || info.signature.params.iter().any(is_double_array)
         || body.locals.iter().any(is_double_array);
     let slot_ok = |t: &rustclr_metadata::TypeSig| {
-        ok(t) || is_int_array(t) || is_double_array(t) || is_bool_array(t)
+        ok(t) || is_int_array(t) || is_double_array(t) || is_bool_array(t) || is_ref_array(t) || is_reference_sig(t)
     };
     any_float
         && (ok(&info.signature.return_type) || info.returns_void())
@@ -660,10 +1040,16 @@ pub fn float_shape_possible(
 /// [`crate::floats::infer`] does the deciding, and declines rather than guesses
 /// — an integer `add` emitted for a double gives a number, silently, and the
 /// wrong one.
+/// `locals` is the *effective* locals list, which is the declared one unless a
+/// pass rewrote the body. Scalar replacement appends a slot per replaced field
+/// and neutralises the object local it retired, and the inference below has to
+/// type the `ldloc`s it produced — so reading `body.locals` here instead would
+/// see a body that no longer exists.
 pub fn float_shape(
     registry: &rustclr_core::TypeRegistry,
     method: rustclr_core::MethodId,
     instructions: &[Instruction],
+    locals: &[rustclr_metadata::TypeSig],
 ) -> Option<crate::floats::FloatMap> {
     let info = registry.method(method);
     let rustclr_core::MethodKind::Il(body) = &info.kind else { return None };
@@ -681,12 +1067,12 @@ pub fn float_shape(
     // the backend could not emit, and the signature does not say which. Both
     // are descriptor addresses now, so the distinction stopped mattering.
     let slot_ok = |t: &rustclr_metadata::TypeSig| {
-        ok(t) || is_int_array(t) || is_double_array(t) || is_bool_array(t)
+        ok(t) || is_int_array(t) || is_double_array(t) || is_bool_array(t) || is_ref_array(t) || is_reference_sig(t)
     };
     if !ok(&info.signature.return_type) && !info.returns_void() {
         return None;
     }
-    if !info.signature.params.iter().all(slot_ok) || !body.locals.iter().all(slot_ok) {
+    if !info.signature.params.iter().all(slot_ok) || !locals.iter().all(slot_ok) {
         return None;
     }
 
@@ -694,7 +1080,7 @@ pub fn float_shape(
     let map = crate::floats::infer(
         instructions,
         &params,
-        &body.locals,
+        locals,
         &info.signature.return_type,
     )?;
     // No floats at all means the integer gate should have taken it, and this
@@ -702,11 +1088,14 @@ pub fn float_shape(
     map.any.then_some(map)
 }
 
+/// `locals` is the effective locals list; see [`float_shape`] for why the
+/// declared one is not enough once a pass has rewritten the body.
 pub fn shape_is_compilable_after_inlining(
     registry: &rustclr_core::TypeRegistry,
     method: rustclr_core::MethodId,
     instructions: &[Instruction],
     arrays: bool,
+    locals: &[rustclr_metadata::TypeSig],
 ) -> bool {
     let info = registry.method(method);
     let rustclr_core::MethodKind::Il(body) = &info.kind else { return false };
@@ -722,12 +1111,12 @@ pub fn shape_is_compilable_after_inlining(
     // backend could not emit, and the signature does not say which. Both are
     // descriptor addresses now, so the distinction stopped mattering.
     let slot_ok = |p: &rustclr_metadata::TypeSig| {
-        integer_shaped(p) || (arrays && (is_int_array(p) || is_bool_array(p)))
+        integer_shaped(p) || (arrays && (is_int_array(p) || is_bool_array(p) || is_ref_array(p) || is_reference_sig(p)))
     };
     if !info.signature.params.iter().all(slot_ok) {
         return false;
     }
-    if !body.locals.iter().all(slot_ok) {
+    if !locals.iter().all(slot_ok) {
         return false;
     }
     // `call` passes here and is checked properly in `compile`, which is the
@@ -735,7 +1124,7 @@ pub fn shape_is_compilable_after_inlining(
     // method itself. Anything else is declined there.
     instructions
         .iter()
-        .all(|i| is_supported(i.op) || (arrays && is_array_op(i.op)) || i.op == Op::Call)
+        .all(|i| is_supported(i.op) || (arrays && (is_array_op(i.op) || is_object_op(i.op))) || i.op == Op::Call)
 }
 
 /// Reads evaluation-stack slot `depth` into `dst`.
@@ -794,6 +1183,22 @@ pub struct Plan {
     pub arg_count: usize,
     /// Whether a self-call leaves a value on the stack.
     pub returns_value: bool,
+    /// Shape index for the `newobj` at each IL offset.
+    pub newobj_shapes: BTreeMap<u32, i64>,
+    /// Guarded dispatch cases for the `callvirt` at each IL offset.
+    pub devirt: BTreeMap<u32, crate::devirt::Cases>,
+    /// Slot and kind for the `ldfld`/`stfld` at each IL offset.
+    pub fields: BTreeMap<u32, (usize, i64)>,
+    /// Table index and argument count for each call to another method.
+    pub call_sites: BTreeMap<u32, (usize, usize)>,
+    /// Whether a call to another method leaves a value on the stack, by site.
+    pub call_returns: BTreeMap<u32, bool>,
+    /// IL offsets that begin a loop body and must poll for a collection.
+    ///
+    /// Empty when the method has no loop, which is most of them — a body that
+    /// runs a bounded number of instructions reaches its own return sooner than
+    /// any collection could need it to stop.
+    pub safepoints: BTreeSet<u32>,
 }
 
 /// [`translate`], told which instructions are floating-point.
@@ -818,6 +1223,13 @@ pub fn translate_with_plan<B: Backend>(
             return Err(CompileError::Unsupported(
                 "negative evaluation-stack depth".into(),
             ));
+        }
+        // A safe point, emitted *before* the instruction: this offset is the
+        // target of a backward branch, so every path arriving here is about to
+        // run a loop body again. Placing it here rather than at the branch
+        // means the poll sits where the evaluation stack is known empty.
+        if plan.safepoints.contains(&ins.offset) {
+            b.safepoint();
         }
         one(b, ins, depth as usize, returns_value, plan)?;
     }
@@ -875,8 +1287,7 @@ fn one<B: Backend>(
                 Ldloc3 => 3,
                 _ => ins.operand.as_var().unwrap_or(0) as usize,
             };
-            let off = b.local_offset(index);
-            b.load_frame(t0, off);
+            b.load_local(t0, index);
             write_slot(b, depth, t0);
         }
 
@@ -889,8 +1300,7 @@ fn one<B: Backend>(
                 _ => ins.operand.as_var().unwrap_or(0) as usize,
             };
             read_slot(b, t0, depth - 1);
-            let off = b.local_offset(index);
-            b.store_frame(off, t0);
+            b.store_local(index, t0);
         }
 
         LdcI4M1 | LdcI40 | LdcI41 | LdcI42 | LdcI43 | LdcI44 | LdcI45 | LdcI46 | LdcI47
@@ -991,6 +1401,27 @@ fn one<B: Backend>(
             write_slot(b, depth, t0);
         }
 
+        // A call to another compiled method. Indirect through a table the tier
+        // filled in, because the callee's address did not exist when this was
+        // emitted — it may not have been compiled yet, and two methods may call
+        // each other.
+        Call if plan.call_sites.contains_key(&ins.offset) => {
+            let (index, arg_count) = plan.call_sites[&ins.offset];
+            if depth < arg_count {
+                return Err(CompileError::Unsupported(
+                    "a call with fewer arguments on the stack than it takes".into(),
+                ));
+            }
+            for i in 0..arg_count {
+                read_slot(b, t0, depth - arg_count + i);
+                b.outgoing_arg(i, t0);
+            }
+            b.call_other(t0, index, arg_count);
+            if plan.call_returns.get(&ins.offset).copied().unwrap_or(false) {
+                write_slot(b, depth - arg_count, t0);
+            }
+        }
+
         // A recursive call. The arguments are copied into an outgoing frame the
         // prologue reserved, and the callee is entered exactly as the tier
         // enters this method — same argument-array shape, same trap slot.
@@ -1022,6 +1453,84 @@ fn one<B: Backend>(
             };
             read_slot(b, t0, depth - 1);
             b.alloc_array(t0, kind, t0);
+            write_slot(b, depth - 1, t0);
+        }
+
+        // A reference array element: one handle, eight bytes. The handle is an
+        // opaque token rather than an address, so nothing here can dereference
+        // it — the only thing compiled code does with one is hand it back to a
+        // helper.
+        LdelemRef => {
+            read_slot(b, t0, depth - 2);
+            read_slot(b, t1, depth - 1);
+            b.array_load_ref(t0, t0, t1);
+            write_slot(b, depth - 2, t0);
+        }
+
+        StelemRef => {
+            read_slot(b, t0, depth - 3);
+            read_slot(b, t1, depth - 2);
+            read_slot(b, t2, depth - 1);
+            b.array_store_ref(t0, t1, t2);
+        }
+
+        // `newobj` of a class whose constructor does nothing. The allocation
+        // itself takes the same trap path a failed array allocation does.
+        Newobj => {
+            let Some(shape) = plan.newobj_shapes.get(&ins.offset).copied() else {
+                return Err(CompileError::Unsupported(
+                    "newobj of a class this backend does not allocate".into(),
+                ));
+            };
+            b.alloc_object(t0, shape);
+            write_slot(b, depth, t0);
+        }
+
+        // The null reference. `Handle::NULL` is the all-zero value, so this is
+        // the same instruction as pushing the integer zero — but it is spelled
+        // separately because the two mean different things and a backend that
+        // conflated them would be relying on a coincidence.
+        Ldnull => {
+            b.load_imm(t0, 0);
+            write_slot(b, depth, t0);
+        }
+
+        // Instance field access on a heap object. The receiver is a handle —
+        // an opaque token — and the value crosses as one 64-bit word, so no
+        // part of the heap's layout is assumed here.
+        Ldfld => {
+            let Some((slot, kind)) = plan.fields.get(&ins.offset).copied() else {
+                return Err(CompileError::Unsupported(
+                    "a field this backend cannot resolve".into(),
+                ));
+            };
+            read_slot(b, t0, depth - 1);
+            b.field_load(t0, t0, slot, kind);
+            write_slot(b, depth - 1, t0);
+        }
+
+        Stfld => {
+            let Some((slot, kind)) = plan.fields.get(&ins.offset).copied() else {
+                return Err(CompileError::Unsupported(
+                    "a field this backend cannot resolve".into(),
+                ));
+            };
+            read_slot(b, t0, depth - 2);
+            read_slot(b, t1, depth - 1);
+            b.field_store(t0, slot, kind, t1);
+        }
+
+        // A virtual call every one of whose answers is known. The receiver is
+        // consumed and the constant its type produces takes its place, so the
+        // stack behaves exactly as the call would have.
+        Callvirt => {
+            let Some(cases) = plan.devirt.get(&ins.offset) else {
+                return Err(CompileError::Unsupported(
+                    "a virtual call whose targets are not all known".into(),
+                ));
+            };
+            read_slot(b, t0, depth - 1);
+            b.devirt_dispatch(t0, t0, cases);
             write_slot(b, depth - 1, t0);
         }
 
@@ -1195,4 +1704,70 @@ pub fn resolve_branches(
         patch(code, *at, destination as isize - *at as isize)?;
     }
     Ok(())
+}
+
+/// Where a method must poll for a collection, and `None` if it cannot.
+///
+/// A safe point goes at the target of every backward branch — the top of each
+/// loop body — because a loop is the only way a compiled method can run long
+/// enough for another thread to be waiting on it, and the only way it can
+/// allocate without bound.
+///
+/// The requirement that makes the frame describable is that the **evaluation
+/// stack is empty** at each of those offsets. A handle sitting in a spill slot
+/// would have to be found by inference over the instruction stream; a handle in
+/// a local or an argument is found from its declared type. Roslyn emits loop
+/// back-edges at depth zero, so the restriction costs nothing in practice and
+/// removes a whole analysis that could be wrong.
+///
+/// `None` means some back-edge lands where the stack is not empty. The method is
+/// then compiled without safe points — and therefore may not allocate in a loop,
+/// which is the rule that was there before any of this.
+pub fn safepoints(
+    instructions: &[Instruction],
+    analysis: &MethodAnalysis,
+) -> Option<BTreeSet<u32>> {
+    let mut sites = BTreeSet::new();
+    for ins in instructions {
+        let Some(target) = ins.operand.as_target() else { continue };
+        if target > ins.offset {
+            continue;
+        }
+        if *analysis.depth_at.get(&target).unwrap_or(&0) != 0 {
+            return None;
+        }
+        sites.insert(target);
+    }
+    Some(sites)
+}
+
+/// Byte offsets, from the frame pointer, of every slot that holds a handle.
+///
+/// Derived from declared types alone: a class-typed local or argument holds a
+/// handle, and everything else does not. See [`is_reference_sig`] for why an
+/// array slot is deliberately absent.
+///
+/// `local_offset` and `arg_offset` come from the backend, because where a slot
+/// lives is the backend's business and this pass only decides *which* slots
+/// matter.
+pub fn reference_slots(
+    params: &[rustclr_metadata::TypeSig],
+    locals: &[rustclr_metadata::TypeSig],
+    mut local_offset: impl FnMut(usize) -> i32,
+    mut arg_offset: impl FnMut(usize) -> Option<i32>,
+) -> Vec<i32> {
+    let mut out = Vec::new();
+    for (i, sig) in params.iter().enumerate() {
+        if is_reference_sig(sig) {
+            if let Some(offset) = arg_offset(i) {
+                out.push(offset);
+            }
+        }
+    }
+    for (i, sig) in locals.iter().enumerate() {
+        if is_reference_sig(sig) {
+            out.push(local_offset(i));
+        }
+    }
+    out
 }

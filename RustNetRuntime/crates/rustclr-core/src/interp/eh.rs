@@ -61,12 +61,31 @@ impl Interpreter {
     /// Returns `Ok(())` when a handler (or a `finally`) took control, so the
     /// caller should keep stepping. Returns `Err` when the exception escaped
     /// past `base_depth`.
+    /// Dispatches an exception, keeping its object alive while it happens.
+    ///
+    /// The object lives in a Rust local for the whole of the search below, and
+    /// a filter is *managed code* that can allocate and therefore collect. So
+    /// it is registered as a root for the duration and released afterwards —
+    /// on every path, which is why this wrapper exists rather than a push and
+    /// a pop around a body full of `?`.
     pub(super) fn dispatch_exception(
+        &mut self,
+        error: ExecutionError,
+        base_depth: usize,
+    ) -> ExecResult<()> {
+        let depth = self.dispatching.len();
+        let outcome = self.dispatch_exception_inner(error, base_depth);
+        self.dispatching.truncate(depth);
+        outcome
+    }
+
+    fn dispatch_exception_inner(
         &mut self,
         mut error: ExecutionError,
         base_depth: usize,
     ) -> ExecResult<()> {
         let exception_object = self.materialise_exception(&mut error);
+        self.dispatching.push(exception_object);
         let exception_type = self.type_of(exception_object);
 
         while self.frames.len() > base_depth {

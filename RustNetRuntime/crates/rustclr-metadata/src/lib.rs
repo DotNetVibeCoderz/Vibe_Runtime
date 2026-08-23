@@ -61,6 +61,7 @@ use crate::prelude::*;
 pub mod body;
 pub mod error;
 pub mod heaps;
+pub mod pdb;
 pub mod pe;
 pub mod reader;
 pub mod rows;

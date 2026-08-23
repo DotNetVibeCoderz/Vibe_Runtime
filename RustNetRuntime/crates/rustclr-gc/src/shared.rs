@@ -119,6 +119,16 @@ impl SharedHeap {
         self.locked(|h| h.unpin(handle))
     }
 
+    /// Swaps the collection policy, returning the previous one.
+    ///
+    /// The policy is meant to be swappable — that is a stated requirement — and
+    /// a shared heap should be no harder to reconfigure than an owned one.
+    pub fn set_collector(&self, collector: alloc::boxed::Box<dyn crate::Collector>)
+        -> alloc::boxed::Box<dyn crate::Collector>
+    {
+        self.locked(|h| h.set_collector(collector))
+    }
+
     pub fn should_collect(&self) -> bool {
         self.locked(|h| h.should_collect())
     }

@@ -94,6 +94,25 @@ impl TableId {
             T::GenericParam => &[U16, U16, Coded(C::TypeOrMethodDef), String],
             T::MethodSpec => &[Coded(C::MethodDefOrRef), Blob],
             T::GenericParamConstraint => &[Table(T::GenericParam), Coded(C::TypeDefOrRef)],
+
+            // Portable PDB. Same physical layout rules as everything above,
+            // which is the whole reason these can be described here rather
+            // than parsed by a second reader.
+            T::Document => &[Blob, Guid, Blob, Guid],
+            T::MethodDebugInformation => &[Table(T::Document), Blob],
+            T::LocalScope => &[
+                Table(T::MethodDef),
+                Table(T::ImportScope),
+                Table(T::LocalVariable),
+                Table(T::LocalConstant),
+                U32,
+                U32,
+            ],
+            T::LocalVariable => &[U16, U16, String],
+            T::LocalConstant => &[String, Blob],
+            T::ImportScope => &[Table(T::ImportScope), Blob],
+            T::StateMachineMethod => &[Table(T::MethodDef), Table(T::MethodDef)],
+            T::CustomDebugInformation => &[Coded(C::HasCustomDebugInformation), Guid, Blob],
         }
     }
 }

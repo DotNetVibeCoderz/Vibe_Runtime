@@ -24,32 +24,48 @@ menghasilkan keluaran yang identik di kedua runtime:
 
 ```console
 $ dotnet Conformance.dll
-checks=222 failures=0
+checks=345 failures=0
 
 $ rustnet run Conformance.dll --stats
-checks=222 failures=0
+checks=345 failures=0
 
 ─── execution ──────────────────────────────
-  wall clock                  10.505 ms
-  IL instructions              19,617
-  throughput                 1,867,343 instr/s
-  managed calls                 2,167
-  native calls                    103
-  peak frame depth                 16
+  wall clock                1367.141 ms
+  IL instructions             844563
+  throughput                  617759 instr/s
+  managed calls                89024
+  native calls                 47506
+  compiled calls                 169
+  methods compiled                19
+  code emitted                  6603 bytes
+  peak frame depth                32
 ─── heap ───────────────────────────────────
   collector               mark-sweep
-  allocations                     194
-  live bytes                   10,023
+  allocations                  46942
+  bytes allocated            3774119
+  collections                      0
+  live objects                 46942
+  peak live bytes            3774119
 ```
 
-Ke-38 pemeriksaan itu mencakup aritmatika dan overflow, matematika `long`, alur
-kontrol, string, array, pewarisan kelas, dispatch virtual dan interface,
-property, struct, enum, boxing dan casting, `try`/`catch`/`finally`, handler
-bersarang, pembagian nol, delegate, serta alokasi di bawah tekanan GC. Suite
-kedua, `tests/fixtures/ModernSyntax/`, melakukan hal sama untuk 35 fitur C#
-modern. Keduanya proyek C# biasa yang bisa Anda baca dan kembangkan.
+Bacalah wall clock dengan satu catatan: sebagian besar darinya adalah thread
+yang sedang *tidur*. Pemeriksaan konkurensi benar-benar bertemu-janji dan
+menunggu di thread OS sungguhan, jadi baris throughput membagi seluruh 844.563
+instruksi dengan waktu yang sebagian besar dihabiskan dalam keadaan terblokir,
+dan itu jauh meremehkan si interpreter. Pencacah di kanan-kirinya — instruksi,
+panggilan, alokasi — akurat.
 
-`cargo test --workspace` menjalankan 141 test di delapan crate.
+Ke-345 pemeriksaan itu mencakup aritmatika dan overflow, matematika `long`, alur
+kontrol, string, array, pewarisan kelas, dispatch virtual dan interface,
+property, struct, enum, boxing dan casting, `try`/`catch`/`finally`, filter
+exception, handler bersarang, pembagian nol, delegate, generic, LINQ,
+`async`/`await`, `Span<T>`, pointer mentah dan `stackalloc`, refleksi atas objek
+`System.Type` sungguhan, thread nyata dengan `lock`, `Interlocked` dan
+`Monitor.Wait`/`Pulse`, serta alokasi di bawah tekanan GC. Suite kedua,
+`tests/fixtures/ModernSyntax/`, melakukan hal sama untuk 35 fitur C# modern.
+Keduanya proyek C# biasa yang bisa Anda baca dan kembangkan.
+
+`cargo test --workspace` menjalankan 206 test di delapan crate.
 
 ---
 
@@ -123,32 +139,43 @@ agar JIT-nya berjalan penuh.
 
 | Beban kerja | .NET | RustCLR | Rasio |
 | --- | ---: | ---: | ---: |
-| Start proses | 108 ms | **62 ms** | **0,6x** |
-| Exception (50rb throw) | 130 ms | **111 ms** | **0,9x** |
-| Kernel bilangan bulat — *dikompilasi* | 149 ms | **268 ms** | **1,8x** |
-| String (20rb concat) | 96 ms | **190 ms** | **2,0x** |
-| Kernel yang sama lewat metode pembantu — *dikompilasi, di-inline* | 106 ms | **310 ms** | **2,9x** |
-| Rekursi (fib 27) | 108 ms | 442 ms | 4,1x |
-| Alokasi (300rb objek) | 112 ms | 1.014 ms | 9,1x |
-| Sieve (1 juta) | 107 ms | 1.287 ms | 12,0x |
-| Perkalian matriks (120 kuadrat) | 110 ms | 1.470 ms | 13,4x |
-| Panggilan virtual (2 juta) | 115 ms | 1.788 ms | 15,5x |
-| Quicksort (200rb) | 122 ms | 2.460 ms | 20,2x |
-| Akses field (3 juta) | 111 ms | 2.943 ms | 26,5x |
+| Rekursi (fib 27) — *dikompilasi* | 111 ms | **77 ms** | **0,7x** |
+| Akses field (3 juta) — *dikompilasi, di-skalarkan* | 124 ms | **95 ms** | **0,8x** |
+| Start proses | 84 ms | **73 ms** | **0,9x** |
+| Sieve (1 juta) — *dikompilasi* | 93 ms | **85 ms** | **0,9x** |
+| Perkalian matriks (120 kuadrat) — *dikompilasi* | 105 ms | **92 ms** | **0,9x** |
+| Quicksort (200rb) — *dikompilasi, rekursif* | 123 ms | **109 ms** | **0,9x** |
+| Aritmetika lewat metode pembantu — *dikompilasi, di-inline* | 111 ms | **97 ms** | **0,9x** |
+| Panggilan virtual (2 juta) — *dikompilasi, di-devirtualisasi* | 118 ms | 129 ms | 1,1x |
+| Exception (50rb throw) | 144 ms | 159 ms | 1,1x |
+| Kernel bilangan bulat — *dikompilasi, memanggil pembantu terkompilasi* | 96 ms | 142 ms | 1,5x |
+| Alokasi (300rb objek) — *dikompilasi* | 117 ms | 199 ms | 1,7x |
+| Penelusuran array — *dikompilasi* | 135 ms | 244 ms | 1,8x |
+| String (20rb concat) | 102 ms | 203 ms | 2,0x |
 
-Kurangi dulu baris start proses sebelum menyimpulkan: baris itu adalah sebagian
-besar angka .NET pada beban kerja pendek, sehingga rasio *komputasi* sebenarnya
-lebih buruk daripada yang ditunjukkan wall clock, sekitar 100x pada perulangan
-paling ketat. Itulah ongkos menafsirkan alih-alih mengompilasi, dan itulah yang
-dituju [Milestone 4](Plan.md).
+Bacalah bagian atas tabel itu dengan hati-hati, bukan dengan bangga. Start
+proses memakan **73 ms**, dan setiap baris sampai quicksort berada dalam jarak
+sekitar 35 ms dari lantai itu. Pembanding yang jujur adalah sejarah mereka
+sendiri:
 
-Beberapa baris justru berbalik, karena tiga alasan berbeda. **RustCLR start
-hampir dua kali lebih cepat** (tanpa JIT, tanpa pemanasan), yang penting untuk
-perkakas CLI berumur pendek dan untuk mikrokontroler yang tak punya ruang bagi
-cache kode. **Exception dan string tetap berdekatan** karena pekerjaannya
-terjadi di Rust native di dalam RustBCL, bukan di IL yang ditafsirkan. Dan dua
-baris **kernel dikompilasi menjadi kode mesin**, bukan ditafsirkan sama sekali —
-yang kedua hanya karena inliner menyisipkan metode pembantunya lebih dulu.
+| Baris | dulu | sekarang | apa yang berubah |
+| --- | ---: | ---: | --- |
+| Sieve, matriks | ~1.500 ms | 85–92 ms | tiering mengompilasi metode yang badannya berulang |
+| Akses field | 3.173 ms | 95 ms | objek yang tak lolos diganti oleh field-fieldnya |
+| Panggilan virtual | 1.923 ms | 129 ms | devirtualisasi berpenjaga |
+| Alokasi | 1.093 ms | 199 ms | safe point, lalu akses field terkompilasi |
+| Aritmetika lewat pembantu | 477 ms | 97 ms | inliner belajar meratakan lebih dari satu tingkat |
+| Kernel bilangan bulat | 350 ms | 142 ms | satu metode terkompilasi boleh memanggil metode terkompilasi lain |
+
+**Kini setiap baris dikompilasi atau native**, dan tak ada yang lebih lambat
+dari 2,0×. Yang terakhir bergerak adalah `kernels`, yang memecah pekerjaannya ke
+metode pembantu yang *berulang* — sehingga tak bisa disisipkan pada kedalaman
+inlining berapa pun, dan satu-satunya cara mengompilasi loop di sekelilingnya
+adalah memberi kode terkompilasi konvensi pemanggilannya sendiri. `sort` ikut
+terbawa, karena `Sort` memanggil `QuickSort`.
+
+**Exception dan string tetap berdekatan** dengan .NET karena pekerjaannya
+terjadi di Rust native di dalam RustBCL, bukan di IL yang ditafsirkan.
 
 Checksum setiap baris dibandingkan antar-runtime sebelum diukur; kalau berbeda,
 yang dicetak `MISMATCH`, bukan angka.
@@ -323,9 +350,19 @@ generic yang sudah di-*erase* melempar exception alih-alih menjawab
 
 **Sebagian metode dikompilasi menjadi kode mesin.** `rustclr-jit` menghasilkan
 x86-64 ke dalam halaman write-xor-execute untuk metode yang mengerjakan
-aritmetika bilangan bulat, setelah 32 panggilan membuktikan metode itu layak
-dikompilasi. Pada benchmark `kernels` hasilnya **11,0× lebih cepat** daripada
-interpretasi — 269 ms berbanding 2.971 ms, yaitu 1,8× .NET, bukan 20×.
+aritmetika `int` *dan* `double`. Di IL, `add` adalah opcode yang sama untuk
+keduanya, jadi sebuah pass penentuan tipe menyimpulkan mana yang dimaksud dari
+nilai-nilai yang sampai ke sana, dan **menolak metodenya ketika tidak sanggup
+mengikuti alirannya** alih-alih menebak — tebakan yang salah akan mengembalikan
+pola bit sebuah double sebagai bilangan bulat, dan begitulah bug itu benar-benar
+ditemukan. Pada benchmark `kernels` hasilnya **11,0× lebih cepat** daripada
+interpretasi — 269 ms berbanding 2.971 ms, yang memindahkannya dari 20× .NET
+ke sekitar satu setengah kali.
+
+**Metode yang badannya berulang dikompilasi pada panggilan pertama**, bukan
+menunggu hitungan panggilan yang tak akan pernah tercapai oleh satu panggilan
+berdurasi panjang. Selebihnya tetap menunggu 32 panggilan. Perubahan itulah yang
+memindahkan `sieve` dan `matrix` dari sekitar 1.500 ms ke bawah 100 ms.
 
 **Callee kecil di-*inline***, sehingga sebuah `call` tidak lagi membuat metode
 ditolak. Benchmark `inlined` memakai aritmetika yang sama dengan `kernels`
@@ -334,11 +371,105 @@ diinterpretasi, 400 ms dikompilasi — **2,9× di antaranya murni dari inliner**
 karena dengan `--no-inline` run yang sama memakan 1.148 ms. Hanya callee statik
 tanpa percabangan yang disisipkan, dan hanya satu tingkat.
 
-Jangkauannya sempit, dan `rustnet jit <assembly>` menyebutkan persis seberapa
-sempit: apa pun yang memakai array, pemanggilan, alokasi, atau exception
-handling tetap diinterpretasi. `rustnet run --no-jit` menginterpretasi
-semuanya, dan harus mencetak byte yang sama — ada differential test yang
-menjaminnya.
+**Array ikut dikompilasi.** Sebuah `int[]`, `double[]` atau `bool[]` — baik
+sebagai parameter maupun sebagai local — diserahkan ke kode terkompilasi sebagai
+pointer data dan panjang, sehingga `a[i]` menjadi satu pemeriksaan batas dan
+satu muatan berindeks-berskala, bukan pencarian handle. Benchmark `arrays`
+berjalan **89,8× lebih cepat** setelah dikompilasi — 18.401 ms berbanding
+205 ms, jarak terlebar di seluruh rangkaian.
+
+**Kode terkompilasi mencapai safe point, sehingga boleh mengalokasikan di dalam
+loop.** Ini pembatasan struktural terakhir pada backend. Kode terkompilasi tak
+punya tempat untuk dihentikan, sehingga pengumpulan sampah tak bisa berjalan
+selagi ia dieksekusi, sehingga loop yang mengalokasikan bisa menghabiskan heap
+yang tidak akan dihabiskan oleh interpreter — dan aturannya dulu hanyalah
+menolak.
+
+Kini metode terkompilasi memeriksa di setiap back-edge loop, baik untuk
+pengumpulan milik thread lain *maupun* untuk tekanan alokasinya sendiri, karena
+dengan satu thread tak ada lagi yang akan meminta. Referensi hidup di frame
+ditemukan dengan membaca offset byte yang ditetapkan saat metode dikompilasi:
+poll-nya diletakkan di tempat stack evaluasi kosong, sehingga satu-satunya slot
+yang penting adalah local dan argumen, dan jenisnya berasal dari tipe yang
+dideklarasikan. Tak ada yang disimpulkan dari aliran instruksi. Back-edge yang
+dicapai dengan stack tak kosong tidak mendapat safe point, dan metode itu tetap
+memakai aturan lama.
+
+Setiap safe point juga melepaskan apa yang sudah selesai dipakai loop, sehingga
+**memori loop terkompilasi datar, bukan sebanding dengan jumlah putarannya**.
+Itu bukan detail sepele: versi pertama dari ini menahan setiap alokasi tetap
+hidup selama panggilan berlangsung — lolos semua uji kebenaran, dan justru lebih
+buruk daripada menolak mengompilasi. Ada tes yang menjalankan loop yang sama
+sepuluh kali lebih panjang dan gagal bila puncak heap-nya ikut naik.
+
+**Satu metode terkompilasi memanggil metode terkompilasi lain.** Rekursi lebih
+dulu — inliner tak bisa menghapusnya, karena menyisipkan metode ke dalam dirinya
+sendiri tidak berhenti — lalu menyusul kasus umumnya. Panggilannya tak langsung,
+lewat tabel alamat masuk yang diisi runtime sebelum si pemanggil berjalan, sebab
+alamat sebuah callee belum ada ketika pemanggilnya dikompilasi dan dua metode
+bisa saling memanggil. Itulah yang membuat `kernels` terkompilasi, yang metode
+pembantunya mengandung loop sehingga tak pernah bisa disisipkan pada kedalaman
+inlining berapa pun.
+
+Panggilan terkompilasi berjalan di stack *mesin*, jadi runtime menghitung
+**byte** yang dipakainya dan menolak melewati anggaran alih-alih crash. Byte,
+bukan frame: ukuran frame berbeda-beda, sehingga hitungan frame apa pun akan
+terlalu longgar bagi frame besar atau terlalu ketat bagi frame kecil — dan
+hitungan yang ada sebelumnya diam-diam keduanya. Runtime memesan stack besar
+untuk kode terkelola alih-alih berharap host menyediakannya, karena program yang
+jalan saat ditafsirkan tidak boleh gagal saat dikompilasi.
+
+**Panggilan virtual yang semua jawabannya diketahui menjadi sebuah
+perbandingan.** Analisis hierarki kelas biasanya tidak bisa membuktikan apa pun
+di sini, karena `Assembly.Load` bisa memasukkan subtipe belakangan — jadi ia
+hanya dipercaya ketika hal itu mustahil: ketika tipe pendeklarasinya tidak
+terlihat dari luar assembly-nya sendiri, sehingga tidak bisa diturunkan dari
+luar. Kelas bersarang `private` adalah kasus yang lazim. Setiap override juga
+harus melipat menjadi konstanta. Barulah panggilan itu menjadi pencarian tipe
+runtime si receiver dan serangkaian perbandingan, tanpa panggilan sama sekali —
+yang membawa `virtual` dari 1.923 ms menjadi 103 ms.
+
+Tipe si receiver diambil lewat helper, bukan dibaca dari memori objeknya, jadi
+tak ada bagian tata letak heap yang diasumsikan — satu-satunya yang dipegang
+kode terkompilasi adalah handle, token 64-bit buram yang tak bisa ia
+dereferensi. Receiver yang tak cocok dengan penjaga mana pun akan **trap**: di
+sini tidak ada on-stack replacement, sehingga badan metode yang sudah
+mengalokasikan tak punya jalan pulang yang sahih ke interpreter, dan bukti
+hierarki yang ternyata keliru harus mengatakannya, bukan mengembalikan angka.
+
+**Field sebuah objek di heap dicapai lewat panggilan helper, bukan lewat load
+inline.** Heap menyimpan nilai dalam enum Rust dengan payload ter-box, yang
+tata letaknya tidak dijamin bahasanya — memancarkan kode mesin yang membacanya
+akan menjadikan tata letak itu bagian dari ABI backend ini, dan gagalnya berupa
+*angka yang salah* pada hari sebuah kompiler menyusun ulang variannya. Sebuah
+panggilan memang lebih mahal daripada satu load, tetapi tidak bisa salah dengan
+cara seperti itu. Field `int`, `long`, `double` dan referensi bisa menyeberang;
+field bertipe struct ditolak.
+
+Jenis yang dideklarasikan **diperiksa**, bukan sekadar dipakai untuk
+mengonversi. Referensi yang disimpan sebagai angka akan bolak-balik dengan
+sempurna melalui kode terkompilasi namun tak terlihat oleh pengumpul sampah,
+yang menelusuri referensi dan bukan bilangan bulat — sehingga rantai di
+bawahnya tersapu selagi kode terkompilasi masih menyusurinya. Itu jawaban salah
+yang tiba jauh setelah kesalahannya, jadi helper-nya menolak bentuk yang tidak
+cocok dengan tipe yang dideklarasikan field itu.
+
+**Objek yang tak pernah lolos berhenti ada.** Kode terkompilasi tidak membaca
+field dari objek di heap, dan memang tidak akan pernah — field tersimpan di
+`Vec<Value>`, dan `Value` adalah enum Rust yang tata letaknya tidak dijamin oleh
+bahasanya, sehingga memancarkan kode yang membacanya akan menjadikan tata letak
+itu bagian dari ABI si JIT, dan gagalnya berupa angka yang salah, bukan crash.
+Sebagai gantinya, ketika sebuah objek terbukti tak pernah meninggalkan metode
+yang membuatnya, setiap fieldnya menjadi local biasa: `ldfld` menjadi `ldloc`.
+Itulah yang membawa `fields` dari 3.173 ms — baris paling lambat di seluruh
+rangkaian — menjadi 104 ms. Pembuktiannya sengaja dibuat sempit, dan objek yang
+dioper ke metode lain, dikembalikan, di-box atau dijadikan target `lock` ditolak
+alih-alih ditebak.
+
+Yang masih diinterpretasi disebutkan persis oleh `rustnet jit <assembly>`:
+`float[]`, `rem` pada double, exception handling, dan akses field objek.
+`rustnet run --no-jit` menginterpretasi semuanya, dan harus mencetak byte yang
+sama — ada differential test yang menjaminnya.
 
 **Fitur lanjutan C#.** 21 dari 21 fitur yang diuji menghasilkan keluaran identik
 di kedua runtime: garbage collection, `IDisposable`/`using`, `async`/`await`,
@@ -358,17 +489,31 @@ Matriks lengkapnya, beserta alasan tiap baris:
 [docs/id/fitur-lanjutan.md](docs/id/fitur-lanjutan.md).
 
 
-**Belum jalan.** Tidak ada yang berjalan konkuren: task `async` maupun badan
-`Thread` sama-sama dieksekusi inline, jadi hasilnya benar tetapi tidak ada
-paralelisme. *Argumen* tipe generic di-*erase*, sehingga kode generic buatan
-pengguna yang membaca `T` saat runtime — `typeof(T)`, `is T`, static field per
-instansiasi — tidak berperilaku benar. Argumen tipe untuk *metode* generic
-sudah diketahui: `typeof(T)`, `default(T)`, dan `x is T` semuanya menjawab di
-dalam `M<T>`.
-Penghasil kode native hanya menangani metode bilangan bulat — 11,0× lebih cepat
-di tempat ia berlaku, dan kini juga menerima pemanggilan ke metode pembantu
-kecil lewat *inlining*, tetapi tetap menolak apa pun yang memakai array, yang
-mencakup sebagian besar program nyata.
+**Belum jalan.** Generic milik framework sengaja tetap di-*erase*: `List<int>`
+dan `List<string>` adalah satu tipe runtime, karena setiap binding native
+dikunci oleh nama tipe pendeklarasinya — memberi `List<int>` nama sendiri akan
+membuat ``List`1::Add`` tak terjangkau. Generic buatan pengguna tidak di-erase:
+`Cell<int>` dan `Cell<string>` adalah dua tipe dengan static slot
+masing-masing. Call site yang menyebut definisi *terbuka* tetap ditolak: tidak
+ada apa pun di sana yang tahu argumennya, jadi runtime mengatakannya alih-alih
+menebak.
+
+Penghasil kode native hanya untuk x86-64; **backend AArch64 dan RISC-V belum
+pernah mengeksekusi satu instruksi pun.** Keduanya menyandikan IL yang sama
+lewat translasi bersama yang sama dan diperiksa dengan disassembly, tetapi tak
+ada papan yang pernah tersambung — dan backend yang belum pernah dieksekusi
+namun mengaku bekerja lebih buruk daripada tidak ada backend sama sekali.
+
+Yang masih ditolak backend x86-64: **penanganan exception**, karena frame
+terkompilasi tak bisa di-unwind oleh interpreter; **metode instance**, yang
+konvensi pemanggilannya tidak membawa receiver; `float[]`; `rem` pada double;
+dan panggilan virtual lewat hierarki yang bisa diperluas assembly lain. Ini juga
+bukan on-stack replacement: metode yang sedang berjalan tidak bisa ditukar.
+
+`Monitor.Pulse` membangunkan *semua* penunggu, bukan satu. Itu janji yang lebih
+lemah daripada .NET, dan sudah ditoleransi oleh `Wait` yang ditulis dalam loop
+pemeriksaan ulang sebagaimana diwajibkan — dinyatakan di sini, bukan
+ditutup-tutupi.
 
 `rustnet capabilities` mencetak daftar ini langsung dari runtime, jadi tidak
 bisa melenceng dari kenyataan. Rincian: [docs/limitations.md](docs/limitations.md).
@@ -531,11 +676,11 @@ generic yang sudah di-*erase* melempar exception alih-alih menjawab
 `System.Object`.
 
 **Sebagian metode dikompilasi menjadi kode mesin.** `rustclr-jit` menghasilkan
-x86-64 ke dalam halaman write-xor-execute untuk metode yang mengerjakan
-aritmetika bilangan bulat, setelah 32 panggilan membuktikan metode itu layak
-dikompilasi. Pada benchmark `kernels` hasilnya **11,0× lebih cepat** daripada
-interpretasi — 269 ms berbanding 2.971 ms, yaitu 1,8× .NET, bukan 20×. Callee
-kecil di-*inline*, sehingga sebuah `call` tidak lagi membuat metode ditolak.
+x86-64 ke dalam halaman write-xor-execute untuk aritmetika `int` dan `double`,
+akses elemen `int[]`/`double[]`/`bool[]`, alokasi array, dan rekursi. Pada
+benchmark `kernels` hasilnya **11,0× lebih cepat** daripada interpretasi —
+269 ms berbanding 2.971 ms, jauh dari 20× .NET semula. Callee kecil
+di-*inline*, sehingga sebuah `call` tidak lagi membuat metode ditolak.
 
 **Backend AArch64 dan RISC-V ada, tetapi belum pernah dieksekusi.** Keduanya
 meng-*encode* IL yang sama melalui translasi bersama yang sama seperti x86-64

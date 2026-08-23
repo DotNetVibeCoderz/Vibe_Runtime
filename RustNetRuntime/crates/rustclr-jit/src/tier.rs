@@ -29,6 +29,19 @@ pub struct JitTier {
     declined: HashSet<MethodId>,
     /// Whether a method's body loops, decoded once and remembered.
     loops: HashMap<MethodId, bool>,
+    /// Methods whose call tables are being resolved, to break a cycle.
+    resolving: HashSet<MethodId>,
+    /// Methods whose call tables are filled in and ready to be called through.
+    resolved: HashSet<MethodId>,
+    /// Scratch buffers for marshalling one call's arguments.
+    ///
+    /// Two heap allocations per call is not much until a benchmark makes a
+    /// quarter of a million of them. They are *moved out* of the tier for the
+    /// duration of a call rather than borrowed, so a nested `try_execute` —
+    /// which nothing does today — would allocate its own rather than write
+    /// into a buffer whose addresses compiled code is still holding.
+    scratch_marshalled: Vec<i64>,
+    scratch_descriptors: Vec<[i64; 2]>,
 }
 
 impl Default for JitTier {
@@ -52,6 +65,10 @@ impl JitTier {
             compiled: HashMap::new(),
             declined: HashSet::new(),
             loops: HashMap::new(),
+            resolving: HashSet::new(),
+            resolved: HashSet::new(),
+            scratch_marshalled: Vec::new(),
+            scratch_descriptors: Vec::new(),
         }
     }
 
@@ -108,6 +125,8 @@ impl NativeTier for JitTier {
         heap: &SharedHeap,
         method: MethodId,
         args: &[Value],
+        mutators: &rustclr_core::gc::safepoint::Mutators,
+        interpreter_roots: &mut dyn FnMut() -> Vec<rustclr_core::gc::Handle>,
     ) -> Option<ExecResult<Option<Value>>> {
         if self.declined.contains(&method) {
             return None;
@@ -136,6 +155,20 @@ impl NativeTier for JitTier {
             }
         }
 
+        // Every callee this body reaches has to be compiled before it runs,
+        // because its calls are indirect through a table of their entries.
+        // Done here rather than during compilation: two methods may call each
+        // other, and compiling one to finish the other would not terminate.
+        if !self.resolve_call_table(loader, method) {
+            // A callee turned out not to compile after all. The caller was
+            // emitted around a call that can never be filled in, so it is
+            // discarded and the method is interpreted — which is a decision to
+            // make once, not on every call.
+            self.compiled.remove(&method);
+            self.declined.insert(method);
+            return None;
+        }
+
         let native = self.compiled.get(&method)?;
 
         // An `int[]` argument becomes a two-word descriptor — data pointer and
@@ -152,14 +185,25 @@ impl NativeTier for JitTier {
         // first half and does not: `Heap::alloc` records pressure and returns,
         // and it is the *interpreter* that collects, between instructions.
         // Compiled code has no between-instructions. See `crate::alloc`.
-        let mut descriptors: Vec<[i64; 2]> = Vec::with_capacity(native.arg_count);
+        let mut descriptors: Vec<[i64; 2]> = core::mem::take(&mut self.scratch_descriptors);
+        descriptors.clear();
+        descriptors.reserve(native.arg_count);
+        // Array arguments reach compiled code as a raw pointer into the
+        // array's storage. Nothing else roots them while the call runs — the
+        // interpreter pushes no frame for a compiled method — so a collection
+        // reached from inside the method would sweep the storage the pointer
+        // names. They are pinned for the duration of the call instead.
+        let mut argument_handles: Vec<rustclr_core::gc::Handle> = Vec::new();
         for i in 0..native.arg_count {
             if let Value::Obj(handle) = args.get(i)? {
                 descriptors.push(int_array_descriptor(heap, *handle)?);
+                argument_handles.push(*handle);
             }
         }
 
-        let mut marshalled = Vec::with_capacity(native.arg_count + 1);
+        let mut marshalled: Vec<i64> = core::mem::take(&mut self.scratch_marshalled);
+        marshalled.clear();
+        marshalled.reserve(native.arg_count + 3);
         let mut next = 0usize;
         for i in 0..native.arg_count {
             match args.get(i)? {
@@ -184,9 +228,34 @@ impl NativeTier for JitTier {
         // array the call allocates and drops them when it returns, which is
         // sound because a compiled method cannot return a reference — so
         // nothing it allocated can outlive the call.
-        let mut sink = self.array_types(loader).map(|types| {
-            crate::alloc::AllocSink::new(heap.clone(), types)
-        });
+        // Only a body that can allocate gets an allocation context. Building
+        // one resolves three types by name and searches for three array
+        // constructions, and a method that never allocates has no use for the
+        // answer — which described almost every compiled method in the
+        // benchmark suite, called a quarter of a million times each.
+        let needs_context = native.allocates || !native.reference_slots.is_empty()
+            || !argument_handles.is_empty();
+        let mut sink = needs_context.then(|| self.array_types(loader)).flatten().map(
+            |mut types| {
+                // The classes this body names, in its own numbering. Copied per
+                // call rather than shared, because the indices the emitted code
+                // uses belong to this method and no other.
+                types.objects = native.object_shapes.clone();
+                // The starting field values for each of those classes,
+                // resolved through the loader because that is where a
+                // signature becomes a value.
+                types.object_fields = native
+                    .object_shapes
+                    .iter()
+                    .map(|(ty, _, _)| loader.default_instance_fields(*ty))
+                    .collect();
+                let mut sink = crate::alloc::AllocSink::new(heap.clone(), types);
+                for handle in &argument_handles {
+                    sink.borrow(*handle);
+                }
+                sink
+            },
+        );
         marshalled.push(
             sink.as_mut()
                 .map(|s| s as *mut crate::alloc::AllocSink as i64)
@@ -198,17 +267,78 @@ impl NativeTier for JitTier {
         // depth and refuses rather than overrunning it.
         marshalled.push(0);
 
+        // Then the safepoint flag, and the sink to park through.
+        //
+        // The flag is read at every loop back-edge, so it is the address of a
+        // plain word rather than anything the poll has to lock. The sink is
+        // only touched when that word is non-zero, and it is the *same*
+        // pointer the allocation helpers use — one object, so a safe point can
+        // prune the allocation list using the frame description without two
+        // aliasing pointers to state that must change together.
+        if let Some(sink) = sink.as_mut() {
+            if !native.reference_slots.is_empty() || !native.array_slots.is_empty() {
+                sink.safepoint = Some(crate::alloc::SafepointState {
+                    mutators: mutators.clone(),
+                    interpreter_roots,
+                });
+            }
+        }
+        marshalled.push(mutators.stopping_flag() as i64);
+        marshalled.push(
+            sink.as_mut()
+                .map(|s| s as *mut crate::alloc::AllocSink<'_> as i64)
+                .unwrap_or(0),
+        );
+        marshalled.push(sink.as_ref().map(|s| s.pressure_flag() as i64).unwrap_or(0));
+        // The parent frame record. Null here: the frame below a compiled call
+        // entered from the interpreter is an *interpreted* one, and its roots
+        // come from the closure rather than from a record.
+        marshalled.push(0);
+        // And the table of callee entries, which `resolve_call_table` filled.
+        marshalled.push(
+            native
+                .call_addresses
+                .as_ref()
+                .map(|t| t.as_ptr() as i64)
+                .unwrap_or(0),
+        );
+
         // SAFETY: `marshalled` holds `arg_count` values plus the trap slot,
         // which is exactly what the emitted code reads. Each array slot points
         // at a descriptor that outlives the call.
         let raw = unsafe { native.call(&marshalled) };
+
+        // Read the trap and hand the buffers back before anything can return.
+        // The sink is dropped here too, releasing whatever the call allocated
+        // — nothing it allocated can outlive the call, so nothing is lost.
+        let trap = marshalled[native.arg_count];
+        let returns_value = native.returns_value;
+        // A field access reports through the sink rather than the trap slot: a
+        // helper has the sink and not the frame. Folded in here so both kinds
+        // of failure take the same path out.
+        let field_fault = sink.as_ref().map(|s| s.fault).unwrap_or(0);
+        drop(sink);
+        marshalled.clear();
+        descriptors.clear();
+        self.scratch_marshalled = marshalled;
+        self.scratch_descriptors = descriptors;
 
         // A failed bounds check cannot throw from compiled code — there is no
         // frame for the interpreter to unwind — so it flags and returns, and
         // the exception is raised here. Declining instead would be wrong:
         // stores that already happened stay done, and re-running the method
         // interpreted would repeat them.
-        match marshalled[native.arg_count] {
+        if field_fault == crate::alloc::FIELD_FAULT_NULL {
+            return Some(Err(ExecutionError::null_reference()));
+        }
+        if field_fault != 0 {
+            return Some(Err(ExecutionError::exception(
+                ClrExceptionKind::InvalidOperation,
+                "compiled code read a field whose shape it did not expect",
+            )));
+        }
+
+        match trap {
             0 => {}
             1 => {
                 return Some(Err(ExecutionError::exception(
@@ -228,15 +358,40 @@ impl NativeTier for JitTier {
             // Compiled recursion went deeper than the machine stack can be
             // trusted for. The interpreter raises the same exception at its own
             // frame budget, so a program sees one answer either way.
-            _ => {
+            3 => {
                 return Some(Err(ExecutionError::exception(
                     ClrExceptionKind::StackOverflow,
                     "Compiled recursion exceeded the depth this runtime allows.",
                 )))
             }
+            // A devirtualised call site met a receiver no guard matched.
+            //
+            // Class-hierarchy analysis said that could not happen, so reaching
+            // here means the analysis was wrong rather than the program being
+            // unusual — and saying so plainly is the whole point. Reporting it
+            // as one of the traps above would send a reader looking for a bug
+            // that is not there.
+            5 => {
+                return Some(Err(ExecutionError::exception(
+                    ClrExceptionKind::InvalidOperation,
+                    "A devirtualised call met a receiver type its guards did not cover;                      the code generator's hierarchy analysis was wrong.",
+                )))
+            }
+            // A virtual call on a null receiver, which is an ordinary program
+            // error rather than anything to do with compilation.
+            6 => return Some(Err(ExecutionError::null_reference())),
+            // An unknown code means the emitter wrote one this does not know
+            // about, which is a bug in this crate. Say that, rather than
+            // borrowing whichever message happens to be last.
+            other => {
+                return Some(Err(ExecutionError::exception(
+                    ClrExceptionKind::InvalidOperation,
+                    format!("compiled code raised an unrecognised trap ({other})"),
+                )))
+            }
         }
 
-        if !native.returns_value {
+        if !returns_value {
             return Some(Ok(None));
         }
         let info = loader.registry.method(method);
@@ -280,6 +435,103 @@ impl JitTier {
     /// `None` when the framework contract is not loaded, which leaves the sink
     /// absent and any `newarr` in compiled code taking the trap path — a
     /// refusal rather than a wrong answer.
+    /// Compiles everything `method` can reach and fills in every call table.
+    ///
+    /// Two passes, and the split is the whole point. A table entry names both
+    /// the callee's entry *and the callee's own table*, because a callee reads
+    /// its table out of the argument array its caller builds. With one pass and
+    /// a cycle — two methods calling each other — the first would have to name
+    /// a table the second had not allocated yet, and would name null. So every
+    /// reachable method is compiled and its table *allocated* first; only then
+    /// are the addresses written, by which point every one of them exists.
+    ///
+    /// Returns false if anything reachable cannot be compiled, which makes the
+    /// caller unusable: it was emitted around calls that would never be filled.
+    fn resolve_call_table(&mut self, loader: &Loader, method: MethodId) -> bool {
+        if self.resolved.contains(&method) {
+            return true;
+        }
+        let mut reachable = Vec::new();
+        if !self.reach(loader, method, &mut reachable) {
+            return false;
+        }
+        // Every table now exists at its final address, so the pairs can name
+        // each other however the calls happen to cycle.
+        for owner in &reachable {
+            let targets = match self.compiled.get(owner) {
+                Some(native) => native.call_table.clone(),
+                None => return false,
+            };
+            let mut pairs = Vec::with_capacity(targets.len() * 2);
+            for target in &targets {
+                let Some(callee) = self.compiled.get(target) else { return false };
+                let table = callee
+                    .call_addresses
+                    .as_ref()
+                    .map(|t| t.as_ptr() as i64)
+                    .unwrap_or(0);
+                pairs.push(callee.entry());
+                pairs.push(table);
+            }
+            // Written *into* the existing allocation, never replaced: another
+            // method's table already names this one by address, and a fresh
+            // box would leave that pointing at freed memory. That is a jump
+            // through a dangling pointer rather than a wrong answer, and it is
+            // exactly how the first version of this crashed.
+            match self.compiled.get_mut(owner) {
+                Some(native) => match native.call_addresses.as_mut() {
+                    Some(slots) if slots.len() == pairs.len() => {
+                        slots.copy_from_slice(&pairs);
+                    }
+                    _ => return false,
+                },
+                None => return false,
+            }
+            self.resolved.insert(*owner);
+        }
+        true
+    }
+
+    /// Compiles `method` and everything it can reach, allocating each one's
+    /// table at its final size so its address is settled.
+    fn reach(
+        &mut self,
+        loader: &Loader,
+        method: MethodId,
+        found: &mut Vec<MethodId>,
+    ) -> bool {
+        if !self.compiled.contains_key(&method) && !self.compile_now(loader, method) {
+            return false;
+        }
+        if !self.resolving.insert(method) {
+            // Already on the path: a cycle, and its table is already allocated.
+            return true;
+        }
+        let targets = match self.compiled.get(&method) {
+            Some(native) => native.call_table.clone(),
+            None => {
+                self.resolving.remove(&method);
+                return false;
+            }
+        };
+        // Allocated before descending, so a cycle coming back round finds an
+        // address rather than a hole.
+        if let Some(native) = self.compiled.get_mut(&method) {
+            if native.call_addresses.is_none() {
+                native.call_addresses = Some(vec![0i64; targets.len() * 2].into_boxed_slice());
+            }
+        }
+        found.push(method);
+        for target in targets {
+            if !self.reach(loader, target, found) {
+                self.resolving.remove(&method);
+                return false;
+            }
+        }
+        self.resolving.remove(&method);
+        true
+    }
+
     fn array_types(&self, loader: &Loader) -> Option<crate::alloc::ArrayTypes> {
         let int_element = loader.registry.find_type_by_name("System.Int32")?;
         let double_element = loader.registry.find_type_by_name("System.Double")?;
@@ -297,6 +549,10 @@ impl JitTier {
             double_element,
             bool_array: loader.registry.find_sz_array(bool_element).unwrap_or(fallback),
             bool_element,
+            // Filled in per call from the method about to run: the numbering is
+            // that method's own.
+            objects: Vec::new(),
+            object_fields: Vec::new(),
         })
     }
 }

@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>AdvancedFeatures</AssemblyName>
+    <RootNamespace>AdvancedFeatures</RootNamespace>
+    <Nullable>disable</Nullable>
+    <LangVersion>preview</LangVersion>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- Interceptors are opt-in per namespace. -->
+    <InterceptorsNamespaces>$(InterceptorsNamespaces);AdvancedFeatures</InterceptorsNamespaces>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The generator lives in a subfolder, so the default glob would compile
+         it into this project as well. It targets netstandard2.0 and references
+         Roslyn; it must only be consumed as an analyzer. -->
+    <Compile Remove="Generator\**" />
+    <None Remove="Generator\**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="Generator\Generator.csproj"
+                      OutputItemType="Analyzer"
+                      ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+</Project>

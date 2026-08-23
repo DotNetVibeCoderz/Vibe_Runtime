@@ -435,7 +435,18 @@ impl Compiler for Arm64Backend {
         let bytes = emit(&instructions, &analysis, body.locals.len(), returns_value)?;
         self.methods_compiled += 1;
         self.bytes_emitted += bytes.len();
-        Ok(CompiledCode { method, tier: Tier::Jit, bytes, analysis })
+        Ok(CompiledCode {
+            method,
+            tier: Tier::Jit,
+            bytes,
+            analysis,
+            object_shapes: Vec::new(),
+            allocates_arrays: false,
+            reference_slots: Vec::new(),
+            array_slots: Vec::new(),
+            frame_map: None,
+            call_table: Vec::new(),
+        })
     }
 }
 

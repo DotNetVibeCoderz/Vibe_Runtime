@@ -4,12 +4,80 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status: milestones 1-3 and 5 complete, 4 and 6 partly done, and it works
 
-The runtime executes real Roslyn-compiled assemblies. `cargo test --workspace` runs 192 tests;
-the conformance fixture prints `checks=308 failures=0` on RustCLR, byte-identical to `dotnet`,
+The runtime executes real Roslyn-compiled assemblies. `cargo test --workspace` runs 206 tests;
+the conformance fixture prints `checks=345 failures=0` on RustCLR, byte-identical to `dotnet`,
 and `ModernSyntax` prints `checks=35 failures=0`. Generic collections, LINQ and
-`async`/`await` all run, hot integer methods compile to x86-64 machine code (with small
-callees inlined, and `int[]` parameters compiled to bounds-checked loads), and reflection
-works on real `System.Type` objects.
+`async`/`await` all run, `Span<T>` and `unsafe` pointers work, and reflection works on
+real `System.Type` objects.
+
+**The code generator has grown well past integers.** Integer *and* `double`
+arithmetic, `int[]`/`double[]`/`bool[]` element access, allocation, and recursion all
+compile to x86-64; a method whose body loops compiles on its first call rather than
+waiting for a call count. `sort`, `sieve`, `matrix` and `fib` all went from
+seconds to under a quarter-second.
+
+**Objects that never escape are replaced by their fields** rather than read out of
+the heap — `Value` is a Rust enum whose layout is not promised, so making it part of
+the JIT ABI was refused. `crates/rustclr-jit/src/escape.rs` states the proof
+obligations; anything it cannot follow is declined. That took `fields` from 3,173 ms
+to 89 ms.
+
+**Virtual calls are devirtualised when every answer is known** — see
+`crates/rustclr-jit/src/devirt.rs`, which trusts class-hierarchy analysis only where
+the declaring type cannot be extended from another assembly, and refuses a public
+hierarchy even when it looks ideal. `virtual` went 1,923 ms → 103 ms. Compiled code
+holds heap references *only* as `Handle`s: `repr(transparent)` over `u64`, opaque,
+never dereferenced, with the receiver's type fetched by a helper rather than read
+out of the object.
+
+**A constructor that provably does nothing is not called** —
+`Loader::constructor_does_nothing` is the single rule, shared by the interpreter,
+scalar replacement and compiled `newobj`, because three copies of it would drift.
+An object's starting field values are computed once per type rather than per
+allocation. Together those took `alloc` 1,093 ms → 670 ms.
+
+**The busiest two locals or arguments are pinned in callee-saved registers**
+(R12/R13), worth −22% on `fields` and nothing on rows where short compiled leaves
+are called from an interpreted loop. **A compiled method that cannot allocate gets
+no allocation context**, and the marshalling buffers are reused — the transition,
+not the emitted code, was most of what `kernels` and `inlined` measured.
+
+What is still interpreted: **field access on an object that escapes**, virtual calls
+through an open hierarchy, and calls to methods other than the caller itself.
+**A field's slot is cached per field, not per receiver type** — base-first layout
+makes it the same in every subclass, so `ldfld`/`stfld` no longer read the object's
+type through the heap's lock.
+
+**Compiled code reaches safe points.** A compiled method polls at every loop
+back-edge — for another thread's collection *and* for its own allocation pressure,
+since with one thread nothing else ever asks. The frame is described by byte offsets
+fixed at compile time, which works because the collector never moves an object, a
+`Handle` is `repr(transparent)` over `u64`, and the poll sits where the evaluation
+stack is empty. A back-edge reached with a non-empty stack gets no safe point and
+keeps the old rules. **Allocation inside a loop is therefore legal**, and each safe
+point releases what the frame can no longer reach, so a loop's memory is flat rather
+than proportional to its trip count — there is a test that fails if it is not.
+
+**A field of a heap object is reached by a helper call, never an inline load** —
+`Value` is a Rust enum with boxed payloads and no promised layout, so reading it
+from emitted code would fail as a wrong number rather than a crash. `int`, `long`,
+`double` and reference fields cross as one word; a struct field is refused, and
+the declared kind is *checked* so a reference cannot be stored as a number and go
+untraced. With that and safe points, `alloc` stopped being interpreted: 613 → 206 ms.
+
+**The inliner flattens more than one level** — a callee that is itself built from
+smaller callees is flattened before being spliced, which is how code is actually
+written. That took `inlined` from 477 ms to 83 ms by turning 400,031 transitions
+into compiled code into **one**. Depth and resulting size are both bounded.
+
+**One compiled method calls another** through a table of entry addresses the tier
+fills in before the caller runs — resolved in two passes, because an entry names
+the callee *and the callee's own table*, and two methods may call each other. That
+compiled `kernels` (350 → 142 ms), whose helpers loop and so can never be spliced.
+Compiled calls are bounded by **bytes of machine stack**, not a frame count, and
+the CLI reserves that stack rather than hoping the host provided it.
+
+**Every benchmark row is now compiled or native**, none slower than 2.0×.
 
 **Concurrency is real.** `Thread.Start` spawns an OS thread; `Task.Run` and
 `Parallel.*` run on a pool of one worker per core; `await` suspends and the completing
@@ -26,6 +94,12 @@ binding, 192,045 with a console-only subset, and each firmware picks from its he
 the Nucleo-F401RE's 96 KB clears neither, which it reports rather than faulting.
 
 CodeGen builds and runs. Not a git repository.
+
+**Debugger hooks exist, a debug adapter does not.** Breakpoints by (method, IL
+offset), step into/over/out, and a view of every frame while stopped —
+`rustnet debug` drives them. No DAP server, and no source-line breakpoints:
+both need a portable-PDB reader. The hook is `#[cold]` and never inlined
+because without that it cost 8% on the interpreter.
 
 `requirements.md` is the single source of truth for scope. Read it before starting any work —
 this file summarizes its binding decisions but does not replace it. `Plan.md` holds the
@@ -107,7 +181,7 @@ the C# side is one project built by path.
 ```bash
 # Runtime
 cargo build --release                      # produces target/release/rustnet
-cargo test --workspace                     # 192 tests; must stay green
+cargo test --workspace                     # 206 tests; must stay green
 bash tests/embedded.sh                     # 4 crates x 4 bare-metal targets; must stay green
 bash tests/firmware.sh                     # seven board firmwares; must stay green
 cargo test -p rustclr-core                 # one crate
@@ -129,7 +203,7 @@ Before claiming a runtime change works, run a real assembly through both runtime
 
 ```bash
 cd tests/fixtures/Conformance && dotnet build -c Release
-dotnet bin/Release/net10.0/Conformance.dll                    # expect: checks=308 failures=0
+dotnet bin/Release/net10.0/Conformance.dll                    # expect: checks=345 failures=0
 ../../../target/debug/rustnet.exe run bin/Release/net10.0/Conformance.dll
 ```
 

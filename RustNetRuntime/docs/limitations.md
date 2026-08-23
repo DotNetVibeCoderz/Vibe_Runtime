@@ -311,13 +311,27 @@ locals are then in a state nothing has reasoned about.
 
 ## What the native code generator takes
 
-**What happens:** most methods are still interpreted. The x86-64 backend
-compiles a method only when it makes no calls, allocates nothing, has no
-exception handling, and works entirely in integers — arguments, locals, results
-and every intermediate value.
+**What happens:** the x86-64 backend takes a good deal now — `int` and `double`
+arithmetic, `int[]`/`double[]`/`bool[]` element access, allocation of both
+arrays and objects, field access, guarded devirtualisation, recursion, and
+calls between compiled methods. Every benchmark row in this repository compiles
+or is native.
 
-That is narrow on purpose: a partial backend that is honest about its reach is
-useful immediately, and everything it declines runs exactly as it did before.
+**What it still declines**, and each for a stated reason rather than because
+nobody got to it:
+
+| | |
+| --- | --- |
+| Exception handling | a compiled frame cannot be unwound by the interpreter |
+| Instance methods | the calling convention carries no receiver |
+| `float[]` | four-byte elements would widen on every load and round on every store |
+| `rem` on doubles | IEEE remainder, with no single x86 instruction since SSE replaced x87's `fprem` |
+| A virtual call through an open hierarchy | another assembly could add an override — see the devirtualisation section |
+| A field of a type it cannot lay out | a struct field has no one-word representation |
+
+Everything declined runs exactly as it did before, which is what makes a partial
+backend useful rather than dangerous. `rustnet jit <assembly>` prints the
+decision for every method, with the reason.
 
 ```bash
 rustnet jit <assembly>       # what compiles, and why the rest does not
@@ -325,13 +339,23 @@ rustnet run --no-jit …       # interpret everything; output must be identical
 rustnet run --no-inline …    # compile, but splice nothing; output must match too
 ```
 
-**What it is worth where it applies.** Three benchmarks measure it:
+**What it is worth**, measured by running the same workload with `--no-jit` so
+the comparison is the same code either way:
 
 | Workload | interpreted | compiled | speedup |
 | --- | ---: | ---: | ---: |
 | `arrays` — an `int[]` passed in and walked | 18,401 ms | 205 ms | **89.8×** |
+| `fields` — 3M reads and writes of an object's fields | 3,123 ms | 120 ms | **26.0×** |
+| `virtual` — 2M calls through a base reference | 1,923 ms | 96 ms | **20.0×** |
+| `alloc` — 300k allocations with collection pressure | 1,093 ms | 206 ms | **5.3×** |
 | `kernels` — arithmetic written out longhand | 2,971 ms | 269 ms | **11.0×** |
 | `inlined` — the same arithmetic via helpers | 1,629 ms | 400 ms | **4.1×** |
+
+Several of these understate the gap rather than flattering it: the compiled
+column is close to the process-start floor, so nearly all of what remains is
+starting up rather than the loop. Each pair was measured in one session; they
+are not all from the same run as the table in
+[benchmarks.md](benchmarks.md), and should not be read against it.
 
 `arrays` is the largest because the interpreter pays most for element access:
 a handle resolution and a `Value` per element, against a bounds check and a
@@ -340,11 +364,163 @@ The `inlined` benchmark is the same arithmetic factored into small helpers:
 1629 ms interpreted, 400 ms compiled, **4.1×** — of which **2.9× is the inliner
 alone**, since with `--no-inline` the same run takes 1148 ms.
 
-**Arrays compile, on one condition: they must arrive as a parameter.** An
-`int[]` argument is handed to compiled code as a two-word descriptor — a data
-pointer and a length — so `a[i]` becomes a bounds check and a scaled-index load
-rather than a handle lookup. The `arrays` benchmark runs **89.8× faster**
-compiled than interpreted, the largest gap in the suite.
+**Arrays compile**, as a parameter or as a local. An `int[]`, `double[]` or
+`bool[]` is handed to compiled code as a two-word descriptor — a data pointer
+and a length — so `a[i]` becomes a bounds check and a scaled-index load rather
+than a handle lookup. The `arrays` benchmark runs **89.8× faster** compiled than
+interpreted, the largest gap in the suite.
+
+**One compiled method can call another.** The call is indirect, through a table
+of entry addresses the runtime fills in before the caller first runs. It has to
+be: a callee's address does not exist when its caller is compiled, and two
+methods may call each other, so there is no order in which direct addresses
+could be baked in.
+
+Each table entry names two things — the callee's entry *and the callee's own
+table* — because a callee reads its table out of the argument array its caller
+builds. Getting that wrong is not a wrong answer, it is a jump through whatever
+the stack happened to hold, and it was wrong twice: once by not writing the
+slot at all, and once by filling tables in a way that moved them after another
+table had recorded their address. Both now have tests that crash without the
+fix.
+
+Compiled calls run on the **machine stack**, which cannot be grown or unwound
+the way the interpreter's frame budget can. So the runtime counts the *bytes*
+those frames occupy and refuses past a budget rather than overrunning. Bytes
+rather than frames is the correction that mattered: frames differ in size, so
+any frame count is simultaneously too generous for a large frame and too mean
+for a small one, and the count that was there before turned into a segfault the
+moment frames grew.
+
+Because managed recursion needs machine stack, the runtime reserves a large one
+for managed code rather than hoping the host provided it — a megabyte, the
+Windows default, is less than the interpreter's own 4096-frame budget needs, and
+a program that ran interpreted must not fail compiled. An embedder calling the
+interpreter directly is responsible for the same thing.
+
+What is still refused: an **instance** method as the callee, which this
+convention does not carry a receiver for, and any callee the backend would not
+compile — settled by shape when the caller is compiled, since compiling the
+callee to find out would not terminate when two methods call each other.
+
+**A field of a heap object is reached by a helper call.** This is the one place
+the design was decided by what could go *wrong* rather than by what would be
+fast. Compiling `ldfld` the obvious way means emitting machine code that reads a
+`Value` out of a `Vec<Value>`, which requires knowing that enum's discriminant
+and payload offsets. Rust promises neither without `repr`, the enum has boxed
+variants, and the failure would be a **wrong number on a toolchain upgrade with
+no source change** — the worst failure profile in the whole runtime. It was
+refused three times on those grounds.
+
+A call has none of that. The helper does the reading in Rust, and compiled code
+sees one 64-bit word: an integer, a double's bit pattern, or a handle. `int`,
+`long`, `double` and reference fields cross; a struct field has no one-word
+representation and is refused.
+
+The declared kind is **checked**, not merely used to convert, and that is worth
+stating because it was wrong first. An early version accepted an integer for any
+kind, which meant a reference stored as a number round-tripped perfectly through
+compiled code — and was invisible to the collector, which traces a reference and
+not an integer, so the chain under it would be swept while compiled code still
+walked it. A mutation test caught it: the helper now refuses a shape that does
+not match what the field was declared to hold.
+
+Two smaller things fall out. An object allocated by compiled code gets its
+fields' **typed zeros** rather than `Value::Null`, because a field declared
+`int` must not read back as a null. And its field count is the **flattened**
+one, base included, or a subclass instance would be allocated too small for the
+slots its own code addresses.
+
+**Compiled code reaches safe points, and may therefore allocate in a loop.**
+This was the last structural restriction on the code generator, and it was
+there for a real reason: compiled code had no place where it could be stopped,
+so a collection could not run while it executed, so a loop that allocated could
+exhaust the heap where the interpreter would not.
+
+A compiled method now polls at every loop back-edge. Two things can ask it to
+stop, and both are needed: another thread waiting to collect — without which a
+long compiled loop would hold up a collection indefinitely — and this call's own
+allocation pressure, which with a single thread is the only thing that will ever
+ask.
+
+What makes the frame describable at that point is a deliberate narrowing. The
+poll goes where the **evaluation stack is empty**, which is where Roslyn puts
+its back-edges, so the only slots holding anything are locals and arguments and
+their kinds are known from declared types — no inference over the instruction
+stream, and no way for that inference to be subtly wrong. A back-edge reached
+with something still on the stack gets no safe point at all, and such a method
+keeps the old rule.
+
+Two other things fall out of the design. A `Handle` is `repr(transparent)` over
+`u64` and this collector never moves an object, so a safe point only has to
+*describe* the frame, never rewrite it. And because a reference or array slot
+must be readable from the frame, those slots are excluded from the register
+pinning that speeds up integer loops — what the collector cannot see, it
+reclaims.
+
+The property worth stating plainly, because the first attempt at this got it
+wrong: **a compiled loop's memory does not grow with its trip count.** An
+earlier version kept every allocation pinned for the length of the call, which
+passed every correctness test and was strictly worse than refusing to compile —
+a million iterations meant a million live arrays. Each safe point now releases
+what the frame can no longer reach. There is a test that runs the same loop ten
+times longer and fails if the peak heap follows.
+
+**A constructor that provably does nothing is not called at all.** A class
+declaring no constructor still gets one from the C# compiler: load `this`, call
+`object`'s constructor, return. Running it costs two managed frames and a native
+call to reach an empty body, and the fields it would leave untouched are already
+at the zero the allocator gave them. Where the whole chain up to
+`System.Object` does nothing, the interpreter allocates and pushes the instance
+without entering a frame.
+
+The chain is what decides, not the leaf: an empty constructor over a base that
+assigns a field is *not* elided, and neither is one whose class has a field
+initialiser, because that compiles into the constructor. The class constructor
+still runs — eliding an instance constructor must never elide a static one.
+`Loader::constructor_does_nothing` is the single rule, shared with scalar
+replacement and with compiled `newobj`, which need the same assurance for the
+same reason.
+
+**A virtual call is compiled only when every answer it can give is known.**
+Class-hierarchy analysis over the loaded types is normally a guess in this
+runtime — `Assembly.Load` can bring in a subtype later — so it is trusted only
+where that is impossible: where the declaring type is not visible outside its
+own assembly and therefore cannot be derived from outside it. A `private`
+nested class qualifies; a `public` one is refused even when it otherwise looks
+ideal, and the test suite contains exactly such a type for the purpose of
+watching it be turned down. Each override must additionally fold to a constant,
+because emitting anything else would need a general calling convention between
+compiled methods, which does not exist.
+
+Where all that holds, the call becomes a helper call for the receiver's runtime
+type and a chain of compares. No object memory is read, so no heap layout is
+assumed; the only thing compiled code holds is a handle, an opaque 64-bit token
+it cannot dereference. A null receiver throws `NullReferenceException` as it
+should, and a receiver matching no guard **traps** — there is no on-stack
+replacement, so a body that has already allocated cannot re-run interpreted,
+and a hierarchy proof that turned out to be wrong has to report itself rather
+than return a number nobody can account for.
+
+That is a narrow capability, described narrowly on purpose. It is not "the
+backend compiles virtual calls".
+
+**Objects that never escape stop existing.** Compiled code does not read fields
+out of a heap object, and deliberately never will: fields live in a `Vec<Value>`
+and `Value` is a Rust enum with boxed payloads whose layout the language does
+not promise, so emitting code that reads it would make that layout part of this
+backend's ABI — and the failure mode would be a wrong number, not a crash.
+Instead, when an object provably never leaves the method that made it, each
+field becomes an ordinary local and `ldfld`/`stfld` become `ldloc`/`stloc`.
+
+The proof is deliberately narrow, because being wrong about it is silent. The
+object must be created by a `newobj` outside any loop, have a constructor that
+does nothing but chain to `System.Object`'s, derive directly from `Object` with
+only scalar fields, live in exactly one local, and be used *only* as the target
+of `ldfld`, `stfld`, or a `dup` feeding one. Passing it to a method, returning
+it, boxing it, locking on it or taking a field's address all disqualify it, and
+anything the analysis cannot follow is refused rather than guessed at. An
+object that escapes is reached through the field helper below instead.
 
 That works because of an invariant worth naming: the backend declines any method
 that allocates, so no collection can run while compiled code executes, and this
@@ -369,13 +545,24 @@ and object field access. `double[]` is not taken either: only `int[]`, because a
 wider set means more element widths in the emitter for no more coverage of the
 loops that matter.
 
-**Inlining is one level deep and branch-free.** A `call` no longer disqualifies
-a method: a small static callee is spliced into its caller, which is often the
-difference between a real method compiling and being declined. But the callee
-must contain no branches at all — a helper with an `if` in it is not inlined —
-and the splice is not applied recursively, so a helper that itself calls another
-helper is left alone. Instance methods are never inlined. `--no-inline` turns
-the whole thing off, and the output must be identical either way.
+**Inlining is branch-free, and reaches through several levels of call.** A
+`call` no longer disqualifies a method: a small static callee is spliced into
+its caller, which is often the difference between a real method compiling and
+being declined. A callee that is *itself* built from smaller callees is
+flattened before it is spliced, up to three levels deep.
+
+That last part is not a refinement, it is the difference between the optimisation
+working and not. One level handles a caller whose callees are leaves; code is
+written with a helper built out of smaller helpers, and against that shape a
+one-level inliner leaves the caller entirely interpreted. The `inlined`
+benchmark was 3.6× .NET for exactly that reason and is 0.7× now.
+
+What is still refused: a callee containing **any branch** — a helper with an
+`if` in it is not spliced — and any instance method. Both the depth and the
+size of the result are bounded, so a method cannot quietly compile to something
+enormous; past the budget the splicing is abandoned and the method is compiled,
+or declined, as written. `--no-inline` turns the whole thing off, and the output
+must be identical either way.
 
 **The AArch64 and RISC-V backends emit code that has never been executed.**
 Both encode the same IL the x86-64 backend does, through the same shared
@@ -431,18 +618,31 @@ program sees it.
 
 Three facts make it sound, and it needs all three:
 
-* **`Heap::alloc` does not collect.** It allocates and records pressure; the
-  *interpreter* collects between instructions, and compiled code has no
-  between-instructions. So allocating from compiled code cannot itself trigger
-  a collection, and the existing argument for raw array pointers — that nothing
-  collects during the call — still holds.
+* **`Heap::alloc` does not collect.** It allocates and records pressure. A
+  collection happens where the runtime asks for one — between two interpreted
+  instructions, or at a compiled method's loop back-edge — never underneath an
+  allocation. So an allocation can never pull the ground out from under the
+  code that requested it.
 * **A compiled method cannot return a reference.** Its return type must be an
-  integer or a float, so every array it allocates is unreachable the moment the
-  call ends. Nothing needs rooting and nothing is handed back.
-* **Allocation is bounded.** A `newarr` *inside a loop* is declined, because
-  compiled code never collects and an unbounded loop would exhaust the heap
-  where the interpreter would not. A program that runs interpreted and fails
-  compiled is the one difference this runtime will not accept.
+  integer or a float, so every object it allocates is unreachable the moment
+  the call ends and nothing has to be handed back.
+* **Allocation is bounded, but by pruning rather than by refusal.** A `newarr`
+  inside a loop used to be declined outright, because compiled code never
+  collected and an unbounded loop would exhaust a heap the interpreter would
+  not. It is allowed where the method reaches a safe point: each poll releases
+  the allocations the frame can no longer reach, so memory tracks what is
+  *live* rather than what has been allocated. A method that cannot poll — a
+  back-edge with a non-empty evaluation stack — is still declined on the old
+  rule.
+* **A raw pointer into array storage stays valid.** It used to rest on "nothing
+  collects during a call", which is no longer true. It now rests on two things
+  that are: this collector never moves an object, and any array the frame can
+  still reach is named by the safe point's frame map and therefore rooted.
+
+A program that runs interpreted and fails compiled is the one difference this
+runtime will not accept, so the bound is measured rather than argued: a test
+runs the same compiled loop at ten times the trip count and fails if the peak
+heap follows it.
 
 When the heap genuinely cannot satisfy a request, compiled code takes the same
 trap path a failed bounds check takes and the tier raises the exception.
@@ -842,13 +1042,46 @@ front, a heap that quietly grows has not been bounded at all.
 
 | | |
 | --- | --- |
-| IL execution | `rustclr-core` needs a hash map, a clock and a way to read an assembly |
-| Ahead-of-time compilation | Needs Arm and RISC-V code generators; only x86-64 exists |
-| The Pico and K210 | Their images build; neither has been flashed |
+| Ahead-of-time compilation | Needs Arm and RISC-V code generators that *execute*; only x86-64 does |
+| The Pico, Netduino, Nucleo-F401RE and K210 | Their images build; none has been flashed, because no board was connected |
 
-That first row is the honest boundary: the chip can *read* a .NET assembly and
-manage a heap, but it cannot execute a method. This is
-[Milestone 6](../Plan.md).
+This table used to have a first row saying IL execution did not run on hardware
+at all — that the chip could read an assembly and manage a heap but not execute
+a method. That stopped being true when the ESP32-C3 and the M5Stack Tough ran
+`HelloWorld.Main` with the whole of RustBCL. A limitations page that understates
+a runtime misleads exactly as much as one that overstates it, so the row is
+gone rather than softened. This is [Milestone 6](../Plan.md).
+
+---
+
+## Debugging
+
+**The hooks exist; the adapter does not.** The runtime can stop before a chosen
+instruction, step into, over and out of calls, and hand a debugger every frame's
+arguments, locals and evaluation stack while the program is stopped. A debugger
+may also set breakpoints *while* stopped, and they take effect on the same run.
+`rustnet debug` drives all of it.
+
+What is missing is everything between that and an editor:
+
+| | |
+| --- | --- |
+| A Debug Adapter Protocol server | VSCode and Rider both speak DAP; nothing here does |
+| Source-line breakpoints | needs a portable-PDB reader to map a line to an IL offset |
+| Variable *names* | locals are shown by index, because names live in the PDB too |
+
+Breakpoints are therefore `Method:offset`, and the CLI refuses an ambiguous
+method name rather than choosing one. The PDB is the common blocker for the last
+two rows: it is a portable PDB, which is the same `BSJB` metadata format the
+assembly reader already parses, but the debug tables (`Document`,
+`MethodDebugInformation`, and the rest) are not in the schema yet.
+
+**The hook costs nothing when nothing is attached.** That is measured rather
+than assumed: interleaved best-of-eleven against a build with the hook removed
+puts it within noise. It only holds because the poll is marked cold and never
+inlined — without those, the same measurement showed **8%** on the most
+instruction-dense interpreted workload, because the branch and its registers
+were being hoisted into the hot loop.
 
 ---
 

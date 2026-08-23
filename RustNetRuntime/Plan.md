@@ -102,16 +102,21 @@ Still open, and the reason this milestone is not the end of the story:
 
 ## Milestone 4 — Native code generation ◐
 
-Every listed item is built. It stays marked partial for one reason, stated
-plainly: two of the three backends have never executed a single instruction.
+Every listed item is built except the last row. It stays marked partial for two
+reasons, stated plainly: two of the three backends have never executed a single
+instruction, and the x86-64 one still declines exception handling and instance
+methods.
 
 | | |
 | --- | --- |
-| x86-64 emitter for integer methods | ✅ executed, and differentially tested |
+| x86-64 emitter | ✅ `int` and `double` arithmetic, `int[]`/`double[]`/`bool[]`, allocation, objects, fields, devirtualisation, recursion, calls |
 | W^X code pages | ✅ mapped RW, filled, then flipped to RX — never both |
-| Tiering: interpret, then compile on call count | ✅ default 32 calls |
+| Tiering: interpret, then compile on call count | ✅ 32 calls, or the first call when the body loops |
+| Safe points in compiled code | ✅ polled at every loop back-edge, frames described by a walkable chain |
+| Calls between compiled methods | ✅ indirect through a table the tier fills; mutual recursion works |
 | AArch64, then RISC-V | ◐ **emit only** — encoded and disassembly-checked, never run |
-| Inlining, using `is_inline_candidate` | ✅ branch-free static callees, one level deep |
+| Inlining, using `is_inline_candidate` | ✅ branch-free static callees, flattened up to three levels |
+| Exception handling, instance methods | ❌ still declined |
 
 **Why the backends are shared.** The IL walk lives in `translate.rs` behind a
 `Backend` trait; only the encoding differs per architecture. So the x86-64
@@ -298,8 +303,8 @@ is exactly what reading an assembly out of flash requires.
 | --- | --- |
 | Evaluate `catch when` filters during the unwind | ✅ five conformance checks, byte-identical to `dotnet` |
 | `calli` | ✅ indirect calls through a function pointer |
-| `localloc`, `cpblk`, `initblk` | ❌ **blocked on the value model**, see below |
-| `arglist` | ❌ varargs; `__arglist` is vanishingly rare in C# |
+| `localloc`, `cpblk`, `initblk` | ✅ `Value` gained a raw-pointer kind — see below |
+| `arglist`, `mkrefany`, `refanyval`, `refanytype`, `jmp` | ❌ refused by name, not silently mishandled |
 | Multi-dimensional arrays with non-zero lower bounds | ❌ |
 
 **`calli` was short because of a decision made much earlier.** A function
@@ -311,15 +316,25 @@ an element of a `delegate*<…>[]` is an `IntPtr` slot, and a method identity do
 not fit in one. The runtime says exactly that rather than calling the wrong
 thing.
 
-**The three that are left need a value model this runtime does not have.**
-`localloc`, `cpblk` and `initblk` all address *byte ranges*: fill `n` bytes from
-here, copy `n` bytes from there. A `ByRef` here is structural — `Local`,
+**Three of these needed a value model this runtime did not have, and now
+does.** `localloc`, `cpblk` and `initblk` all address *byte ranges*: fill `n`
+bytes from here, copy `n` bytes from there. A `ByRef` is structural — `Local`,
 `Field`, `ArrayElement`, `StructField` — a path to a slot rather than an
-address, which is what makes stale pointers impossible and makes the collector's
-job tractable. Byte-range operations have no meaning against a path. Supporting
-them means adding a raw-pointer kind to `Value` and arithmetic over it, which is
-a change to the foundation every other part of the runtime stands on, not an
-addition beside them. It is deliberately not being done incrementally.
+address, which is what makes stale pointers impossible and the collector's job
+tractable, and byte-range operations have no meaning against a path.
+
+What unblocked them was adding a raw-pointer kind to `Value` that is *still not
+an address*: a buffer handle plus a byte offset. Arithmetic moves the offset,
+the handle keeps the buffer reachable, and nothing can dangle. That was a change
+to the foundation rather than an addition beside it, which is why it was not
+done incrementally — and why the property that made the original design worth
+having survived it.
+
+**The five that remain are refused by name.** `arglist`, `mkrefany`,
+`refanyval`, `refanytype` and `jmp` each return "not implemented by this
+runtime" rather than doing something plausible. `__arglist` and the typed-
+reference family are vanishingly rare in C#; `jmp` has no C# source form at
+all.
 
 **Filters run in their own frame.** The obstacle was never the matching rule —
 it was that a filter is managed code executing *during* the unwind, before the

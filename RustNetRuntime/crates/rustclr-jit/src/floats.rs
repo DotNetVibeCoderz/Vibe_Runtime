@@ -95,7 +95,7 @@ pub fn infer(
             }
         }
 
-        let mut pop = |n: usize, stack: &mut Vec<Kind>| -> Option<Vec<Kind>> {
+        let pop = |n: usize, stack: &mut Vec<Kind>| -> Option<Vec<Kind>> {
             if stack.len() < n {
                 return None;
             }

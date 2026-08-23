@@ -62,10 +62,45 @@ pub struct Inlined {
 ///
 /// Returns `None` when nothing was inlined, so a caller can keep the original
 /// stream rather than paying for a copy.
+/// How many times a *callee* may itself be flattened before it is spliced.
+///
+/// Zero is the original inliner: a caller whose callees are leaves. That is not
+/// how code is written — a helper is built out of smaller helpers — and with
+/// zero the caller of such a helper stays interpreted, which is what made the
+/// `inlined` benchmark 3.6× .NET. Three is enough for the ordinary shapes and
+/// bounds the recursion for a method that calls itself; the size budgets below
+/// stop it paying for depth with code.
+const MAX_INLINE_DEPTH: u32 = 3;
+
+/// Instructions a *flattened* callee may reach before it is refused.
+///
+/// A leaf keeps the tighter `is_inline_candidate` budget it always had. This
+/// is the allowance for a callee that had to have its own calls spliced in
+/// first, which legitimately produces a longer body — trading size for the
+/// call, which is the whole point — but not without limit.
+const MAX_FLATTENED_INSTRUCTIONS: usize = 96;
+
+/// Instructions a caller may reach once everything has been spliced into it.
+///
+/// Each individual splice is bounded above, but a caller with many call sites
+/// multiplies that bound. This is the ceiling on the result, so a method cannot
+/// quietly compile to something enormous: past it the splicing is abandoned and
+/// the method is compiled — or declined — as it was written.
+const MAX_INLINED_CALLER_INSTRUCTIONS: usize = 4096;
+
 pub fn inline_calls(
     loader: &Loader,
     caller: MethodId,
     instructions: &[Instruction],
+) -> Option<Inlined> {
+    inline_within(loader, caller, instructions, MAX_INLINE_DEPTH)
+}
+
+fn inline_within(
+    loader: &Loader,
+    caller: MethodId,
+    instructions: &[Instruction],
+    fuel: u32,
 ) -> Option<Inlined> {
     let info = loader.registry.method(caller);
     let MethodKind::Il(body) = &info.kind else { return None };
@@ -85,7 +120,7 @@ pub fn inline_calls(
             ins.operand
                 .as_token()
                 .and_then(|t| loader.resolve_method_token(assembly, t))
-                .and_then(|target| candidate(loader, target))
+                .and_then(|target| candidate_within(loader, target, fuel))
         } else {
             None
         };
@@ -138,7 +173,7 @@ pub fn inline_calls(
         sites += 1;
     }
 
-    if sites == 0 {
+    if sites == 0 || out.len() > MAX_INLINED_CALLER_INSTRUCTIONS {
         return None;
     }
 
@@ -200,7 +235,7 @@ struct Candidate {
 }
 
 /// Whether a method can be inlined here, and its decoded body if so.
-fn candidate(loader: &Loader, method: MethodId) -> Option<Candidate> {
+fn candidate_within(loader: &Loader, method: MethodId, fuel: u32) -> Option<Candidate> {
     let info = loader.registry.method(method);
     let MethodKind::Il(body) = &info.kind else { return None };
 
@@ -209,11 +244,32 @@ fn candidate(loader: &Loader, method: MethodId) -> Option<Candidate> {
     if info.signature.has_this || !body.exception_clauses.is_empty() {
         return None;
     }
-    if !crate::translate::shape_is_compilable_with(&loader.registry, method, true) {
+    // Signature and locals only. The opcode check comes *after* flattening,
+    // because a callee that contains a call is exactly the case worth
+    // flattening and the stricter screen would turn it away first.
+    if !crate::translate::shape_might_compile_after_inlining(&loader.registry, method) {
         return None;
     }
 
-    let instructions = decode_all(&body.il).ok()?;
+    let mut instructions = decode_all(&body.il).ok()?;
+    let mut locals = body.locals.len();
+
+    // A callee built out of smaller callees is flattened before it is judged.
+    // Without this the inliner is one level deep, and a helper that calls two
+    // other helpers — the ordinary way arithmetic gets factored — leaves its
+    // caller interpreted.
+    let has_calls = instructions.iter().any(|i| i.op == Op::Call);
+    if has_calls {
+        if fuel == 0 {
+            return None;
+        }
+        let flattened = inline_within(loader, method, &instructions, fuel - 1)?;
+        if flattened.instructions.len() > MAX_FLATTENED_INSTRUCTIONS {
+            return None;
+        }
+        locals += flattened.extra_locals.len();
+        instructions = flattened.instructions;
+    }
 
     // Small, loop-free and exception-free. Measured, not assumed: the branch
     // check below would catch a loop anyway, but a fabricated analysis would
@@ -221,12 +277,22 @@ fn candidate(loader: &Loader, method: MethodId) -> Option<Candidate> {
     let returns_value = !info.returns_void();
     let analysis = crate::verify::analyse(
         &instructions,
-        body.max_stack,
+        // Splicing can only deepen the stack, so the declared figure is a
+        // floor rather than a limit once a body has been flattened.
+        body.max_stack.saturating_add(8),
         &body.exception_clauses,
         |ins| if ins.op == Op::Ret && returns_value { -1 } else { 0 },
     )
     .ok()?;
-    if !analysis.is_inline_candidate() {
+    // A leaf keeps the budget it always had. A flattened body was already
+    // bounded above, and its `il_size` describes the original stream rather
+    // than what came out of the splice, so it would be measuring the wrong
+    // thing here.
+    if has_calls {
+        if analysis.has_loops || analysis.has_exception_handling {
+            return None;
+        }
+    } else if !analysis.is_inline_candidate() {
         return None;
     }
 
@@ -248,7 +314,7 @@ fn candidate(loader: &Loader, method: MethodId) -> Option<Candidate> {
     Some(Candidate {
         body: instructions,
         arg_count: info.signature.params.len(),
-        locals: body.locals.len(),
+        locals,
     })
 }
 

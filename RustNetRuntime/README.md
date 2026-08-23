@@ -24,32 +24,47 @@ handling — produces identical output on both runtimes:
 
 ```console
 $ dotnet Conformance.dll
-checks=308 failures=0
+checks=345 failures=0
 
 $ rustnet run Conformance.dll --stats
-checks=308 failures=0
+checks=345 failures=0
 
 ─── execution ──────────────────────────────
-  wall clock                  10.505 ms
-  IL instructions              19,617
-  throughput                 1,867,343 instr/s
-  managed calls                 2,167
-  native calls                    103
-  peak frame depth                 16
+  wall clock                1367.141 ms
+  IL instructions             844563
+  throughput                  617759 instr/s
+  managed calls                89024
+  native calls                 47506
+  compiled calls                 169
+  methods compiled                19
+  code emitted                  6603 bytes
+  peak frame depth                32
 ─── heap ───────────────────────────────────
   collector               mark-sweep
-  allocations                     194
-  live bytes                   10,023
+  allocations                  46942
+  bytes allocated            3774119
+  collections                      0
+  live objects                 46942
+  peak live bytes            3774119
 ```
 
-The 38 checks cover arithmetic and overflow, `long` maths, control flow,
-strings, arrays, class inheritance, virtual and interface dispatch, properties,
-structs, enums, boxing and casting, `try`/`catch`/`finally`, nested handlers,
-divide-by-zero, delegates, and allocation under collection pressure. A second
-suite, `tests/fixtures/ModernSyntax/`, does the same for 35 modern C# features.
-Both are normal C# projects you can read and extend.
+Read the wall clock with one caveat: most of it is threads *sleeping*. The
+concurrency checks rendezvous and wait on real OS threads, so the throughput
+line divides all 844,563 instructions by time that was largely spent blocked,
+and understates the interpreter considerably. The counters either side of it —
+instructions, calls, allocations — are exact.
 
-`cargo test --workspace` runs 192 tests across the eight crates.
+The 345 checks cover arithmetic and overflow, `long` maths, control flow,
+strings, arrays, class inheritance, virtual and interface dispatch, properties,
+structs, enums, boxing and casting, `try`/`catch`/`finally`, exception filters,
+nested handlers, divide-by-zero, delegates, generics, LINQ, `async`/`await`,
+`Span<T>`, raw pointers and `stackalloc`, reflection over real `System.Type`
+objects, real threads with `lock`, `Interlocked` and `Monitor.Wait`/`Pulse`, and
+allocation under collection pressure. A second suite,
+`tests/fixtures/ModernSyntax/`, does the same for 35 modern C# features. Both
+are normal C# projects you can read and extend.
+
+`cargo test --workspace` runs 206 tests across the eight crates.
 
 ---
 
@@ -119,31 +134,43 @@ speed.
 
 | Workload | .NET | RustCLR | Ratio |
 | --- | ---: | ---: | ---: |
-| Process start | 108 ms | **62 ms** | **0.6x** |
-| Exceptions (50k throws) | 130 ms | **111 ms** | **0.9x** |
-| Integer kernels — *compiled* | 149 ms | **268 ms** | **1.8x** |
-| Strings (20k concats) | 96 ms | **190 ms** | **2.0x** |
-| The same kernels via helpers — *compiled, inlined* | 106 ms | **310 ms** | **2.9x** |
-| Recursion (fib 27) | 108 ms | 442 ms | 4.1x |
-| Allocation (300k objects) | 112 ms | 1,014 ms | 9.1x |
-| Sieve (1M) | 107 ms | 1,287 ms | 12.0x |
-| Matrix multiply (120 squared) | 110 ms | 1,470 ms | 13.4x |
-| Virtual calls (2M) | 115 ms | 1,788 ms | 15.5x |
-| Quicksort (200k) | 122 ms | 2,460 ms | 20.2x |
-| Field access (3M) | 111 ms | 2,943 ms | 26.5x |
+| Recursion (fib 27) — *compiled* | 111 ms | **77 ms** | **0.7x** |
+| Field access (3M) — *compiled, scalarised* | 124 ms | **95 ms** | **0.8x** |
+| Process start | 84 ms | **73 ms** | **0.9x** |
+| Sieve (1M) — *compiled* | 93 ms | **85 ms** | **0.9x** |
+| Matrix multiply (120 squared) — *compiled* | 105 ms | **92 ms** | **0.9x** |
+| Quicksort (200k) — *compiled, recursive* | 123 ms | **109 ms** | **0.9x** |
+| Arithmetic via helpers — *compiled, inlined* | 111 ms | **97 ms** | **0.9x** |
+| Virtual calls (2M) — *compiled, devirtualised* | 118 ms | 129 ms | 1.1x |
+| Exceptions (50k throws) | 144 ms | 159 ms | 1.1x |
+| Integer kernels — *compiled, calling compiled helpers* | 96 ms | 142 ms | 1.5x |
+| Allocation (300k objects) — *compiled* | 117 ms | 199 ms | 1.7x |
+| Array walk — *compiled* | 135 ms | 244 ms | 1.8x |
+| Strings (20k concats) | 102 ms | 203 ms | 2.0x |
 
-Subtract the process-start row before drawing conclusions: it is most of .NET's
-figure on the shorter workloads, so the *compute* ratio is worse than the wall
-clock suggests, closer to 100x on the tightest loops. That is the cost of
-interpreting rather than compiling, and it is what [Milestone 4](Plan.md) is for.
+Read the top of that table carefully rather than triumphantly. Process start is
+**73 ms**, and every row down to quicksort lands within about 35 ms of that
+floor — so
+much of what they measure is starting the process, not computing. The honest
+comparison is against their own history:
 
-Several rows go the other way, for three different reasons. **RustCLR starts in
-little over half the time** (no JIT, no warm-up), which matters for short-lived
-CLI tools and for microcontrollers with no room for a code cache. **Exceptions
-and strings stay close** because that work happens in native Rust inside
-RustBCL, not in interpreted IL. And the two **kernel rows are compiled to
-machine code** rather than interpreted at all — the second of them only because
-the inliner splices its helpers in first.
+| Row | was | now | what changed |
+| --- | ---: | ---: | --- |
+| Sieve, matrix | ~1,500 ms | 85–92 ms | tiering compiles a method whose body loops |
+| Field access | 3,173 ms | 95 ms | non-escaping objects replaced by their fields |
+| Virtual calls | 1,923 ms | 129 ms | guarded devirtualisation |
+| Allocation | 1,093 ms | 199 ms | safe points, then compiled field access |
+| Arithmetic via helpers | 477 ms | 97 ms | the inliner learned to flatten more than one level |
+| Integer kernels | 350 ms | 142 ms | one compiled method may call another |
+
+**Every row is now compiled or native**, and none is slower than 2.0×. The last
+to move was `kernels`, which factors its work into helpers that *loop* — so they
+cannot be spliced at any inlining depth, and the only way to compile the loop
+around them was to give compiled code a calling convention of its own.
+`sort` came with it, since `Sort` calls `QuickSort`.
+
+**Exceptions and strings stay close** to .NET because that work happens in
+native Rust inside RustBCL, never in interpreted IL.
 
 Every row's checksum is compared between the runtimes before it is timed; a
 mismatch prints `MISMATCH` instead of a number.
@@ -313,26 +340,114 @@ properties. `typeof(T)` on an *erased* generic parameter throws rather than
 answering `System.Object`.
 
 **Some methods are compiled to machine code.** `rustclr-jit` emits x86-64 into
-write-xor-execute pages for methods doing integer arithmetic, after 32 calls
-have shown them to be worth compiling. On the `kernels` benchmark that is
-**11.0× faster** than interpreting — 269 ms against 2,971 ms, which is 1.8× .NET
-rather than 20×.
+write-xor-execute pages for methods doing `int` *and* `double` arithmetic. IL's
+`add` is the same opcode for both, so a typing pass infers which is meant from
+the values that reach it, and **declines the method when it cannot follow the
+stream** rather than guessing — a wrong guess would return a double's bit
+pattern as an integer, which is how that bug was actually found. On the
+`kernels` benchmark compiling is **11.0× faster** than interpreting — 269 ms
+against 2,971 ms, which moved it from 20× .NET to within half again.
 
-**Small callees are inlined**, so a `call` no longer disqualifies a method. The
-`inlined` benchmark is the same arithmetic as `kernels` but factored into
-helpers, the way real code is written: 1,629 ms interpreted, 400 ms compiled,
-of which **2.9× is the inliner alone** — with `--no-inline` the same run takes
-1,148 ms because the method around the helpers stays interpreted. Only
-branch-free static callees are spliced, one level deep.
+**A method whose body loops compiles on its first call**, instead of waiting for
+a call count that a single long-running call would never reach. Everything else
+still waits for 32 calls. That one change is what moved `sieve` and `matrix`
+from around 1,500 ms to under 100 ms.
 
-**Arrays compile too, on one condition: they must arrive as a parameter.** An
-`int[]` argument is handed to compiled code as a data pointer and a length, so
-`a[i]` becomes a bounds check and a scaled-index load rather than a handle
-lookup. The `arrays` benchmark runs **89.8× faster** compiled — 18,401 ms
-against 205 ms, the largest gap in the suite. An array created *inside* the
-method is still declined, because `new int[n]` allocates and "this method
-allocates nothing" is the invariant that makes holding a pointer into the heap
-sound for the length of a call.
+**Small callees are inlined, through more than one level.** A `call` no longer
+disqualifies a method, and neither does a callee that is not itself a leaf: a
+helper built out of smaller helpers is flattened before it is spliced. That
+matters because it is how code is actually written. The `inlined` benchmark is
+the same arithmetic as `kernels` but factored into helpers, and its driving loop
+calls a helper made of three others — with one level it could not compile at all
+and paid 400,031 transitions into compiled code; flattening first takes that to
+**one**, and the row from 477 ms to 83 ms. Only branch-free static callees are
+spliced, and both the depth and the resulting size are bounded.
+
+**Arrays compile too.** An `int[]`, `double[]` or `bool[]` — as a parameter or
+a local — is handed to compiled code as a data pointer and a length, so `a[i]`
+becomes a bounds check and a scaled-index load rather than a handle lookup. The
+`arrays` benchmark runs **89.8× faster** compiled — 18,401 ms against 205 ms,
+the largest gap in the suite.
+
+**Compiled code reaches safe points, and may therefore allocate in a loop.**
+This was the last structural restriction on the backend. Compiled code had
+nowhere it could be stopped, so a collection could not run while it executed,
+so a loop that allocated could exhaust the heap where the interpreter would
+not — and the rule was simply to refuse.
+
+A compiled method now polls at every loop back-edge, for another thread's
+collection *and* for its own allocation pressure, since with a single thread
+nothing else ever asks. The frame's live references are found by reading byte
+offsets fixed when the method was compiled: the poll sits where the evaluation
+stack is empty, so the only slots that matter are locals and arguments and
+their kinds come from declared types. Nothing is inferred from the instruction
+stream. A back-edge reached with a non-empty stack gets no safe point, and that
+method keeps the old rule.
+
+Each safe point also releases what the loop has finished with, so **a compiled
+loop's memory is flat rather than proportional to its trip count**. That is not
+a detail: the first version of this kept every allocation alive for the length
+of the call, which passed every correctness test and was strictly worse than
+refusing to compile. A test runs the same loop ten times longer and fails if
+the peak heap follows.
+
+**One compiled method calls another.** Recursion came first — the inliner
+cannot remove it, since splicing a method into itself does not terminate — and
+the general case followed. A call goes indirectly through a table of entry
+addresses the runtime fills in before the caller runs, because a callee's
+address does not exist when its caller is compiled and two methods may call each
+other. That is what compiled `kernels`, whose helpers contain loops and so can
+never be spliced at any inlining depth.
+
+Compiled calls run on the *machine* stack, so the runtime counts the **bytes**
+they occupy and refuses past a budget rather than crashing. Bytes rather than
+frames: frames differ in size, so any frame count is either too generous for a
+large one or too mean for a small one — and the count that was there before was
+quietly both. The runtime reserves a large stack for managed code rather than
+hoping the host provided one, because a program that ran interpreted must not
+fail compiled.
+
+**A virtual call whose every answer is known becomes a compare.** Class
+hierarchy analysis normally cannot prove anything here, because `Assembly.Load`
+can introduce a subtype later — so it is trusted only where that is impossible:
+when the declaring type is not visible outside its own assembly, and therefore
+cannot be derived from outside it. A `private` nested class is the usual case.
+Each override must also fold to a constant. Then the call becomes a lookup of
+the receiver's runtime type and a chain of compares, with no call at all, which
+took `virtual` from 1,923 ms to 103 ms.
+
+The receiver's type is fetched by a helper rather than read out of the object,
+so no part of the heap's layout is assumed — the only thing compiled code holds
+is a handle, an opaque 64-bit token it cannot dereference. A receiver matching
+no guard **traps**: there is no on-stack replacement here, so a body that has
+already allocated has no sound way back to the interpreter, and a hierarchy
+proof that turned out to be wrong must say so rather than return a number.
+
+**A field of a heap object is reached through a helper call, never an inline
+load.** The heap keeps values in a Rust enum with boxed payloads, whose layout
+the language does not promise — emitting machine code that read it would make
+that layout part of this backend's ABI and fail as a *wrong number* the day a
+compiler reordered the variants. A call costs more than a load and cannot be
+wrong in that way. `int`, `long`, `double` and reference fields cross; a struct
+field is refused.
+
+The declared kind is **checked**, not merely used to convert. A reference
+stored as a number would round-trip perfectly through compiled code and be
+invisible to the collector, which traces a reference and not an integer — so
+the chain under it would be swept while compiled code still walked it. That is
+a wrong answer arriving long after the mistake, so the helper refuses a shape
+that does not match what the field was declared to hold.
+
+**Objects that never escape stop existing.** Compiled code does not read fields
+out of a heap object, and deliberately never will — fields live in a
+`Vec<Value>`, and `Value` is a Rust enum whose layout the language does not
+promise, so emitting code that read it would make that layout part of the JIT's
+ABI and fail as a wrong number rather than a crash. Instead, when an object
+provably never leaves the method that made it, each field becomes an ordinary
+local: `ldfld` becomes `ldloc`. That is what took `fields` from 3,173 ms — the
+slowest row in the suite at the time — to 95 ms. The proof is narrow on purpose, and an
+object passed to a method, returned, boxed or locked on is refused rather than
+guessed at.
 
 The reach is still narrow and `rustnet jit <assembly>` says exactly how narrow:
 allocation, exception handling, floating point and object field access are all
@@ -362,17 +477,28 @@ The full matrix, with why each row lands where it does:
 [docs/advanced-features.md](docs/advanced-features.md).
 
 
-**Does not work yet.** Nothing runs concurrently: `async` tasks and `Thread`
-bodies both execute inline, so results are right but there is no parallelism.
-Generic type arguments are known for user types and methods — `typeof(T)`,
-`x is T`, `default(T)` and a static field per construction all behave correctly.
-Framework generics stay erased by choice: `List<int>` and `List<string>` are one
-runtime type, because every native binding is keyed by its declaring type's
-name. A class type parameter in a *static* method still refuses, having no
-receiver to ask. The native code generator takes integer methods and `int[]`
-parameters — 11.0× faster on arithmetic and 89.8× on an array walk — but it
-declines allocation, which includes creating an array inside the method, and
-that covers a great deal of a real program.
+**Does not work yet.** Framework generics stay erased by choice: `List<int>`
+and `List<string>` are one runtime type, because every native binding is keyed
+by its declaring type's name, and giving `List<int>` a name of its own would put
+``List`1::Add`` out of reach. User generics are not erased — `Cell<int>` and
+`Cell<string>` are two types with their own static slots. A call site naming the
+*open* definition still refuses: nothing there knows the argument, so the
+runtime says so rather than guessing.
+
+The native code generator is x86-64 only; **the AArch64 and RISC-V backends
+have never executed an instruction.** They encode the same IL through the same
+shared translation and are checked by disassembly, but no board has been
+connected, and an unexecuted backend that claims to work is worse than none.
+
+What the x86-64 backend still declines: **exception handling**, because a
+compiled frame cannot be unwound by the interpreter; **instance methods**,
+which the calling convention carries no receiver for; `float[]`; `rem` on
+doubles; and a virtual call through a hierarchy another assembly could extend.
+Nor is this on-stack replacement: a method already running cannot be swapped.
+
+`Monitor.Pulse` wakes every waiter rather than one. That is a weaker promise
+than .NET's, which a `Wait` written in the required re-check loop already
+tolerates — stated here rather than papered over.
 
 `rustnet capabilities` prints this list from the runtime itself, so it cannot
 drift from reality. Detail: [docs/limitations.md](docs/limitations.md).

@@ -28,6 +28,8 @@ pub enum Command {
     Info { assembly: String, verbose: bool },
     /// Report what the code generator can compile.
     Jit { assembly: String },
+    /// Run under the debugger hooks, tracing every stop.
+    Debug { assembly: String, breakpoints: Vec<(String, u32)>, step: bool },
     /// Disassemble methods to IL.
     Disasm {
         assembly: String,
@@ -142,6 +144,42 @@ pub fn parse(argv: &[String]) -> Result<Command, ParseError> {
                 .cloned()
                 .ok_or_else(|| ParseError("jit needs an assembly path".into()))?;
             Ok(Command::Jit { assembly })
+        }
+
+        "debug" => {
+            let mut breakpoints = Vec::new();
+            let mut assembly = None;
+            let step = argv.iter().any(|a| a == "--step");
+            let mut rest = argv[1..].iter().peekable();
+            while let Some(arg) = rest.next() {
+                match arg.as_str() {
+                    "--break" => {
+                        // `Method:offset` — a method name and an IL offset.
+                        // Source-line breakpoints need a portable PDB reader,
+                        // which does not exist yet, and inventing a syntax for
+                        // something that cannot be honoured would be worse
+                        // than not offering it.
+                        let spec = rest
+                            .next()
+                            .ok_or_else(|| ParseError("--break needs Method:offset".into()))?;
+                        let (name, offset) = spec.rsplit_once(':').ok_or_else(|| {
+                            ParseError(format!("`{spec}` is not Method:offset"))
+                        })?;
+                        let offset: u32 = offset.parse().map_err(|_| {
+                            ParseError(format!("`{offset}` is not an IL offset"))
+                        })?;
+                        breakpoints.push((name.to_string(), offset));
+                    }
+                    "--step" => {}
+                    other if !other.starts_with('-') && assembly.is_none() => {
+                        assembly = Some(other.to_string());
+                    }
+                    other => return Err(ParseError(format!("unknown option `{other}`"))),
+                }
+            }
+            let assembly =
+                assembly.ok_or_else(|| ParseError("debug needs an assembly path".into()))?;
+            Ok(Command::Debug { assembly, breakpoints, step })
         }
 
         "info" => {

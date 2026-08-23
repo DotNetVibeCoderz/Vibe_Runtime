@@ -54,6 +54,18 @@ pub enum TableId {
     GenericParam = 0x2A,
     MethodSpec = 0x2B,
     GenericParamConstraint = 0x2C,
+
+    // Portable PDB. These live in a *separate* `.pdb` file whose physical
+    // format is the same `BSJB` metadata an assembly uses, which is why they
+    // belong in this enum rather than in a reader of their own.
+    Document = 0x30,
+    MethodDebugInformation = 0x31,
+    LocalScope = 0x32,
+    LocalVariable = 0x33,
+    LocalConstant = 0x34,
+    ImportScope = 0x35,
+    StateMachineMethod = 0x36,
+    CustomDebugInformation = 0x37,
 }
 
 pub const TABLE_COUNT: usize = 64;
@@ -107,6 +119,14 @@ impl TableId {
             0x2A => GenericParam,
             0x2B => MethodSpec,
             0x2C => GenericParamConstraint,
+            0x30 => Document,
+            0x31 => MethodDebugInformation,
+            0x32 => LocalScope,
+            0x33 => LocalVariable,
+            0x34 => LocalConstant,
+            0x35 => ImportScope,
+            0x36 => StateMachineMethod,
+            0x37 => CustomDebugInformation,
             _ => return None,
         })
     }
@@ -159,6 +179,14 @@ impl TableId {
             GenericParam => "GenericParam",
             MethodSpec => "MethodSpec",
             GenericParamConstraint => "GenericParamConstraint",
+            Document => "Document",
+            MethodDebugInformation => "MethodDebugInformation",
+            LocalScope => "LocalScope",
+            LocalVariable => "LocalVariable",
+            LocalConstant => "LocalConstant",
+            ImportScope => "ImportScope",
+            StateMachineMethod => "StateMachineMethod",
+            CustomDebugInformation => "CustomDebugInformation",
         }
     }
 }
@@ -242,6 +270,8 @@ pub enum CodedIndex {
     CustomAttributeType,
     ResolutionScope,
     TypeOrMethodDef,
+    /// Portable PDB: what a `CustomDebugInformation` row can hang off.
+    HasCustomDebugInformation,
 }
 
 impl CodedIndex {
@@ -295,6 +325,18 @@ impl CodedIndex {
                 &[Some(Module), Some(ModuleRef), Some(AssemblyRef), Some(TypeRef)]
             }
             Self::TypeOrMethodDef => &[Some(TypeDef), Some(MethodDef)],
+            // Twenty-eight tags, most of them the same set `HasCustomAttribute`
+            // uses, with the debug tables appended.
+            Self::HasCustomDebugInformation => &[
+                Some(MethodDef), Some(Field), Some(TypeRef), Some(TypeDef),
+                Some(Param), Some(InterfaceImpl), Some(MemberRef), Some(Module),
+                Some(DeclSecurity), Some(Property), Some(Event), Some(StandAloneSig),
+                Some(ModuleRef), Some(TypeSpec), Some(Assembly), Some(AssemblyRef),
+                Some(File), Some(ExportedType), Some(ManifestResource), Some(GenericParam),
+                Some(GenericParamConstraint), Some(MethodSpec), Some(Document),
+                Some(LocalScope), Some(LocalVariable), Some(LocalConstant),
+                Some(ImportScope),
+            ],
         }
     }
 
@@ -324,6 +366,7 @@ impl CodedIndex {
             Self::CustomAttributeType => "CustomAttributeType",
             Self::ResolutionScope => "ResolutionScope",
             Self::TypeOrMethodDef => "TypeOrMethodDef",
+            Self::HasCustomDebugInformation => "HasCustomDebugInformation",
         }
     }
 }

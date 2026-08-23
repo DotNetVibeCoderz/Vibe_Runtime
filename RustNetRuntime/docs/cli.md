@@ -28,7 +28,7 @@ rustnet run <assembly> [--stats] [--trace] [--max-instructions N]
 
 ```console
 $ rustnet run Conformance.dll --stats --jit-threshold 1
-checks=308 failures=0
+checks=345 failures=0
 
 ─── execution ──────────────────────────────
   wall clock                  88.147 ms
@@ -164,6 +164,34 @@ before the backend existed. The reasons are listed because they are actionable:
 they are the backend's to-do list, ordered by what a real program actually hits.
 
 ---
+
+## debug
+
+Runs a program through the debugger hooks, printing every stop with the frames
+as a debugger sees them.
+
+```bash
+rustnet debug app.dll --break Triple:2     # stop before IL_0002 of Triple
+rustnet debug app.dll --step               # step into, instruction by instruction
+```
+
+A breakpoint is `Method:offset` — a method name and an **IL offset**, not a
+source line. Mapping a line to an offset needs a portable-PDB reader, which this
+runtime does not have; offering a `file:line` syntax that silently never matched
+would be worse than not offering one. `rustnet disasm <assembly> Type.Method`
+prints the offsets.
+
+The name must match exactly, and an ambiguous one lists the candidates and stops
+rather than picking among them — asking for `Triple` and silently getting
+`TripledAsync` is the kind of plausible wrong answer this runtime refuses
+everywhere else.
+
+`--step` steps into with a budget, then detaches and runs to completion, so a
+real program terminates rather than printing forever.
+
+**This is not a debug adapter.** It exercises the hooks and shows what an
+adapter would see. VSCode and Rider speak the Debug Adapter Protocol, and
+nothing here speaks it yet.
 
 ## build
 

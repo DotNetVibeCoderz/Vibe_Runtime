@@ -137,12 +137,24 @@ pub trait NativeTier: Send {
     /// through a closure and holds no borrow of its own; it reads to marshal
     /// arguments and never allocates, which is the property that makes it safe
     /// to hold a pointer into an object for the duration of a compiled call.
+    /// `mutators` is the safepoint registry, and `interpreter_roots` produces
+    /// the roots of the frames *below* this call. Both are needed because a
+    /// compiled method may now reach a safe point in the middle of a loop: the
+    /// thread that parks there is this one, and the collection it parks for
+    /// needs its whole root set — the compiled frame's handles, which the
+    /// backend knows how to find, *and* the interpreter frames underneath,
+    /// which it does not.
+    ///
+    /// The closure is only called if a collection is actually requested, so
+    /// walking those frames costs nothing on the ordinary path.
     fn try_execute(
         &mut self,
         loader: &Loader,
         heap: &SharedHeap,
         method: MethodId,
         args: &[Value],
+        mutators: &Mutators,
+        interpreter_roots: &mut dyn FnMut() -> Vec<Handle>,
     ) -> Option<ExecResult<Option<Value>>>;
 
     /// Methods compiled and bytes emitted, for `--stats`.
@@ -227,6 +239,55 @@ pub struct Interpreter {
     /// raised while a native method calls back into managed code.
     frame_floor: usize,
     code_cache: HashMap<MethodId, Arc<CompiledMethod>>,
+    /// The starting field values for each type, remembered per type.
+    ///
+    /// Every instance of a type begins identically, and working that out means
+    /// walking the base chain, building two vectors and reading a signature per
+    /// field. Doing it per *allocation* made `alloc` the slowest row in the
+    /// benchmark table by a distance; doing it per type makes an allocation one
+    /// vector clone.
+    field_defaults: HashMap<TypeId, Vec<Value>>,
+    /// The flattened instance-field list for each type, remembered per type.
+    ///
+    /// The registry stores each type's *own* fields; this is that list
+    /// concatenated base-first, which is what slot numbers are relative to.
+    instance_field_cache: HashMap<TypeId, Arc<Vec<FieldId>>>,
+    /// The slot each instance field occupies, remembered per field.
+    ///
+    /// A field's position does not depend on the receiver's runtime type. The
+    /// flattened layout is base-first, so a field declared in `T` sits at the
+    /// same index in `T` and in every subclass of `T` — which is what makes
+    /// this cacheable by field alone, and what lets a field access skip
+    /// reading the object's type at all. That read was a second trip through
+    /// the heap's lock for every `ldfld` and `stfld` in the program.
+    field_slots: HashMap<FieldId, usize>,
+    /// The attached debugger, if any.
+    ///
+    /// `None` costs one branch per instruction — the location is not built and
+    /// the breakpoint set is not consulted — so a program run without one pays
+    /// essentially nothing for the hook existing.
+    pub debugger: Option<crate::debug::BoxedDebugger>,
+    /// Where the program should stop.
+    pub breakpoints: crate::debug::Breakpoints,
+    /// What the interpreter is stepping towards, between stops.
+    stepping: Option<crate::debug::Stepping>,
+    /// Whether the debugger has been told the program started.
+    announced_entry: bool,
+    /// Exception objects currently being dispatched.
+    ///
+    /// A stack rather than one handle: a filter can throw, and its dispatch
+    /// nests inside the one already running. Each entry is a root until its
+    /// dispatch finishes.
+    dispatching: Vec<Handle>,
+    /// Whether each constructor provably does nothing, remembered per method.
+    ///
+    /// [`Loader::constructor_does_nothing`] decodes IL to answer, which is far
+    /// more expensive than the two frames it saves — so asking it once per
+    /// `newobj` would be slower than not asking at all. Memoised here rather
+    /// than on the loader because a loader is finished before the first
+    /// instruction runs and every thread holds its own copy of it; this is
+    /// per-interpreter state and belongs with the other per-interpreter caches.
+    trivial_ctors: HashMap<MethodId, bool>,
     frames: Vec<Frame>,
     next_frame_id: u32,
     /// `ldstr` results, keyed by assembly index and `#US` offset.
@@ -307,6 +368,15 @@ impl Interpreter {
             native_tier: None,
             frame_floor: 0,
             code_cache: HashMap::new(),
+            trivial_ctors: HashMap::new(),
+            field_defaults: HashMap::new(),
+            field_slots: HashMap::new(),
+            dispatching: Vec::new(),
+            debugger: None,
+            breakpoints: crate::debug::Breakpoints::new(),
+            stepping: None,
+            announced_entry: false,
+            instance_field_cache: HashMap::new(),
             frames: Vec::new(),
             next_frame_id: 1,
             literal_cache: HashMap::new(),
@@ -444,17 +514,34 @@ impl Interpreter {
 
     /// Allocates an instance of a reference type with fields at their defaults.
     pub fn alloc_object(&mut self, type_id: TypeId) -> Handle {
-        let fields = self.instance_fields(type_id);
-        let mut obj = ClrObject::new(type_id, fields.len());
-        for (i, field) in fields.iter().enumerate() {
-            let sig = self.loader.registry.field(*field).signature.clone();
-            obj.fields[i] = self.default_value_for(&sig);
-        }
+        // Every instance of a type starts the same way, so the starting values
+        // are worked out once and copied thereafter.
+        let fields = self.field_defaults(type_id).to_vec();
+        let obj = ClrObject { type_id, fields, monitor: None };
         self.stats.allocations += 1;
         self.heap.alloc(obj)
     }
 
+    /// The value each instance field of `type_id` starts at.
+    fn field_defaults(&mut self, type_id: TypeId) -> &[Value] {
+        if !self.field_defaults.contains_key(&type_id) {
+            let fields = self.instance_fields(type_id);
+            let mut defaults = Vec::with_capacity(fields.len());
+            for field in fields.iter() {
+                let sig = self.loader.registry.field(*field).signature.clone();
+                defaults.push(self.default_value_for(&sig));
+            }
+            self.field_defaults.insert(type_id, defaults);
+        }
+        &self.field_defaults[&type_id]
+    }
+
     /// Instance fields of a type, base-first so slots are stable in subclasses.
+    ///
+    /// The registry holds each type's own fields; the flattening across the
+    /// base chain is this. Kept as a `Vec` return for the callers that want to
+    /// own one — [`Self::instance_field_list`] is the allocation-free form the
+    /// hot paths use.
     pub fn instance_fields(&self, type_id: TypeId) -> Vec<FieldId> {
         let mut chain: Vec<TypeId> = self.loader.registry.base_chain(type_id).collect();
         chain.reverse();
@@ -465,8 +552,51 @@ impl Interpreter {
         out
     }
 
-    fn field_slot(&self, type_id: TypeId, field: FieldId) -> Option<usize> {
-        self.instance_fields(type_id).iter().position(|f| *f == field)
+    /// [`Self::instance_fields`], computed once per type.
+    ///
+    /// The answer cannot change: a type's fields are fixed when it loads.
+    fn instance_field_list(&mut self, type_id: TypeId) -> Arc<Vec<FieldId>> {
+        if let Some(cached) = self.instance_field_cache.get(&type_id) {
+            return cached.clone();
+        }
+        let list = Arc::new(self.instance_fields(type_id));
+        self.instance_field_cache.insert(type_id, list.clone());
+        list
+    }
+
+    /// The slot `field` occupies in any instance that has it.
+    ///
+    /// `type_id` is the receiver's type when the caller knows it and is only
+    /// consulted on a miss — the answer is a property of the field.
+    fn field_slot(&mut self, type_id: TypeId, field: FieldId) -> Option<usize> {
+        if let Some(&slot) = self.field_slots.get(&field) {
+            return Some(slot);
+        }
+        // Resolve against the field's own declaring type rather than the
+        // receiver's: a subclass has the same layout for the part it inherits,
+        // and the declaring type is the one guaranteed to contain the field.
+        let declaring = self.loader.registry.field(field).declaring_type;
+        let mut slot = self.slot_within(declaring, field);
+        // The receiver's own type is the fallback, for a field whose declaring
+        // type does not list it — an explicit-layout or synthesised shape. It
+        // is consulted only when it is a real type: callers that have no
+        // receiver type pass `TypeId::INVALID`, and indexing the registry with
+        // that is a panic rather than a miss. An aggressive collector found
+        // that the hard way, on a path that had simply never been reached.
+        if slot.is_none() && type_id != TypeId::INVALID && type_id != declaring {
+            slot = self.slot_within(type_id, field);
+        }
+        let slot = slot?;
+        self.field_slots.insert(field, slot);
+        Some(slot)
+    }
+
+    /// Where `field` sits in `owner`'s flattened layout, if it is there at all.
+    fn slot_within(&mut self, owner: TypeId, field: FieldId) -> Option<usize> {
+        if owner == TypeId::INVALID || owner.index() >= self.loader.registry.type_count() {
+            return None;
+        }
+        self.instance_field_list(owner).iter().position(|f| *f == field)
     }
 
     /// The initial value of a local, resolving value types to their zero.
@@ -629,7 +759,30 @@ impl Interpreter {
             for v in frame.args.iter().chain(&frame.locals).chain(&frame.stack) {
                 v.trace_handles(&mut out);
             }
+            // Two handles a frame holds that are in none of those three.
+            //
+            // `pending_newobj` is the instance a constructor is running
+            // against: allocated, handed to the constructor as `this`, and not
+            // yet pushed anywhere. `in_flight` is the exception being
+            // dispatched, which lives in a Rust field while filters and
+            // finally blocks run — and those run *managed code*, which
+            // allocates.
+            //
+            // Both were invisible to a collection. Neither could be reached
+            // before, because a collection only happens where the interpreter
+            // asks for one and nothing asked during those windows; an
+            // aggressive collector reaches both immediately, and the symptom is
+            // a swept exception object surfacing as a type index of -1.
+            if let Some(pending) = frame.pending_newobj {
+                out.push(pending);
+            }
+            if let Some(error) = &frame.in_flight {
+                if let ExecutionError::Exception { object, .. } = error.as_ref() {
+                    out.push(*object);
+                }
+            }
         }
+        out.extend(self.dispatching.iter().copied());
         self.loader.static_roots(&mut out);
         out.extend(self.interned.values().copied());
         out.extend(self.literal_cache.values().copied());
@@ -1115,8 +1268,35 @@ impl Interpreter {
         // Offer the call to the code generator before building a frame. A
         // compiled method needs no interpreter state at all, so this is where
         // the saving is: no frame, no locals vector, no decode loop.
-        if let Some(tier) = self.native_tier.as_mut() {
-            if let Some(outcome) = tier.try_execute(&self.loader, &self.heap, method, &args) {
+        if self.native_tier.is_some() {
+            // The tier and the roots it may ask for are borrowed from the same
+            // interpreter, so the pieces it needs are moved out for the call
+            // and put back after. Splitting the borrow any other way would
+            // mean the roots closure could not see the frames.
+            let mut tier = self.native_tier.take().expect("checked above");
+            let mutators = self.mutators.clone();
+            let frames = &self.frames;
+            let loader = &self.loader;
+            let interned = &self.interned;
+            let literals = &self.literal_cache;
+            let type_objects = &self.type_objects;
+            let mut roots = || {
+                let mut out = Vec::new();
+                for frame in frames {
+                    for v in frame.args.iter().chain(&frame.locals).chain(&frame.stack) {
+                        v.trace_handles(&mut out);
+                    }
+                }
+                loader.static_roots(&mut out);
+                out.extend(interned.values().copied());
+                out.extend(literals.values().copied());
+                out.extend(type_objects.values().copied());
+                out
+            };
+            let outcome =
+                tier.try_execute(loader, &self.heap, method, &args, &mutators, &mut roots);
+            self.native_tier = Some(tier);
+            if let Some(outcome) = outcome {
                 self.stats.native_tier_calls += 1;
                 return outcome.map(Entered::Native);
             }
@@ -1302,6 +1482,99 @@ impl Interpreter {
 
     // -- the loop ------------------------------------------------------------
 
+    /// Decides whether to stop here, and stops if so.
+    ///
+    /// `cold` and never inlined: this is called from the instruction loop and
+    /// answers "no" on every instruction of every program that is not being
+    /// debugged. Letting it be inlined puts its registers and its code in the
+    /// hot path for the benefit of a branch that is essentially never taken.
+    #[cold]
+    #[inline(never)]
+    ///
+    /// Only called with a debugger attached. Everything expensive — describing
+    /// frames, naming methods — happens after the decision, never before it.
+    fn debug_poll(&mut self, il_offset: u32) {
+        let depth = self.frames.len();
+        let method = self.frame_ref().method;
+
+        let reason = if !self.announced_entry {
+            self.announced_entry = true;
+            crate::debug::StopReason::Entry
+        } else if self.breakpoints.contains(method, il_offset) {
+            crate::debug::StopReason::Breakpoint
+        } else if self.stepping.is_some_and(|s| s.satisfied_at(depth)) {
+            crate::debug::StopReason::Step
+        } else {
+            return;
+        };
+
+        self.debug_stop(reason, il_offset, depth);
+    }
+
+    /// Describes the stopped program, asks the debugger, and records what it
+    /// said to do next.
+    fn debug_stop(&mut self, reason: crate::debug::StopReason, il_offset: u32, depth: usize) {
+        // The debugger is moved out for the call. It needs the frames and the
+        // breakpoints at the same time, and they are different fields of the
+        // same struct — taking the debugger out is what lets the borrow
+        // checker see that, rather than a lock or a copy.
+        let Some(mut debugger) = self.debugger.take() else { return };
+
+        let frames: Vec<crate::debug::DebugFrame<'_>> = self
+            .frames
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(index, frame)| {
+                // The innermost frame is stopped *before* `il_offset`; every
+                // caller is stopped at the call it is in the middle of, whose
+                // offset is the instruction its pc last passed.
+                let offset = if index + 1 == depth {
+                    il_offset
+                } else {
+                    frame
+                        .code
+                        .instructions
+                        .get(frame.pc.saturating_sub(1))
+                        .map(|i| i.offset)
+                        .unwrap_or(0)
+                };
+                crate::debug::DebugFrame {
+                    method: frame.method,
+                    method_name: &self.loader.registry.method(frame.method).qualified_name,
+                    il_offset: offset,
+                    arguments: &frame.args,
+                    locals: &frame.locals,
+                    stack: &frame.stack,
+                }
+            })
+            .collect();
+
+        let mut control = crate::debug::DebugControl { breakpoints: &mut self.breakpoints };
+        let command = debugger.stopped(reason, &frames, &mut control);
+        drop(frames);
+
+        self.stepping = match command {
+            crate::debug::DebugCommand::Run => None,
+            crate::debug::DebugCommand::StepInto => Some(crate::debug::Stepping::Into),
+            crate::debug::DebugCommand::StepOver => Some(crate::debug::Stepping::Over(depth)),
+            crate::debug::DebugCommand::StepOut => Some(crate::debug::Stepping::Out(depth)),
+            crate::debug::DebugCommand::Detach => None,
+        };
+        // Detaching drops the debugger rather than leaving it attached and
+        // ignored, so the per-instruction branch goes back to costing nothing.
+        if command != crate::debug::DebugCommand::Detach {
+            self.debugger = Some(debugger);
+        }
+    }
+
+    /// Attaches a debugger. The program stops before its first instruction.
+    pub fn attach_debugger(&mut self, debugger: crate::debug::BoxedDebugger) {
+        self.debugger = Some(debugger);
+        self.announced_entry = false;
+        self.stepping = None;
+    }
+
     fn run_until(&mut self, base_depth: usize) -> ExecResult<Option<Value>> {
         let mut result = None;
 
@@ -1346,6 +1619,13 @@ impl Interpreter {
             // rather than spinning.
             return self.do_return(None);
         };
+
+        // The debug hook, before the instruction rather than after: a
+        // breakpoint means "stop *at* this", and a debugger that saw it having
+        // already run could not step into the call it makes.
+        if self.debugger.is_some() {
+            self.debug_poll(instruction.offset);
+        }
 
         self.stats.instructions_executed += 1;
         self.frames[top].pc = pc + 1;

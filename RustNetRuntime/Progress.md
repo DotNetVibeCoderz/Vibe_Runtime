@@ -1,14 +1,14 @@
 # Progress
 
-Tracking for RustNetRuntime. Updated 2026-08-20.
+Tracking for RustNetRuntime. Updated 2026-08-23.
 
-**Verified this session:** `cargo test --workspace` → 141 passed, 0 failed.
+**Verified this session:** `cargo test --workspace` → 206 passed, 0 failed.
 Five programs — two conformance suites, a sample, and two written or edited by
 the assistant against a live LLM — produce byte-identical output on RustCLR and
 .NET.
 
 ```
-Conformance    IDENTICAL — checks=308 failures=0
+Conformance    IDENTICAL — checks=345 failures=0
 ModernSyntax   IDENTICAL — checks=35 failures=0
 UserDirectory  IDENTICAL
 PrimeSieve     IDENTICAL   (written by Jack from a prompt)
@@ -21,13 +21,13 @@ SensorGateway  IDENTICAL   (edited by Jack from a prompt)
 
 | Crate | State | Evidence |
 | --- | --- | --- |
-| `rustclr-metadata` | PE/COFF + ECMA-335 reader, signatures, IL bodies | 27 tests, incl. 9 against a real Roslyn-built assembly |
-| `rustclr-gc` | Handle-based heap, pluggable collectors, mark-sweep, **shared heap + stop-the-world safepoints** | 19 tests; 200k-deep graph marks without stack overflow |
-| `rustclr-core` | Type system, loader, IL interpreter, exception handling | 18 unit + 3 multi-threaded |
-| `rustclr-bcl` | Native BCL: Console, String, Math, interpolation, tuples, ranges, Nullable, generic collections, LINQ, Task and async, reflection | 20 unit + 8 integration; 988 bindings |
-| `rustclr-sched` | Lock-free MS queue, MPMC channel, thread pool | 16 tests |
+| `rustclr-metadata` | PE/COFF + ECMA-335 reader, signatures, IL bodies | 28 tests, incl. 9 against a real Roslyn-built assembly |
+| `rustclr-gc` | Handle-based heap, pluggable collectors, mark-sweep, **shared heap + stop-the-world safepoints** | 22 tests; 200k-deep graph marks without stack overflow |
+| `rustclr-core` | Type system, loader, IL interpreter, exception handling, **threads, monitors, task pool** | 25 tests, incl. multi-threaded |
+| `rustclr-bcl` | Native BCL: Console, String, Math, interpolation, tuples, ranges, Nullable, generic collections, LINQ, Task and async, spans, marshalling, reflection | 29 tests; 988 bindings |
+| `rustclr-sched` | Lock-free MS queue, MPMC channel, thread pool | 17 tests; the queue is the task pool's |
 | `rustclr-interop` | P/Invoke, dynamic loading, marshalling | 9 tests; calls the real `GetCurrentProcessId` |
-| `rustclr-jit` | Compiler trait, IL verifier, analysis, **x86-64 code generator**, W^X pages, tiering | 25 unit + 3 differential |
+| `rustclr-jit` | Compiler trait, IL verifier, analysis, **x86-64 code generator** with floats, arrays, allocation and recursion, W^X pages, tiering | 62 tests, incl. differential against the interpreter |
 | `rustnet-cli` | `run` / `info` / `disasm` / `verify` / `build` / `capabilities` | Drives every fixture |
 
 ### Recursion compiles
@@ -44,9 +44,10 @@ argument-array shape, same trap slot, same allocation context. The call target
 is the first byte of the method's own code, so the displacement is known at emit
 time and needs no fixup.
 
-Only *self*-calls. A call to another method needs an address that may not exist
-when the caller is compiled, and the inliner already covers the small-callee
-case. `Sort`, the wrapper that calls `QuickSort`, is still interpreted.
+Only *self*-calls, at the time: a call to another method needs an address that
+may not exist when the caller is compiled. **Superseded** — calls between
+compiled methods go through a table the tier fills in before the caller runs,
+and `Sort` compiles.
 
 **Compiled recursion runs on the machine stack**, which cannot be grown or
 unwound the way the interpreter's frame budget can — so overrunning it would be
@@ -848,11 +849,17 @@ discipline around each one. Reading the representation first turned a risky ABI
 change into two loads.
 
 **Holding a raw pointer into the managed heap is sound for a stated reason.**
-The backend declines any method that allocates, so no collection can run while
-compiled code executes; and this collector never moves an object in any case.
-Both would have to change together for the pointer to go stale. That same
-invariant is why an array created *inside* the method is still declined —
-`new int[n]` allocates, which is exactly what it forbids.
+At the time it rested on two facts: the backend declined any method that
+allocates, so no collection could run while compiled code executed, and this
+collector never moves an object. That same invariant was why an array created
+*inside* a method was declined — `new int[n]` allocates, which is exactly what
+it forbade.
+
+**Superseded.** The first fact stopped being true when compiled code reached
+safe points and could allocate in a loop. What replaced it: the collector still
+never moves an object, and any array the frame can still reach is named by the
+safe point's frame map and therefore rooted. The pointer is sound for a
+different reason now, and the reason is written down where the code is.
 
 **A bounds failure cannot throw.** Compiled code has no frame for the
 interpreter to unwind, so it writes a flag one slot past the arguments and
@@ -1422,7 +1429,6 @@ screenshot is rendered from the real windows by `--screenshot`, so the docs
 cannot drift from the product.
 
 ---
-
 ## Bugs found and fixed, with how
 
 Each was found by running something real, not by reading code.
@@ -1430,6 +1436,25 @@ Each was found by running something real, not by reading code.
 | Bug | Found by |
 | --- | --- |
 | PE optional-header skip was 44/56 bytes instead of 60/76 — **every** image failed to load | Parsing a real Roslyn assembly instead of a hand-built fixture |
+| The x86-64 verifier gave every `call` the *enclosing* method's stack delta, so any non-recursive call drifted the depth and reported a stack error in valid IL | `rustnet jit` on the benchmark assembly: two methods said "IL verification failed" where `rustnet verify` said the same assembly was fine |
+| Scalar replacement bailed on every method, because `ret` is signature-dependent and has no static stack effect to look up — the catch-all arm refused it | `rustnet jit` still listing `FieldAccess` as declined after the pass was wired in |
+| A devirtualised call on a **null** receiver reported "the hierarchy analysis was wrong" instead of throwing `NullReferenceException` | Deleting the null guard and finding the Conformance check still passed — the method under test was compilable but never *compiled*, because the tier only takes a method that loops or is called 32 times |
+| The devirtualisation check could not tell a correct guard from a swapped one: `300*3 + 300*4` equals `300*4 + 300*3` | Reversing the case list on purpose and watching the suite stay green |
+| The closed-world refusal was untested — no loaded type would have been devirtualised even with the check removed | Adding a `public` hierarchy that is otherwise an ideal candidate, purely so the refusal has something to refuse |
+| The class-constructor check for elided constructors was untested: the fixture read a static field of the same class, which runs the class constructor by itself | Deleting `ensure_cctor` and watching the suite stay green; the witness now lives on a *different* class |
+| `alloc_object` walked the base chain, built two vectors and cloned a signature per field — on every allocation rather than once per type | `--stats` on `alloc`: 600,009 managed calls and 300,006 native calls for 300,006 allocations |
+| The interpreter-to-compiled transition built an allocation context on every call — three types resolved by name, three array constructions searched — for methods that never allocate | `--stats` on `kernels`: 239,969 of its 240,009 managed calls are calls *into* compiled code, so the measurement was the transition rather than the code |
+| Register pinning was measured as "no effect" and nearly reverted; it is worth −22% on `fields` | Measuring one run per build, on a machine that drifts by ten percent. An interleaved best-of-eleven settled it — and intermediate sample sizes showed +2% and +9% before converging on zero |
+| Every `ldfld` and `stfld` read the receiver's type through the heap's lock, purely to find a slot that does not depend on it | Pricing `alloc`'s candidates by deleting each one: allocation removed saved nothing, field access removed saved nothing, so the cost had to be spread across the ordinary path |
+| **A frame's `pending_newobj` and in-flight exception were never traced as roots.** An object between allocation and its constructor returning, and an exception being dispatched, were both invisible to a collection | Running the fixture under a collector with a 16 KB trigger. Neither window could be reached before, because a collection only happens where the interpreter asks for one and nothing asked during either |
+| **`dispatch_exception` held the exception object in a Rust local while running filters** — which are managed code, and allocate. The object could be swept mid-dispatch, surfacing as a type index of -1 | Same run. The fix registers it as a root for the length of the dispatch, on every path — hence the wrapper rather than a push and a pop around a body full of `?` |
+| The first attempt at allocation-in-a-loop pinned every allocation for the length of the call: correct, and strictly worse than refusing to compile | Not by a correctness test — every one passed. By measuring peak heap at ten times the trip count and watching it follow exactly |
+| Objects allocated by *compiled* code got `Value::Null` in every field, so a field declared `int` read back as the wrong shape; and their field count came from the declaring type only, so a subclass instance was allocated too small | Compiling the whole fixture at threshold 1 — the field-access helper refused the shape rather than returning a plausible zero, which is what it is for |
+| `field_load` accepted an integer for *any* declared kind, so a reference stored as a number round-tripped perfectly through compiled code and was invisible to the collector | Mutating `field_store` to write a reference as `Value::I64` and watching the suite stay green. The kind is now checked, not merely used to convert |
+| The inliner was one level deep, so a helper built out of smaller helpers could not be spliced and its caller stayed interpreted — 400,031 transitions on one benchmark row | `--stats` again: almost every managed call was a call *into* compiled code, with only 5.2M instructions interpreted. Flattening a callee's own calls first took that to one call and the row from 477 ms to 83 ms |
+| A compiled callee read its own call table from a slot the caller never wrote, so it jumped through whatever the stack happened to hold | A segfault that appeared only at a low JIT threshold, and vanished with `--no-inline`. Tracing table resolution named the method: mutual recursion, where the callee is the only one that *has* a table to read |
+| Filling a call table by *replacing* the box moved it, leaving the address another method's table already recorded pointing at freed memory | The same crash, one layer down. Tables are now allocated at their final size first and filled in place |
+| The compiled stack guard counted *frames*, which is unsound for any frame size but the one it was calibrated against — larger frames turned it from a refusal into a segfault | Frames grew by ~50 bytes and 4096 of them stopped fitting a 1 MB stack. It counts bytes now, and the CLI reserves a stack for managed code rather than hoping for one |
 | `stfld` through a managed pointer did not handle unboxed structs | Conformance check `struct` |
 | Value-type locals were zeroed as scalars, losing their fields | Same |
 | Lock-free queue took the node value *before* winning the CAS — heap corruption | The 4-producer/2-consumer stress test |
@@ -1483,94 +1508,100 @@ attribute constructors do not bury the real findings.
 
 ## Not done
 
-Ordered as in [Plan.md](Plan.md):
+Ordered as in [Plan.md](Plan.md). Everything here is a deliberate refusal, a
+piece of work with no hardware to run it on, or a gap still open — each said as
+which, because those are not the same thing.
 
-1. **Generic types** — done for user types and methods, including a class type
-   parameter in a *static* method: the call site's `MemberRef` names the
-   construction, so the frame carries it. What is left is framework generics,
-   which stay erased by choice because native bindings are keyed by declaring
-   type name.
-2. **Real concurrency** — done. `Thread.Start`, `Task.Run` and `Parallel.*` run
-   on real threads sharing the heap and static storage; `lock` and `Interlocked`
-   exclude; `await` suspends and the completing thread resumes; tasks run on a
-   pool of one worker per core, and `Task.Delay` arms a timer. `rustclr-sched`
-   is no longer unused — its lock-free queue is the pool's. `await using`, `ValueTask` and now `await foreach` over
-   an `async IAsyncEnumerable<T>` all work, so the async surface itself is
-   complete — what is missing is overlap, not syntax.
+1. **Framework generics stay erased, by choice.** User generics are not:
+   `Cell<int>` and `Cell<string>` are two runtime types with their own static
+   slots, and a class type parameter answers in a *static* method because the
+   call site's `MemberRef` names the construction. `List<int>` and
+   `List<string>` remain one type because every native binding is keyed by its
+   declaring type's name, and giving `List<int>` a name of its own would put
+   ``List`1::Add`` out of reach. `GetGenericArguments()` on an *open* definition
+   refuses: .NET returns the parameter `T`, and this runtime has no runtime type
+   for one.
 
-   The runtime beneath it has moved. The thread-safe heap and collector that
-   this was waiting on are done and tested: several OS threads allocate into one
-   heap, share objects, and stop at safe points so a collection sees every
-   root — see "Several threads share one heap" above. What now blocks the C#
-   surface is one specific thing, the per-interpreter `Loader`: two threads
-   would see two sets of static fields. It needs splitting into a read-only part
-   shared without a lock and a mutable part behind one, because a lock across
-   `registry.ty()` — called on nearly every instruction — would cost more than
-   the whole heap change did.
-3. **Native code generation beyond scalar arithmetic and `int[]`** — the x86-64
-   backend is 11.0× faster on arithmetic and 89.8× on an array walk. It still
-   declines allocation, exception handling, floating point and object field
-   access; an array created *inside* a method falls under allocation, which is
-   why `sieve` and `sort` are still interpreted. The AArch64 and RISC-V backends
-   emit and disassemble correctly but **have never executed a single
-   instruction**, and deliberately decline arrays — adding untested encodings to
-   an untested backend would be stacking one unknown on another.
-4. **Reflection breadth** — constructing a generic type at run time now works;
-   `MakeGenericType` calls the same loader path a `TypeSpec` does and shares its
-   cache, so it returns the identical instance as `typeof`. The gap that
-   replaced it is narrower: `GetGenericArguments()` on an *open* definition,
-   where .NET returns the type parameter `T` and this runtime has no runtime
-   type for one — so it refuses. `Assembly.Load` works on
-   a host but resolves by probing where .NET reads `deps.json`, so an
-   unreferenced DLL beside the app loads here and does not there — noted in
-   `docs/limitations.md` because it is a divergence in the risky direction.
-   Everything else works: types, members, properties, parameters and their
-   names, assemblies, modules, invocation and attributes.
-5. **IL execution on more hardware** — an ESP32-C3 (RISC-V 32) and an M5Stack
-   Tough (Xtensa LX6) run the interpreter with the whole of RustBCL. The
-   remaining images build but have not been flashed since; the Pico and the
-   Netduino clear only the reduced binding set, the Nucleo-F401RE clears
-   neither, and no board was connected for any of them. Ahead-of-time
-   compilation additionally needs the Arm and RISC-V backends to execute.
-6. **`Span<T>`** — done. Over an array, over a string, and over `stackalloc`
-   memory; `Memory<T>`, `AsSpan` and `AsMemory` too. Slicing a span that
-   *stands for* a string still refuses, because the string is the whole
-   representation and there is no offset in it.
-7. **The remaining IL** — `localloc`, `cpblk` and `initblk` work: `Value` has a
-   raw-pointer kind now, and it is a buffer plus a byte offset rather than an
-   address. What is left is `arglist` (varargs), `mkrefany`/`refanyval`/
-   `refanytype`, `jmp`, and multi-dimensional arrays with non-zero lower
-   bounds. Exception filters and `calli` work.
+2. **Concurrency is done.** `Thread.Start` spawns an OS thread; `Task.Run` and
+   `Parallel.*` run on a pool of one worker per core; `await` suspends and the
+   completing thread resumes; `lock`, `Interlocked` and `Monitor.Wait`/`Pulse`
+   all do what they say, and threads share one heap and one set of static
+   fields. What remains is a weaker promise, stated rather than hidden:
+   `Monitor.Pulse` wakes *every* waiter rather than one, which a `Wait` written
+   in the required re-check loop already tolerates.
 
-`rustnet capabilities` prints this from the runtime itself, and
-`rustnet verify <assembly>` names what a specific program would hit.
+3. **Native code generation** now covers `int` and `double` arithmetic,
+   `int[]`/`double[]`/`bool[]` element access, allocation — including inside a
+   loop, since compiled code reaches safe points — object allocation, field
+   access through a helper, guarded devirtualisation, recursion, and calls
+   between compiled methods. Every benchmark row is compiled or native.
 
-### The advanced-feature matrix is measured, not asserted
+   Still declined, and both are code rather than hardware: **exception
+   handling** and **instance methods**. Separately, the AArch64 and RISC-V
+   backends **have never executed a single instruction**. They encode the same
+   IL through the same shared translation and are checked by disassembly, but no
+   board has been connected — and an unexecuted backend that claims to work is
+   worse than no backend at all.
 
-`tests/fixtures/AdvancedFeatures/` is 21 single-feature probes plus a real
-incremental source generator. `probe.sh` runs each on both runtimes and diffs —
-**21 of 21 pass on RustCLR today**.
+4. **Reflection is broad.** Types, members, properties, parameters and their
+   names, assemblies, modules, invocation, attributes, and constructing a
+   generic type at run time all work. Two divergences are documented rather than
+   papered over: the open-definition case in (1), and `Assembly.Load` resolving
+   by probing where .NET reads `deps.json` — so an unreferenced DLL beside the
+   app loads here and does not there, which is a divergence in the risky
+   direction.
 
-That measures *output*, and output is not capability. `async`, threading and the
-TPL all produce the answers .NET produces while nothing overlaps, so a probe
-that measured wall-clock time would fail three of these. The matrix marks those
-rows with a warning rather than a tick for that reason. Results and reasoning:
+5. **IL runs on hardware; ahead-of-time compilation does not.** An ESP32-C3
+   (RISC-V 32) and an M5Stack Tough (Xtensa LX6) both execute `HelloWorld.Main`
+   with the whole of RustBCL, printing bytes identical to `dotnet`. The Pico,
+   Netduino, Nucleo-F401RE and K210 images build but have never been flashed —
+   no board was connected. AOT additionally needs the Arm and RISC-V code
+   generators to execute, which is (3).
+
+6. **`Span<T>` is done** — over an array, over a string, and over `stackalloc`
+   memory, with `Memory<T>`, `AsSpan` and `AsMemory`. Slicing a span that
+   *stands for* a string still refuses: the string is the whole representation
+   and there is no offset in it.
+
+7. **Five IL opcodes are refused**, each returning "not implemented by this
+   runtime" rather than doing something plausible: `arglist` (varargs),
+   `mkrefany`, `refanyval`, `refanytype` and `jmp`. Multi-dimensional arrays
+   with non-zero lower bounds are also absent. `localloc`, `cpblk`, `initblk`,
+   exception filters and `calli` all work — the first three were once listed
+   here as blocked on the value model, and stopped being blocked when `Value`
+   gained a raw-pointer kind that is a buffer plus a byte offset rather than an
+   address.
+
+8. **Toolchain surface named in `requirements.md` that does not exist yet.**
+   Listed because scope is measured by the requirement, not by what was built:
+
+   | | |
+   | --- | --- |
+   | Debug Adapter Protocol server | the *hooks* are built — breakpoints, stepping, frame inspection, and `rustnet debug` — but nothing speaks DAP, so VSCode and Rider cannot attach |
+   | Source-line breakpoints and variable names | both need a portable-PDB reader; breakpoints are by IL offset today |
+   | `rustnet deploy` | CodeGen has a Deploy menu and a device flasher; the CLI has no `deploy` command |
+   | Profiler and diagnostics | `run --stats` reports execution and heap counters; there is no profiler |
+   | Ahead-of-time compilation | only the JIT exists — see (3) and (5) |
+
+### Advanced C# features
+
+Roslyn's own feature list for C# 12, 13 and 14, probed one feature at a time and
+diffed against `dotnet`: **21 of 21 pass on RustCLR**. Results and reasoning:
 [docs/advanced-features.md](docs/advanced-features.md) ·
 [Bahasa Indonesia](docs/id/fitur-lanjutan.md).
+
+That measures *output*, and output is not capability — though it means more now
+than when this was written, because the things it could not then distinguish
+have since been built. `Task` and `Parallel.For` do overlap now, on a real pool.
 
 Two findings from that run were not obvious beforehand:
 
 - **Source generators and interceptors need no runtime support at all.** Both
   are Roslyn-side; the runtime only ever sees ordinary IL. Proven with a
   generator that actually intercepts a call, not by reasoning about it.
-- **`Thread` spawns for real.** `Thread.Start` starts an OS thread and `Join`
-  waits for it; `lock` excludes and `Interlocked` does not lose updates. `Task`
-  and `Parallel.For` still run their work where it is created, so a
-  `Thread`-based program overlaps and a task-based one does not.
-
-Also measured: **union types and closed hierarchies do not exist in .NET 10** —
-`IUnion` and `IsClosedTypeAttribute` are absent from the BCL, so there is
-nothing for any runtime to support yet.
+- **Union types and closed hierarchies do not exist in .NET 10.** `IUnion` and
+  `IsClosedTypeAttribute` are absent from the BCL, so there is nothing for any
+  runtime to support yet.
 
 ---
 
@@ -1587,6 +1618,90 @@ nothing for any runtime to support yet.
 - **Managed pointers are structural, not addresses.** They cannot dangle and
   never need collector fix-ups — which is also what makes value-type
   constructors and the interpolation handler work.
+- **A safe point in compiled code is a description, not a rewrite.** Three
+  things make that true and all three are load-bearing: this collector never
+  moves an object, a `Handle` is `repr(transparent)` over `u64`, and the poll
+  sits where the evaluation stack is empty. Together they reduce "find this
+  frame's roots" to reading a list of byte offsets computed from declared
+  types — no inference over the instruction stream, and nothing to write back.
+  Anything that would need more than that is declined instead.
+- **A permission and its obligation are one change.** Allowing allocation
+  inside a compiled loop is only sound *because* the loop can be stopped there
+  and pruned there. Shipping the permission without the pruning would have been
+  worse than shipping neither: it compiles methods that can exhaust a heap the
+  interpreter would not. The test that guards it measures memory at two trip
+  counts rather than checking any answer.
+- **A field's slot does not depend on the receiver's type.** The flattened
+  layout is base-first, so a field declared in `T` sits at the same index in `T`
+  and in every subclass. That is what makes the slot cacheable by field alone,
+  and what let both field paths stop reading the object's type through the
+  heap's lock. The bounds check inside the accessor is what keeps a receiver
+  that somehow lacks the field an error rather than a read of the wrong slot.
+- **Price a bottleneck by deleting it, not by reading the code.** `alloc` looked
+  like an allocation problem and is not: making every `new` return the same
+  object saves nothing, and so does removing field access entirely. Only the
+  whole `newobj` path moves it, by 14%; the rest is plain interpretation. Three
+  cheap experiments were worth more than any amount of staring at the
+  allocator.
+- **An "off" feature is only free if it is measured.** The debugger hook is one
+  branch per instruction and looked obviously free. Interleaved against a build
+  with it removed it cost **8%** on the densest interpreted workload — the
+  branch and its registers were being hoisted into the hot loop. Marking the
+  poll `#[cold]` and `#[inline(never)]` took it to nothing. The first
+  measurement that suggested otherwise compared two different sessions, which
+  is the mistake this file already records once.
+- **A budget must be denominated in the resource it protects.** The compiled
+  recursion guard counted frames because frames are what recursion produces; the
+  resource is *bytes of machine stack*, and the two only agree for one frame
+  size. It was latently wrong from the day it was written and only failed when
+  frames grew — as a segfault, which is precisely what it existed to prevent.
+- **A default is not a guarantee.** Managed recursion runs on the machine stack,
+  so how deep a program can go was decided by whatever stack the host happened
+  to give the thread — a megabyte on Windows, less than the interpreter's own
+  frame budget needs. A runtime that requires a resource should ask for it, so
+  the CLI now runs managed code on a stack it reserves itself.
+- **An optimisation's reach is part of its design, not a detail.** The inliner
+  was correct from the day it was written and still left the benchmark it
+  existed for entirely interpreted, because real code factors a helper out of
+  smaller helpers and one level cannot see through that. What it *could* do was
+  never the question; what the code in front of it looks like was.
+- **Compiled code being slow is not the same as compiled code being bad.** The
+  `kernels` and `inlined` rows were both compiled and both slow, which read as a
+  code-quality problem and was not: a quarter of a million *transitions* into
+  compiled code, each doing setup the method had no use for. Ask `--stats` what
+  a benchmark is actually doing before reading its number as a verdict on the
+  thing you were thinking about.
+- **One rule for "this constructor does nothing", on the loader.** The
+  interpreter skips the call, scalar replacement retires the object, and
+  compiled `newobj` allocates without a frame — three consumers, one reason
+  (none of them runs a constructor), and therefore one implementation. It lives
+  on `Loader` rather than in the JIT because the interpreter asks it on every
+  `newobj`, and it is memoised per interpreter because decoding IL to answer
+  costs more than the frames it saves.
+- **A `Handle` may cross into compiled code; a `Value` may not.** The two look
+  like the same question and are not. `Handle` is one `u64` in a newtype, so
+  `repr(transparent)` is the language's own promise about its representation —
+  and it is an opaque token rather than an address, so compiled code cannot
+  dereference one and a stale value fails a generation check instead of reading
+  freed memory. `Value` is a multi-variant enum with boxed payloads and no
+  promise at all. Anything compiled code needs to *know* about an object — its
+  type, its fields — comes from a helper call into Rust, never from reading the
+  heap.
+- **`Value`'s memory layout is not part of the JIT ABI, and did not become one
+  — field access went through a helper instead.** Compiling `ldfld` the obvious way means emitting machine code that
+  reads a `Value` out of a `Vec<Value>` — which requires knowing the enum's
+  discriminant and payload offsets. Rust promises neither without `repr`, the
+  enum has boxed variants, and a future compiler is free to reorder them. The
+  failure would be a *wrong number*, not a crash, and it would appear on a
+  toolchain upgrade with no source change. Scalar replacement gets the same
+  benchmark win with no layout assumption at all, so the layout route was
+  declined rather than deferred. If field access on escaping objects is ever
+  needed, the sound version is a helper call — the shape `alloc_array` already
+  uses — not inline layout knowledge. That is what was eventually built: a call
+  per access, `int`/`long`/`double`/reference crossing as one 64-bit word, and
+  a struct field refused. It costs more than a load and cannot be wrong in the
+  way an inline load could, and it took `alloc` from 613 ms to 206 ms — so the
+  refusal cost nothing in the end except the time to find the right shape.
 - **Unsupported interop shapes are refused, not guessed.**
 - **Strings are `Vec<u16>`.** .NET defines `Length` and indexing in UTF-16 code
   units; UTF-8 would make them wrong or O(n).

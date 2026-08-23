@@ -607,19 +607,89 @@ pub fn capabilities() -> Result<i32> {
     println!("                               and a compiled method cannot return a");
     println!("                               reference - so nothing it allocates");
     println!("                               outlives the call.");
-    println!("                               DECLINED: newarr INSIDE A LOOP, which would");
-    println!("                               be unbounded since compiled code never");
-    println!("                               collects; float[]; `rem` on doubles;");
-    println!("                               exception handling; and object access.");
+    println!("                               SAFE POINTS: a compiled method polls at every");
+    println!("                               loop back-edge, so it can be stopped mid-body.");
+    println!("                               Two reasons to stop: another thread wants to");
+    println!("                               collect, or this call has allocated enough to");
+    println!("                               want one itself. Both are needed - with a");
+    println!("                               single thread nothing else ever asks.");
+    println!("                               That is what makes ALLOCATION IN A LOOP legal:");
+    println!("                               the frame's live arrays and references are");
+    println!("                               described by offsets fixed at compile time, so");
+    println!("                               a collection can see them, and everything the");
+    println!("                               loop has finished with is released there. A");
+    println!("                               loop's memory is flat, not proportional to its");
+    println!("                               trip count.");
+    println!("                               A back-edge reached with anything still on the");
+    println!("                               evaluation stack gets NO safe point, and such a");
+    println!("                               method may not allocate in a loop - the old");
+    println!("                               rule, kept for the case the map cannot describe.");
+    println!("                               DECLINED: float[]; `rem` on doubles;");
+    println!("                               exception handling.");
+    println!("                               FIELD ACCESS on a heap object goes through a");
+    println!("                               HELPER CALL, never an inline load. The heap's");
+    println!("                               value representation is a Rust enum with boxed");
+    println!("                               payloads and no layout the language promises,");
+    println!("                               so emitting code that read it would fail as a");
+    println!("                               WRONG NUMBER the day a compiler reordered the");
+    println!("                               variants. A call costs more and cannot be wrong");
+    println!("                               that way. int, long, double and reference");
+    println!("                               fields cross; a struct field is REFUSED.");
+    println!("                               The declared kind is CHECKED, not just used to");
+    println!("                               convert: a reference stored as a number would");
+    println!("                               round-trip perfectly and be invisible to the");
+    println!("                               collector.");
+    println!("                               SCALAR REPLACEMENT: an object that provably");
+    println!("                               never leaves the method that made it stops");
+    println!("                               existing - each field becomes a local, and");
+    println!("                               ldfld/stfld become ldloc/stloc. Compiled code");
+    println!("                               never reads a field out of a heap object,");
+    println!("                               because that would make the Rust layout of");
+    println!("                               Value part of this backend's ABI and fail as");
+    println!("                               a wrong number rather than a crash.");
+    println!("                               The proof is narrow ON PURPOSE: newobj outside");
+    println!("                               any loop, a constructor that only chains to");
+    println!("                               Object's, scalar fields only, one local, and");
+    println!("                               used ONLY by ldfld/stfld/dup. Passing it to a");
+    println!("                               method, returning, boxing, locking or taking a");
+    println!("                               field's address all REFUSE.");
+    println!("                               GUARDED DEVIRTUALISATION: a callvirt whose");
+    println!("                               every possible answer is known becomes a type");
+    println!("                               compare and a branch - no call at all.");
+    println!("                               Trusted ONLY when the declaring type is not");
+    println!("                               visible outside its assembly, so nothing");
+    println!("                               loaded later can override it; a public");
+    println!("                               hierarchy is REFUSED even when it looks ideal.");
+    println!("                               Each override must fold to a constant.");
+    println!("                               The receiver's type comes from a helper, never");
+    println!("                               from reading the object - compiled code holds");
+    println!("                               only a handle, an opaque token it cannot");
+    println!("                               dereference. A receiver no guard matches TRAPS:");
+    println!("                               there is no on-stack replacement, so a body");
+    println!("                               that already allocated cannot return to the");
+    println!("                               interpreter, and a wrong proof must say so.");
+    println!("                               A null receiver throws NullReferenceException,");
+    println!("                               told apart from that trap on purpose.");
     println!("                               RECURSION compiles: a method that calls");
     println!("                               ITSELF gets a real calling convention, which");
     println!("                               the inliner cannot provide - splicing a");
     println!("                               method into itself does not terminate.");
-    println!("                               A call to ANOTHER method is declined: its");
-    println!("                               address may not exist yet.");
-    println!("                               Compiled recursion runs on the MACHINE");
-    println!("                               stack, so it counts its own depth and");
-    println!("                               refuses past a limit rather than crashing.");
+    println!("                               A call to ANOTHER compiled method goes through");
+    println!("                               a TABLE of entry addresses the runtime fills in");
+    println!("                               before the caller runs - the callee's address");
+    println!("                               does not exist when the caller is compiled, and");
+    println!("                               two methods may call each other. Each entry");
+    println!("                               names the callee AND the callee's own table,");
+    println!("                               because a callee reads its table from the");
+    println!("                               argument array its caller builds.");
+    println!("                               Compiled calls run on the MACHINE stack, so the");
+    println!("                               runtime counts the BYTES they occupy and");
+    println!("                               refuses past a budget rather than crashing.");
+    println!("                               Bytes, not frames: frames differ in size, so a");
+    println!("                               frame count is too generous for a large one and");
+    println!("                               too mean for a small one. The CLI reserves a");
+    println!("                               large stack for managed code rather than hoping");
+    println!("                               the host gave it one.");
     println!("                               TIERING: a method whose body LOOPS compiles");
     println!("                               on its first call; a loop-free one waits for");
     println!("                               the call count. A single call that runs for");
@@ -635,14 +705,35 @@ pub fn capabilities() -> Result<i32> {
     println!("                               stay made, as on .NET.");
     println!("  code memory                  write-xor-execute; never both at once");
     println!("  tiering                      compile after 32 calls; --no-jit disables");
-    println!("  inlining                     yes - branch-free static callees, one level");
-    println!("                               deep; --no-inline disables");
+    println!("  inlining                     yes - branch-free static callees. A callee");
+    println!("                               that is ITSELF built from smaller callees is");
+    println!("                               flattened before it is spliced, three levels");
+    println!("                               deep: one level only handles a caller whose");
+    println!("                               callees are leaves, and code is written with");
+    println!("                               helpers built out of helpers. Depth AND the");
+    println!("                               size of the result are both bounded. A callee");
+    println!("                               with any branch, or any instance method, is");
+    println!("                               REFUSED. --no-inline disables");
     println!("  AArch64, RISC-V backends     EMIT ONLY, NEVER EXECUTED. Both encode the");
     println!("                               same IL the x86-64 backend does and are");
     println!("                               checked by disassembly, but no compiled");
     println!("                               method has ever run on either architecture.");
     println!("                               Only x86-64 is dispatched to at runtime.");
     println!("  managed call depth limit     {}", interp.limits.max_frames);
+    println!("  debugger hooks               yes - breakpoints by (method, IL offset),");
+    println!("                               step into/over/out, and a view of every");
+    println!("                               frame's arguments, locals and evaluation");
+    println!("                               stack while stopped. `rustnet debug` runs");
+    println!("                               a program through them.");
+    println!("                               A debugger may set breakpoints WHILE stopped");
+    println!("                               and they take effect on the same run.");
+    println!("                               NOT a debug adapter: there is no DAP server,");
+    println!("                               and breakpoints are by IL offset rather than");
+    println!("                               by source line, because mapping a line needs");
+    println!("                               a portable-PDB reader this runtime does not");
+    println!("                               have. VSCode and Rider cannot attach yet.");
+    println!("                               The hook costs nothing when nothing is");
+    println!("                               attached - measured, not assumed.");
     println!("\nMemory");
     println!("  collector                    {}", interp.heap.collector_name());
     println!("  pluggable collectors         yes");
@@ -680,7 +771,6 @@ pub fn capabilities() -> Result<i32> {
     println!("                               different order there, which .NET does not");
     println!("                               promise either way. OrderBy is stable on");
     println!("                               both and agrees exactly.");
-    println!("  generic methods              instantiations bind by type argument");
     println!("  reflection                   System.Type is a real object:");
     println!("                               name, namespace, base type, IsValueType and");
     println!("                               friends, IsAssignableFrom, GetMethods,");
@@ -957,4 +1047,132 @@ fn is_supported_array(sig: &rustclr_core::metadata::TypeSig) -> bool {
     rustclr_jit::translate::is_int_array(sig)
         || rustclr_jit::translate::is_bool_array(sig)
         || rustclr_jit::translate::is_double_array(sig)
+}
+
+/// `rustnet debug` — run under the debugger hooks, printing every stop.
+///
+/// This is not a debug adapter. It is the smallest thing that exercises the
+/// hooks end to end and shows what an adapter would see: where execution
+/// stopped, in what method, at what IL offset, and what the frames held.
+///
+/// Breakpoints are given as `Method:offset` rather than `file:line`, because
+/// mapping a line to an IL offset needs a portable PDB reader and this runtime
+/// does not have one yet. Offering a `file:line` syntax that silently never
+/// matched would be worse than not offering it.
+pub fn debug(path: &str, breakpoints: &[(String, u32)], step: bool) -> Result<i32> {
+    use rustclr_core::debug::{DebugCommand, DebugControl, DebugFrame, Debugger, StopReason};
+
+    let mut interp = Interpreter::with_host(Box::new(rustclr_core::SystemHost::new()));
+    rustclr_bcl::install(&mut interp);
+    let assembly = interp.loader.load_from_file(path)?;
+
+    // Resolve each name to a method before running, so a typo is an error now
+    // rather than a breakpoint that silently never fires.
+    for (name, offset) in breakpoints {
+        // Exact name first, then qualified name. A substring match is
+        // deliberately *not* a fallback: asking for `Triple` and silently
+        // getting `TripledAsync` is a plausible wrong answer, which is the one
+        // kind of failure this runtime refuses everywhere else.
+        let candidates: Vec<rustclr_core::MethodId> = (0..interp.loader.registry.method_count())
+            .map(|i| rustclr_core::MethodId(i as u32))
+            .filter(|&id| {
+                let m = interp.loader.registry.method(id);
+                m.name == *name || m.qualified_name == *name
+            })
+            .collect();
+        let found = match candidates.as_slice() {
+            [one] => *one,
+            [] => {
+                return Err(format!(
+                    "no method named `{name}` in this assembly; `rustnet info {path} --verbose` lists them"
+                )
+                .into())
+            }
+            many => {
+                // Overloads, or the same name on two types. Naming one at
+                // random would put the breakpoint somewhere the user did not
+                // ask for, so this asks rather than guesses.
+                let names: Vec<&str> = many
+                    .iter()
+                    .map(|id| interp.loader.registry.method(*id).qualified_name.as_str())
+                    .collect();
+                return Err(format!(
+                    "`{name}` is ambiguous — {} methods match:
+  {}",
+                    many.len(),
+                    names.join("
+  ")
+                )
+                .into());
+            }
+        };
+        interp.breakpoints.add(found, *offset);
+        println!(
+            "breakpoint: {} at IL_{:04X}",
+            interp.loader.registry.method(found).qualified_name,
+            offset
+        );
+    }
+    if breakpoints.is_empty() && !step {
+        println!("no breakpoints and no --step: the program will run to completion");
+    }
+
+    struct Tracer {
+        step: bool,
+        stops: usize,
+    }
+    impl Debugger for Tracer {
+        fn stopped(
+            &mut self,
+            reason: StopReason,
+            frames: &[DebugFrame<'_>],
+            _control: &mut DebugControl<'_>,
+        ) -> DebugCommand {
+            self.stops += 1;
+            if let Some(top) = frames.first() {
+                println!(
+                    "\n─── {:?} · {} · IL_{:04X} · {} frame(s)",
+                    reason,
+                    top.method_name,
+                    top.il_offset,
+                    frames.len()
+                );
+                if !top.arguments.is_empty() {
+                    println!("  args    {}", render(top.arguments));
+                }
+                if !top.locals.is_empty() {
+                    println!("  locals  {}", render(top.locals));
+                }
+                if !top.stack.is_empty() {
+                    println!("  stack   {}", render(top.stack));
+                }
+                for frame in frames.iter().skip(1).take(8) {
+                    println!("     at {} · IL_{:04X}", frame.method_name, frame.il_offset);
+                }
+            }
+            // A step budget, so `--step` on a real program terminates rather
+            // than printing until the heat death of the universe.
+            if self.step && self.stops < 64 {
+                DebugCommand::StepInto
+            } else if self.step {
+                println!("\n(step budget reached; running to completion)");
+                DebugCommand::Detach
+            } else {
+                DebugCommand::Run
+            }
+        }
+    }
+
+    interp.attach_debugger(Box::new(Tracer { step, stops: 0 }));
+    let code = interp.run_entry_point(assembly)?;
+    Ok(code)
+}
+
+/// A short rendering of a slice of values, for the trace above.
+fn render(values: &[rustclr_core::Value]) -> String {
+    values
+        .iter()
+        .map(|v| format!("{v:?}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }

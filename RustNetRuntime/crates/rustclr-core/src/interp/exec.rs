@@ -1185,6 +1185,19 @@ impl Interpreter {
         }
     }
 
+    /// Whether `ctor` can be skipped entirely, remembered after the first ask.
+    ///
+    /// The answer cannot change: it is a property of the IL, which is fixed
+    /// once loaded.
+    fn constructor_is_a_formality(&mut self, ctor: MethodId) -> bool {
+        if let Some(&known) = self.trivial_ctors.get(&ctor) {
+            return known;
+        }
+        let answer = self.loader.constructor_does_nothing(ctor);
+        self.trivial_ctors.insert(ctor, answer);
+        answer
+    }
+
     fn do_newobj(&mut self, token: Token) -> ExecResult<StepOutcome> {
         // `new Span<int>(ptr, 4)` is a `newobj`, and the width of an element
         // is only in the `int`. Staged the same way a `call` stages it.
@@ -1282,6 +1295,25 @@ impl Interpreter {
         self.maybe_collect();
         let handle = self.alloc_object(type_id);
 
+        // A constructor that provably does nothing is not called.
+        //
+        // Roslyn writes one for every class that declares none: load `this`,
+        // call `object`'s constructor, return. Running it costs two managed
+        // frames and a native call to reach a method whose body is empty, and
+        // the fields it would leave untouched are already at the zero
+        // `alloc_object` gave them. In the `alloc` benchmark that is 600,000
+        // frames and 300,000 native calls that achieve nothing.
+        //
+        // The class constructor still has to run — `ensure_cctor` above covers
+        // the constructed type, and this covers the declaring one, which differ
+        // for a generic construction.
+        if self.constructor_is_a_formality(ctor) {
+            let declaring = self.loader.registry.method(ctor).declaring_type;
+            self.ensure_cctor(declaring)?;
+            self.push(Value::Obj(handle));
+            return Ok(StepOutcome::Continue);
+        }
+
         let mut call_args = Vec::with_capacity(param_count + 1);
         call_args.push(Value::Obj(handle));
         call_args.extend(args);
@@ -1312,8 +1344,15 @@ impl Interpreter {
 
         match obj {
             Value::Obj(h) if !h.is_null() => {
-                let type_id = self.type_of(*h).unwrap_or(TypeId::INVALID);
-                let slot = self.field_slot(type_id, field).ok_or_else(|| self.missing_field(field))?;
+                // No `type_of` here: the slot is a property of the field, so
+                // asking the heap for the receiver's type would be a second
+                // trip through its lock to learn something already known. The
+                // bounds check inside the closure is what keeps a receiver
+                // that somehow lacks the field an error rather than a read of
+                // the wrong slot.
+                let slot = self
+                    .field_slot(TypeId::INVALID, field)
+                    .ok_or_else(|| self.missing_field(field))?;
                 self.heap.with::<ClrObject, _>(*h, |o| o.fields.get(slot).cloned()).flatten()
                     .ok_or_else(|| self.missing_field(field))
             }
@@ -1349,8 +1388,9 @@ impl Interpreter {
         let h = obj.as_handle().filter(|h| !h.is_null()).ok_or_else(
             ExecutionError::null_reference,
         )?;
-        let type_id = self.type_of(h).unwrap_or(TypeId::INVALID);
-        let slot = self.field_slot(type_id, field).ok_or_else(|| self.missing_field(field))?;
+        let slot = self
+            .field_slot(TypeId::INVALID, field)
+            .ok_or_else(|| self.missing_field(field))?;
         let stored = self.heap.with_mut::<ClrObject, _>(h, |o| {
             if slot < o.fields.len() {
                 o.fields[slot] = value;

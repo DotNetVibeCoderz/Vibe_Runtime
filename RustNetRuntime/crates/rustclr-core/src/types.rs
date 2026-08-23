@@ -321,6 +321,15 @@ pub struct RuntimeType {
     pub primitive: Option<Primitive>,
     pub is_abstract: bool,
     pub is_sealed: bool,
+    /// Whether another assembly could derive from this type.
+    ///
+    /// What makes class-hierarchy analysis over the loaded types a *proof*
+    /// rather than a guess: a type nothing outside this assembly can see is a
+    /// type nothing outside can extend, so the overrides already loaded are
+    /// all the overrides there will ever be — even though `Assembly.Load` can
+    /// still bring in more types later. Defaults to `true`, so a type built
+    /// any other way is assumed open and no analysis trusts it.
+    pub externally_extensible: bool,
     /// Generic parameter count of the open definition.
     pub generic_param_count: u32,
     /// Type arguments, when this is a constructed generic type.

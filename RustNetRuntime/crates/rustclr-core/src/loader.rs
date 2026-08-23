@@ -1308,6 +1308,9 @@ impl Loader {
             primitive: None,
             is_abstract: false,
             is_sealed: kind.is_value_like() || kind == TypeKind::String,
+            // A synthesised type carries no visibility, so assume the open
+            // answer: nothing may conclude a hierarchy is closed from it.
+            externally_extensible: true,
             generic_param_count: 0,
             generic_args: Vec::new(),
             generic_definition: None,
@@ -1411,6 +1414,7 @@ impl Loader {
                 primitive: None,
                 is_abstract: td.is_abstract(),
                 is_sealed: td.is_sealed(),
+                externally_extensible: td.is_externally_extensible(),
                 generic_param_count: 0,
                 generic_args: Vec::new(),
                 generic_definition: None,
@@ -2360,6 +2364,127 @@ impl Loader {
             m.qualified_name.clone(),
             native_key(&declaring, &m.name, &m.signature),
         ]
+    }
+
+    /// The value each instance field of `ty` starts at, base-first.
+    ///
+    /// `ClrObject::new` fills with `Value::Null`, which is only right for a
+    /// reference field. Anything that allocates without going through the
+    /// interpreter needs these instead, or a field declared `int` reads back
+    /// as a null.
+    pub fn default_instance_fields(&self, ty: TypeId) -> Vec<Value> {
+        let mut chain: Vec<TypeId> = self.registry.base_chain(ty).collect();
+        chain.reverse();
+        let mut out = Vec::new();
+        for owner in chain {
+            for field in &self.registry.ty(owner).instance_fields {
+                out.push(self.zero_for(&self.registry.field(*field).signature));
+            }
+        }
+        out
+    }
+
+    /// The zero of a field signature, for the kinds a field can hold.
+    fn zero_for(&self, sig: &TypeSig) -> Value {
+        use rustclr_metadata::TypeSig as T;
+        match sig.unwrap_modifiers() {
+            T::I8 | T::U8 => Value::I64(0),
+            T::R4 | T::R8 => Value::F(0.0),
+            T::Boolean | T::Char | T::I1 | T::U1 | T::I2 | T::U2 | T::I4 | T::U4 => {
+                Value::I32(0)
+            }
+            _ => Value::Null,
+        }
+    }
+
+    /// Which slot an instance field occupies, in any object that has it.
+    ///
+    /// The flattened layout is base-first, so a field declared in `T` sits at
+    /// the same index in `T` and in every subclass of `T`. That is what makes
+    /// this a property of the *field* rather than of a receiver, and what lets
+    /// the code generator bake a slot number into compiled code without
+    /// knowing what type will arrive.
+    pub fn instance_field_slot(&self, field: FieldId) -> Option<usize> {
+        let info = self.registry.field(field);
+        if info.is_static {
+            return None;
+        }
+        let mut chain: Vec<TypeId> = self.registry.base_chain(info.declaring_type).collect();
+        chain.reverse();
+        let mut index = 0usize;
+        for ty in chain {
+            for candidate in &self.registry.ty(ty).instance_fields {
+                if *candidate == field {
+                    return Some(index);
+                }
+                index += 1;
+            }
+        }
+        None
+    }
+
+    /// Whether a constructor does nothing but chain to `System.Object`'s.
+    ///
+    /// Three things depend on this and all for one reason: none of them run the
+    /// constructor, so a constructor that did any work would silently not
+    /// happen. Scalar replacement retires the object entirely, the code
+    /// generator's `newobj` allocates without entering a frame, and the
+    /// interpreter skips the call chain outright.
+    ///
+    /// That last one is why this is worth proving rather than assuming. A
+    /// `class Node { public int Value; public Node Next; }` has a constructor
+    /// Roslyn wrote for it that loads `this`, calls `object`'s constructor and
+    /// returns — three instructions, two managed frames and one native call,
+    /// three hundred thousand times in the `alloc` benchmark, to do nothing at
+    /// all.
+    pub fn constructor_does_nothing(&self, ctor: MethodId) -> bool {
+        self.trivial_ctor_within(ctor, 8)
+    }
+
+    /// The same question, following the constructor chain to its root.
+    ///
+    /// `Triangle : Shape : object` chains twice before it reaches
+    /// `Object::.ctor`, and every link has to do nothing for the whole chain to
+    /// do nothing. The depth bound stops a cycle in corrupt metadata becoming a
+    /// hang; a hierarchy deeper than that is simply declined.
+    fn trivial_ctor_within(&self, ctor: MethodId, fuel: u32) -> bool {
+        use crate::opcode::Op;
+        if fuel == 0 {
+            return false;
+        }
+        let info = self.registry.method(ctor);
+        // A constructor taking arguments is doing something with them, or the
+        // arguments would not be there.
+        if !info.signature.params.is_empty() {
+            return false;
+        }
+        let MethodKind::Il(body) = &info.kind else {
+            return false;
+        };
+        let Ok(instructions) = crate::opcode::decode_all(&body.il) else {
+            return false;
+        };
+        let assembly = self.assembly(info.assembly);
+        let mut saw_base_call = false;
+        for ins in &instructions {
+            match ins.op {
+                Op::Nop | Op::Ldarg0 | Op::Ret => {}
+                Op::Call if !saw_base_call => {
+                    let Some(token) = ins.operand.as_token() else { return false };
+                    let Some(target) = self.resolve_method_token(assembly, token) else {
+                        return false;
+                    };
+                    let owner = self.registry.ty(self.registry.method(target).declaring_type);
+                    let reached_the_root = owner.namespace == "System" && owner.name == "Object";
+                    if !reached_the_root && !self.trivial_ctor_within(target, fuel - 1) {
+                        return false;
+                    }
+                    saw_base_call = true;
+                }
+                _ => return false,
+            }
+        }
+        true
     }
 
     /// Total static-field slots allocated.

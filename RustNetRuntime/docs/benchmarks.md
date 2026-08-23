@@ -18,34 +18,122 @@ process start.
 
 | Workload | .NET (ms) | RustCLR (ms) | Ratio | What it stresses |
 | --- | ---: | ---: | ---: | --- |
-| `fib` | 128 | **75** | **0.6×** | Recursive call overhead, fib(27) — **compiled** |
-| `matrix` | 87 | **60** | **0.7×** | 120×120 multiply over `double[]` — **compiled** |
-| `noop` | 124 | **93** | **0.8×** | Process start — nothing else |
-| `sieve` | 119 | **92** | **0.8×** | 1M-element sieve over `bool[]` — **compiled** |
-| `exceptions` | 125 | **129** | **1.0×** | 50k throws through `try`/`catch`/`finally` |
-| `strings` | 94 | **169** | **1.8×** | 20k concatenations, `Length`, `IndexOf` |
-| `arrays` | 117 | **232** | **2.0×** | An `int[]` passed in and walked — **compiled** |
-| `sort` | 112 | **236** | **2.1×** | Quicksort over 200k ints — **compiled, recursive** |
-| `kernels` | 127 | **339** | **2.7×** | Integer arithmetic written longhand — **compiled** |
-| `inlined` | 94 | **442** | **4.7×** | The same arithmetic in helpers — **compiled, inlined** |
-| `alloc` | 101 | 1,072 | 10.6× | 300k allocations with collection pressure |
-| `virtual` | 112 | 1,962 | 17.5× | 2M virtual calls through a base reference |
-| `fields` | 109 | 3,173 | 29.1× | 3M instance field reads and writes |
+| `fib` | 111 | **77** | **0.7×** | Recursive call overhead, fib(27) — **compiled** |
+| `fields` | 124 | **95** | **0.8×** | 3M field reads and writes — **compiled, scalarised** |
+| `noop` | 84 | **73** | **0.9×** | Process start — nothing else |
+| `sieve` | 93 | **85** | **0.9×** | 1M-element sieve over `bool[]` — **compiled** |
+| `matrix` | 105 | **92** | **0.9×** | 120×120 multiply over `double[]` — **compiled** |
+| `sort` | 123 | **109** | **0.9×** | Quicksort over 200k ints — **compiled, recursive** |
+| `inlined` | 111 | **97** | **0.9×** | Arithmetic factored into helpers — **compiled, inlined** |
+| `virtual` | 118 | 129 | 1.1× | 2M virtual calls — **compiled, devirtualised** |
+| `exceptions` | 144 | 159 | 1.1× | 50k throws through `try`/`catch`/`finally` |
+| `kernels` | 96 | 142 | 1.5× | Integer arithmetic in helpers that loop — **compiled, called** |
+| `alloc` | 117 | 199 | 1.7× | 300k allocations with collection pressure — **compiled** |
+| `arrays` | 135 | 244 | 1.8× | An `int[]` passed in and walked — **compiled** |
+| `strings` | 102 | 203 | 2.0× | 20k concatenations, `Length`, `IndexOf` |
 
-`sieve` and `matrix` are the two worth reading carefully. Both dropped from
-around 1,500 ms to under 100 ms when the tiering heuristic started compiling
-methods that loop, and both are now *at the process-start floor* — `noop` is
-70 ms, so almost everything left in those two rows is starting the process. The
-ratio against .NET is therefore mostly RustCLR's faster startup rather than
-faster computation, and reading them as "twice as fast as .NET at numerics"
-would be wrong.
+Every row's checksum is compared between the two runtimes before it is timed;
+a mismatch prints `MISMATCH` instead of a number, because a faster wrong answer
+is not a result.
+
+The top of that table needs reading carefully rather than triumphantly. `noop`
+is 73 ms, and every row down to `sort` lands within about 35 ms of that floor
+— so
+much of what they measure is **starting the process**, not computing.
+
+Their own history is the honest comparison, and it is where the work shows:
+
+| Row | was | now | what changed |
+| --- | ---: | ---: | --- |
+| `sieve`, `matrix` | ~1,500 ms | 85–92 ms | tiering compiles a method whose body loops |
+| `fields` | 3,173 ms | 95 ms | scalar replacement retires the object |
+| `virtual` | 1,923 ms | 129 ms | guarded devirtualisation |
+| `alloc` | 1,093 ms | 199 ms | safe points, then compiled field access — the loop stopped being interpreted |
+| `kernels` | 350 ms | 142 ms | the transition stopped doing needless work, then compiled methods could call each other |
+| `inlined` | 477 ms | 97 ms | the same, then the inliner learned to flatten more than one level |
+
+### What `kernels` and `inlined` actually measured
+
+Both are compiled and both were slow, which looked like a code-quality problem
+and was not — three times over, and none of the three was about the emitted
+instructions.
+
+The first was the **transition**. `kernels` made 240,009 managed calls of which
+239,969 were calls *into* compiled code, and interpreted only 2.2M instructions.
+Each transition built an allocation context — three types resolved by name,
+three array constructions searched for — for methods that never allocate.
+
+The second was **inlining depth**. `inlined`'s driving loop calls `Step`, which
+is built from three smaller helpers. A one-level inliner splices a leaf into its
+caller; `Step` is not a leaf, so the loop could not compile at all and paid
+400,031 transitions. Flattening a callee's own calls before splicing it took
+that to one.
+
+The third was that **a compiled method could not call another one**. `kernels`
+factors its work into helpers that *loop*, so they cannot be spliced at any
+depth — the only way to compile the loop around them was to give compiled code
+a calling convention. That took the row from 266 ms to 142 ms, and `sort` with
+it, since `Sort` calls `QuickSort`.
+
+### Where `alloc` used to spend its time
+
+`alloc` was the slowest row in the suite for a long time, and the obvious
+explanations were both wrong. Deleting each candidate is what settled it:
+
+| Experiment | Result |
+| --- | ---: |
+| Baseline (interpreted) | 589 ms |
+| Every `new Node()` hands back the *same* object | 548 ms |
+| Field reads and writes become no-ops | 630 ms |
+| The whole of `newobj` short-circuited | 506 ms |
+
+Removing allocation entirely saved nothing. Removing field access saved
+nothing. Only the whole `newobj` path moved it, by about 14% — and the other
+86% was simply the interpreter executing 9.6M IL instructions.
+
+So the answer was never a faster allocator; it was to stop interpreting the
+loop. That needed two things the backend refused at the time: allocation inside
+a loop, which needed safe points, and field access on a heap object, which
+needed a way to reach a field without knowing the heap's layout. With both
+built, the row stopped being interpreted: **199 ms**, 1.7× .NET.
+
+### A worked example of measuring a change
+
+Pinning a method's two busiest locals and arguments in callee-saved registers
+looked like it did nothing. A single run of each build put `kernels` at 363 ms
+against 350 ms and `inlined` at 483 ms against 477 ms — no better, possibly
+worse, and the emitted code grew by about 10%.
+
+That reading was wrong twice over. The first measurement was taken while the
+transition cost above still dominated, so there was nothing for better code to
+improve. And one run per build cannot resolve a 5% difference on a machine that
+drifts by ten.
+
+Measured properly — both binaries in one session, alternating, best of eleven:
+
+| Row | pinned | unpinned | |
+| --- | ---: | ---: | ---: |
+| `fields` | 69 ms | 89 ms | **−22%** |
+| `sieve` | 94 ms | 103 ms | **−8%** |
+| `virtual` | 102 ms | 112 ms | **−8%** |
+| `fib` | 79 ms | 82 ms | −3% |
+| `matrix` | 89 ms | 89 ms | 0% |
+| `kernels` | 252 ms | 252 ms | 0% |
+| `inlined` | 297 ms | 298 ms | 0% |
+
+The pattern is consistent once seen: pinning pays where the *whole loop* is
+compiled and the register is reused across iterations, and costs nothing where
+short compiled leaves are called from an interpreted loop. Intermediate sample
+sizes gave `kernels` at +2% and `inlined` at +9% — both of which vanished at
+eleven samples, which is what a difference that is really zero looks like on
+the way there.
 
 ### How much of a difference is real
 
 **About ten percent of run-to-run drift, on this machine, within one session.**
-That is measured, not assumed: `fields` gave 2,856 ms, then 3,097 ms, then
-3,200 ms across one afternoon on the same binary, drifting slower as the machine
-warmed. Two full suite runs an hour apart put every row 5–10% above the table
+That is measured, not assumed: back when `fields` was interpreted it gave
+2,856 ms, then 3,097 ms, then 3,200 ms across one afternoon on the same binary,
+drifting slower as the machine warmed. Two full suite runs an hour apart put every row 5–10% above the table
 above.
 
 So a 5% difference between two runs of this suite means nothing. Before
@@ -68,84 +156,53 @@ than the console-only subset accounts for about 3 ms of it, measured with
 
 ## Reading these numbers
 
-**Subtract the `noop` row.** Both figures include process start, which is most
-of .NET's time on the shorter workloads and most of RustCLR's on the compiled
-ones. `fields` at 112 ms on .NET is roughly 110 ms of startup and a couple of
-milliseconds of work; RustCLR's 3,256 ms is 70 ms of startup and about 3.2 s of
-work. The compute ratio on an interpreted row is therefore far worse than the
-wall-clock ratio suggests — closer to 100× on the tightest loops.
+**Subtract the `noop` row.** Both figures include process start, which is now
+most of RustCLR's time on the faster half of the table. `fields` at 95 ms sits
+22 ms above a 73 ms floor: the 3M field accesses it performs account for that
+22 ms, not for 95. Reading any sub-1× ratio as "faster at arithmetic" would be
+wrong — it mostly says RustCLR starts quickly, having no JIT to warm up.
 
-The same subtraction cuts the other way on `sieve` and `matrix`: at 60 ms and
-84 ms against a 70 ms floor, almost nothing is left to attribute to
-computation, and their sub-1× ratios say more about process start than about
-arithmetic.
+**Every row is compiled or native now.** That was not true for most of this
+file's history, and the sections above record how each row stopped being
+interpreted. What is left is worth stating plainly:
 
-That is what interpretation costs. .NET compiles IL to machine code; RustCLR
-walks it instruction by instruction — around 33 million IL instructions per
-second on this machine.
+* `strings` and `exceptions` were never interpreted in the interesting sense —
+  that work happens in native Rust inside RustBCL.
+* `arrays` and `alloc` are compiled but still the slowest ratios, and both are
+  dominated by something other than the emitted code: array element access
+  costs a bounds check per element, and `alloc` spends its time in the
+  allocator and the collector rather than in the loop around them.
+* `kernels` is compiled *and* calls compiled helpers. It is the row that
+  required the calling convention, because its helpers loop and so can never be
+  spliced by the inliner at any depth.
 
-**Except where the code generator reaches.** Six rows are compiled to machine
-code rather than interpreted — `sieve`, `matrix`, `arrays`, `kernels`,
-`inlined`, and parts of others.
+**What compilation is worth, where it can be isolated.** These are measured by
+running the same workload with `--no-jit`, so the comparison is the same code
+either way:
 
-`kernels` writes it out longhand, in methods that call nothing and allocate
-nothing — the shape the backend has always taken. Compiled it runs in 269 ms
-against 2,971 ms interpreted: **11.0× faster**, moving it from 20× slower than
-.NET to 1.8×.
+| Workload | interpreted | compiled | speedup |
+| --- | ---: | ---: | ---: |
+| `arrays` — an `int[]` passed in and walked | 18,401 ms | 205 ms | **89.8×** |
+| `fields` — 3M reads and writes of an object's fields | 3,123 ms | 120 ms | **26.0×** |
+| `virtual` — 2M calls through a base reference | 1,923 ms | 96 ms | **20.0×** |
+| `kernels` — arithmetic written out longhand | 2,971 ms | 269 ms | **11.0×** |
 
-`arrays` is the one with the widest gap. An `int[]` that arrives
-as a *parameter* is handed to compiled code as a data pointer and a length, so
-element access is a bounds check and a scaled-index load. Interpreted it takes
-18,401 ms; compiled, 205 ms — **89.8×**, because element access is exactly where
-the interpreter pays most: a handle resolution and a `Value` for every element.
+`arrays` is the widest because element access is exactly where the interpreter
+pays most: a handle resolution and a `Value` for every element, against a bounds
+check and a scaled-index load.
 
-`sieve` and `matrix` were the two this table used to embarrass. Both are
-array-bound, both allocate their arrays as *locals*, and the backend declined
-any method that allocated — so `arrays` was added beside them to measure the
-part that did compile. Both compile now: allocation from compiled code is
-sound because allocating does not itself collect and a compiled method cannot
-return a reference, so nothing it allocates outlives the call.
-
-Neither moved until the *tiering* changed as well. Each is called once, so a
-call-count threshold never fired however long it ran; a method whose body loops
-now compiles on its first call. Two separate limits, and the benchmark showed
-no improvement until both were gone — which is why they are described together
-here.
-
-`sort` compiles now too. `QuickSort` is recursive, which is the one call shape
-the inliner cannot remove — splicing a method into itself does not terminate —
-so it needed a calling convention of its own: the arguments go into an outgoing
-frame the prologue reserves, and the callee is entered exactly as the tier
-enters the method, same argument-array shape and same trap slot.
-
-Compiled recursion runs on the *machine* stack rather than the interpreter's
-frame budget, which cannot be grown or unwound the same way, so compiled code
-counts its own depth and traps past a limit. `Down(200000)` reports the same
-catchable exception interpreted and compiled; .NET stack-overflows and dies.
-
-`Sort` itself — the wrapper that calls `QuickSort` — is still interpreted,
-because a call to *another* method needs an address that may not exist when the
-caller is compiled. Only self-calls are emitted.
-
-`inlined` factors the identical arithmetic into small static helpers, which is
-what code in the wild actually looks like. Every one of those calls used to
-disqualify the calling method outright. With the inliner splicing them in:
+**Inlining and the calling convention do different jobs, and the contrast is
+the point.** `inlined` factors the same arithmetic as `kernels` into small
+static helpers, which is what code in the wild looks like:
 
 | | interpreted | compiled, `--no-inline` | compiled |
 | --- | ---: | ---: | ---: |
 | `inlined` | 1,629 ms | 1,148 ms | **400 ms** |
 
-**2.9× of that is the inliner alone.** Without it, only the leaf helpers compile
-and the method around them stays interpreted. Inlining is worth nothing at all
-on `kernels` — 1.0×, because its callees contain loops and none are eligible —
-and that contrast is the point. The gain is not in compiling more instructions;
-it is in compiling code that was written normally.
-
-Every other row is unchanged by the JIT, because every other row uses arrays and
-`rustnet jit` declines them all. That is why these two were added *beside* the
-existing workloads rather than replacing one: the interesting number is not just
-what compilation is worth where it applies, but how narrow "where it applies"
-still is.
+Inlining is worth nothing at all on `kernels` — its helpers contain loops, so
+none are eligible at any depth — and that is precisely why the calling
+convention had to exist. One optimisation compiles code that was *factored*;
+the other compiles code that was factored into things too big to splice.
 
 ```bash
 rustnet jit benchmarks/Benchmarks/bin/Release/net10.0/Benchmarks.dll

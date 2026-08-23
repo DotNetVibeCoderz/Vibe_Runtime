@@ -44,7 +44,7 @@ use crate::codepage::{CodePage, CodePageError};
 use crate::translate::{Backend, BinOp, Cond, UnOp};
 use crate::verify::MethodAnalysis;
 use crate::{analyse, CompileError, CompiledCode, Compiler, Tier};
-use rustclr_core::opcode::{decode_all, Instruction, Op};
+use rustclr_core::opcode::{decode_all, Instruction};
 use rustclr_core::{Loader, MethodId, MethodKind, TypeRegistry};
 use std::collections::HashMap;
 
@@ -70,25 +70,156 @@ const RDI: u8 = 7;
 /// helper needs. System V uses rdi/rsi/rdx; Windows uses rcx/rdx/r8.
 const RSI: u8 = 6;
 const R8: u8 = 8;
+const R9: u8 = 9;
+const R12: u8 = 12;
+const R13: u8 = 13;
 const R14: u8 = 14;
 const R15: u8 = 15;
 
 /// Evaluation-stack slots kept in registers, shallowest first.
 const CACHED: [u8; 2] = [R14, R15];
 
+/// Registers a method's busiest locals and arguments are pinned to.
+///
+/// R12 and R13 are the two general-purpose registers callee-saved under *both*
+/// the Windows and System V conventions that nothing else here has claimed —
+/// RBX holds the argument pointer, RBP the frame, R14 and R15 the top two
+/// evaluation-stack slots. Being callee-saved is what lets a pinned value
+/// survive a call to an allocation helper without being spilled around it.
+const PINNED: [u8; 2] = [R12, R13];
+
 /// Bytes of frame occupied by callee-saved registers pushed after `rbp` is
 /// established. Locals and spill slots start below this.
-const SAVED_BYTES: i32 = 24;
+const SAVED_BYTES: i32 = 40;
+
+/// A slot a method reads and writes: an argument, or a local.
+///
+/// The two are pinned by the same mechanism because they behave the same way
+/// once compiled — a frame slot read and written by index. They are told apart
+/// only when the prologue has to give a pinned register its starting value: an
+/// argument's comes from the caller, a local's is zero.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Pinnable {
+    Arg(usize),
+    Local(usize),
+}
+
+/// Which slots are worth a register, busiest first.
+///
+/// Counting uses is a crude heuristic and deliberately so: a loop-weighted
+/// count would be better, and would also be another thing that can be wrong in
+/// code whose failures are silent. A slot read four times in a method is very
+/// likely read four times in its loop.
+/// Whether a callee is one this backend would take.
+///
+/// Asked at *compile* time, and deliberately a shape question rather than an
+/// attempt to compile: two methods may call each other, and compiling one to
+/// answer a question about the other would not terminate. Whether the callee is
+/// actually compiled is settled at run time, before the caller first runs.
+fn could_compile(loader: &Loader, callee: MethodId) -> bool {
+    let info = loader.registry.method(callee);
+    if info.signature.has_this || !matches!(info.kind, MethodKind::Il(_)) {
+        return false;
+    }
+    crate::translate::shape_might_compile_after_inlining(&loader.registry, callee)
+}
+
+fn slots_worth_pinning(
+    instructions: &[Instruction],
+    locals: usize,
+    reference_slots: &[Pinnable],
+) -> Vec<Pinnable> {
+    use rustclr_core::opcode::Op::*;
+    let mut args: std::collections::BTreeMap<usize, usize> = Default::default();
+    let mut locs: std::collections::BTreeMap<usize, usize> = Default::default();
+    for ins in instructions {
+        let index = |ins: &Instruction| ins.operand.as_var().unwrap_or(0) as usize;
+        match ins.op {
+            Ldarg0 => *args.entry(0).or_default() += 1,
+            Ldarg1 => *args.entry(1).or_default() += 1,
+            Ldarg2 => *args.entry(2).or_default() += 1,
+            Ldarg3 => *args.entry(3).or_default() += 1,
+            LdargS | Ldarg | StargS | Starg => *args.entry(index(ins)).or_default() += 1,
+            Ldloc0 | Stloc0 => *locs.entry(0).or_default() += 1,
+            Ldloc1 | Stloc1 => *locs.entry(1).or_default() += 1,
+            Ldloc2 | Stloc2 => *locs.entry(2).or_default() += 1,
+            Ldloc3 | Stloc3 => *locs.entry(3).or_default() += 1,
+            LdlocS | Ldloc | StlocS | Stloc => *locs.entry(index(ins)).or_default() += 1,
+            _ => {}
+        }
+    }
+    let mut ranked: Vec<(usize, Pinnable)> = args
+        .into_iter()
+        .map(|(i, n)| (n, Pinnable::Arg(i)))
+        .chain(
+            locs.into_iter()
+                // A local index past the declared count would be a bug
+                // elsewhere; pinning it would turn that into a silent one.
+                .filter(|(i, _)| *i < locals)
+                .map(|(i, n)| (n, Pinnable::Local(i))),
+        )
+        .collect();
+    // Busiest first, and by slot within a tie so the choice does not depend on
+    // map iteration order — identical input must give identical code.
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| format!("{:?}", a.1).cmp(&format!("{:?}", b.1))));
+    // A slot holding a handle is never pinned. The collector finds a compiled
+    // frame's roots by reading the frame at offsets fixed when the method was
+    // compiled, and a value living in a register is not at any of them. Keeping
+    // references in memory is what lets the stack map be a list of offsets
+    // rather than a description of the machine state.
+    ranked.retain(|(_, slot)| !reference_slots.contains(slot));
+    ranked.truncate(PINNED.len());
+    ranked.into_iter().map(|(_, slot)| slot).collect()
+}
 
 /// A compiled method, kept alive for as long as the process may call it.
 pub struct NativeMethod {
     pub method: MethodId,
     pub arg_count: usize,
     pub returns_value: bool,
+    /// Classes this body allocates or tests against, in the order its code
+    /// numbers them: the type, its instance-field count, and the array type of
+    /// a `T[]` of it.
+    ///
+    /// Travels with the method rather than living in a table the tier owns,
+    /// because the numbering is decided when this body is emitted and means
+    /// nothing to any other body.
+    pub object_shapes: Vec<(rustclr_core::TypeId, usize, rustclr_core::TypeId)>,
+    /// Whether this body can allocate.
+    ///
+    /// A body that cannot needs no allocation context, and building one is not
+    /// free: it resolves three types by name and searches for three array
+    /// constructions. Doing that per call, for a method that never allocates,
+    /// was most of what the `kernels` benchmark measured.
+    pub allocates: bool,
+    /// Frame offsets of the slots a collection reaching into this method's
+    /// frame must read as roots. Empty unless the body holds a reference.
+    pub reference_slots: Vec<i32>,
+    /// Frame offsets of the slots holding an array descriptor address. A safe
+    /// point matches these back to the allocations that produced them.
+    pub array_slots: Vec<i32>,
+    /// The methods this body calls, in the order its code indexes them.
+    pub call_table: Vec<MethodId>,
+    /// Their entry addresses, resolved before this body first runs.
+    ///
+    /// Boxed so the address handed to compiled code is stable, and separate
+    /// from `call_table` because the addresses are only known once every callee
+    /// has been compiled — which cannot happen while this one is being
+    /// compiled, since two methods may call each other.
+    pub call_addresses: Option<Box<[i64]>>,
+    /// Kept alive because the emitted prologue holds its address, and the
+    /// slot vectors above are what it points into.
+    #[allow(dead_code)]
+    frame_map: Option<Box<crate::alloc::FrameMap>>,
     page: CodePage,
 }
 
 impl NativeMethod {
+    /// The address compiled code jumps to, for another method's call table.
+    pub fn entry(&self) -> i64 {
+        self.page.as_ptr() as i64
+    }
+
     /// Runs the compiled body.
     ///
     /// # Safety
@@ -129,11 +260,33 @@ pub struct X64Backend {
     /// Settable so a test can compile the same corpus both ways and compare;
     /// that is the only way to show the inliner is doing anything.
     pub inline: bool,
+    /// Whether objects that never escape are replaced by their fields.
+    ///
+    /// Settable for the same reason `inline` is: an optimisation that produces
+    /// identical output is indistinguishable from one that never ran, unless a
+    /// test can turn it off and watch something change.
+    pub scalarise: bool,
+    /// How many objects stopped existing, across every method compiled.
+    pub objects_scalarised: usize,
+    /// Whether a virtual call with a known, closed set of answers is compiled
+    /// as a guarded chain rather than declined.
+    ///
+    /// Settable for the same reason `inline` and `scalarise` are: an
+    /// optimisation whose output is identical either way is indistinguishable
+    /// from one that never ran unless a test can turn it off.
+    pub devirtualise: bool,
 }
 
 impl Default for X64Backend {
     fn default() -> Self {
-        Self { methods_compiled: 0, bytes_emitted: 0, inline: true }
+        Self {
+            methods_compiled: 0,
+            bytes_emitted: 0,
+            inline: true,
+            scalarise: true,
+            objects_scalarised: 0,
+            devirtualise: true,
+        }
     }
 }
 
@@ -157,6 +310,13 @@ impl X64Backend {
             method,
             arg_count: info.arg_count(),
             returns_value: !info.returns_void(),
+            allocates: !compiled.object_shapes.is_empty() || compiled.allocates_arrays,
+            reference_slots: compiled.reference_slots,
+            array_slots: compiled.array_slots,
+            call_table: compiled.call_table,
+            call_addresses: None,
+            frame_map: compiled.frame_map,
+            object_shapes: compiled.object_shapes,
             page,
         })
     }
@@ -183,6 +343,13 @@ impl Compiler for X64Backend {
         // is exactly what happened, and made a differential test pass while
         // compiling nothing.
         if crate::translate::float_shape_possible(registry, method) {
+            return true;
+        }
+        // Same reasoning for an object local: a method that creates one gets
+        // past this screen on its declared types, and `compile` decides once
+        // `escape::scalarise` has had a look at the real body. Rejecting here
+        // would mean no method with an object ever reached the analysis.
+        if self.scalarise && crate::translate::scalarisation_possible(registry, method) {
             return true;
         }
         if self.inline {
@@ -218,6 +385,33 @@ impl Compiler for X64Backend {
             }
         }
 
+        // Then scalar replacement, *after* inlining: splicing a callee in can
+        // turn an object that was passed to it into one that never leaves this
+        // method, and the analysis should see the body as it finally is.
+        //
+        // An object whose fields become locals stops needing `ldfld` at all —
+        // which is how a method the backend used to decline for object access
+        // becomes plain arithmetic over frame slots.
+        // The locals the *rewritten* body actually uses. Identical to the
+        // declared ones until a pass changes the body.
+        let mut effective_locals = body.locals.clone();
+        effective_locals.resize(locals, rustclr_metadata::TypeSig::I4);
+        if self.scalarise {
+            if let Some(flat) = crate::escape::scalarise(loader, method, &instructions, locals) {
+                instructions = flat.instructions;
+                locals += flat.extra_locals.len();
+                self.objects_scalarised += flat.objects;
+                // The retired object locals are dead — nothing reads or writes
+                // them — but their declared type is still a class, which every
+                // gate refuses. Substituting a scalar says "ignore this slot"
+                // without teaching each gate about liveness.
+                for dead in flat.dead_locals {
+                    effective_locals[dead as usize] = rustclr_metadata::TypeSig::I4;
+                }
+                effective_locals.extend(flat.extra_locals);
+            }
+        }
+
         // The shape check runs against the *rewritten* body, so an inlined
         // caller is judged on what it actually became.
         //
@@ -231,10 +425,16 @@ impl Compiler for X64Backend {
             method,
             &instructions,
             true,
+            &effective_locals,
         ) {
             crate::floats::FloatMap::default()
         } else {
-            match crate::translate::float_shape(&loader.registry, method, &instructions) {
+            match crate::translate::float_shape(
+                &loader.registry,
+                method,
+                &instructions,
+                &effective_locals,
+            ) {
                 Some(map) => map,
                 None => {
                     return Err(CompileError::Unsupported(
@@ -245,25 +445,23 @@ impl Compiler for X64Backend {
         };
 
         let returns_value = !info.returns_void();
-        // `max_stack` is the declared figure for the original body; splicing
-        // can only add to the depth, so the inlined arguments are allowed for.
-        let max_stack = body.max_stack.saturating_add(8);
-        // A `call` moves the stack by however many arguments it takes, less
-        // one if it leaves a result. Treating it as zero made the depth walk
-        // disagree with itself the moment a recursive call appeared — reported
-        // as "reached with stack depth 3, but 0 on another path", which is the
-        // verifier noticing rather than a bug in the method.
-        let arg_count = info.arg_count();
+        // A generous ceiling for the *verifier*, which errors above it. The
+        // frame is sized from what the walk actually observed, further down —
+        // guessing here and then trusting the guess is how spill slots end up
+        // past the end of the frame.
+        let max_stack = body.max_stack.saturating_add(64);
+        // A `call` moves the stack by however many arguments *the callee*
+        // takes, less one if the callee leaves a result. Reading those off the
+        // enclosing method instead is right only when the call is recursive,
+        // and silently wrong otherwise: every non-recursive call got the
+        // caller's own delta, the running depth drifted, and the walk reported
+        // "reached with stack depth 2, but 0 on another path" — a stack error
+        // in a method whose stack was fine. The callee's real signature is the
+        // only correct source, so this uses the same helper the interpreter
+        // tier does.
+        let enclosing_assembly = loader.assembly(info.assembly);
         let analysis = analyse(&instructions, max_stack, &body.exception_clauses, |ins| {
-            match ins.op {
-                Op::Ret if returns_value => -1,
-                Op::Call => {
-                    let popped = arg_count as i32;
-                    let pushed = if returns_value { 1 } else { 0 };
-                    pushed - popped
-                }
-                _ => 0,
-            }
+            crate::call_stack_delta(loader, enclosing_assembly, returns_value, ins)
         })
         .map_err(CompileError::Invalid)?;
 
@@ -272,32 +470,175 @@ impl Compiler for X64Backend {
         // inside a loop — see `newarr_kinds` on why unbounded allocation from
         // compiled code is not acceptable.
         let assembly = loader.registry.method(method).assembly;
+        // Decided before the allocation gates, because whether this body can
+        // be stopped mid-loop is what decides whether it may allocate there.
+        let safepoints =
+            crate::translate::safepoints(&instructions, &analysis).unwrap_or_default();
+        let polls = !safepoints.is_empty();
+        let mut shapes = crate::translate::ShapeTable::default();
         let Some(newarr_kinds) =
-            crate::translate::newarr_kinds(loader, assembly, &instructions)
+            crate::translate::newarr_kinds(loader, assembly, &instructions, &mut shapes, polls)
         else {
             return Err(CompileError::Unsupported(
                 "this method allocates something the backend cannot, or allocates in a loop"
                     .into(),
             ));
         };
-        // Which calls target this method itself. Anything else is declined:
-        // calling another compiled method needs its address, which may not
-        // exist yet, and the inliner already covers the small-callee case.
+        // Which calls target this method itself, and where the rest go.
         let Some(self_calls) =
             crate::translate::self_calls(loader, assembly, method, &instructions)
         else {
             return Err(CompileError::Unsupported(
-                "this method calls something other than itself".into(),
+                "a call this backend cannot resolve".into(),
             ));
         };
+        // A call to another method is indirect through a table the tier fills
+        // in, so the callee's address does not have to exist yet. Whether it
+        // *could* be compiled is settled here; whether it *will* be is settled
+        // at run time, which is what lets two methods call each other.
+        let Some(targets) = crate::translate::call_targets(
+            loader,
+            assembly,
+            method,
+            &instructions,
+            |callee| could_compile(loader, callee),
+        ) else {
+            return Err(CompileError::Unsupported(
+                "a call to a method this backend would not compile".into(),
+            ));
+        };
+        let call_returns: std::collections::BTreeMap<u32, bool> = targets
+            .sites
+            .keys()
+            .map(|offset| {
+                let token = instructions
+                    .iter()
+                    .find(|i| i.offset == *offset)
+                    .and_then(|i| i.operand.as_token());
+                let returns = token
+                    .and_then(|t| loader.resolve_method_token(loader.assembly(assembly), t))
+                    .map(|m| !loader.registry.method(m).returns_void())
+                    .unwrap_or(false);
+                (*offset, returns)
+            })
+            .collect();
+        let call_table = targets.table;
+        let widest_callee = targets.widest;
+        // Objects this body creates, and the classes it names to do so.
+        let Some(newobj_shapes) =
+            crate::translate::newobj_shapes(loader, assembly, &instructions, &mut shapes, polls)
+        else {
+            return Err(CompileError::Unsupported(
+                "newobj of a class with a real constructor, or inside a loop".into(),
+            ));
+        };
+        // Virtual calls whose every answer is known. A `callvirt` this does not
+        // cover makes the walk decline the method, which is where the refusal
+        // belongs — here there is nothing to say about a call site not reached.
+        let devirt = if self.devirtualise {
+            crate::devirt::plan(loader, method, &instructions)
+        } else {
+            Default::default()
+        };
+        let object_shapes = shapes.entries;
+
+        // The slots a collection reaching into this frame must read. Declared
+        // types decide it; nothing is inferred.
+        let params: Vec<rustclr_metadata::TypeSig> = info.signature.params.to_vec();
+        let reference_pinnables: Vec<Pinnable> = params
+            .iter()
+            .enumerate()
+            .filter(|(_, sig)| crate::translate::is_reference_sig(sig))
+            .map(|(i, _)| Pinnable::Arg(i))
+            .chain(
+                effective_locals
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, sig)| crate::translate::is_reference_sig(sig))
+                    .map(|(i, _)| Pinnable::Local(i)),
+            )
+            .collect();
+        // Array locals hold a descriptor address, and a safe point finds a
+        // live array by reading those slots — so they must be *in* the frame,
+        // not in a register. Both kinds are excluded from pinning for the same
+        // reason: what the collector cannot see, it reclaims.
+        let array_pinnables: Vec<Pinnable> = effective_locals
+            .iter()
+            .enumerate()
+            .filter(|(_, sig)| {
+                crate::translate::is_int_array(sig)
+                    || crate::translate::is_double_array(sig)
+                    || crate::translate::is_bool_array(sig)
+                    || crate::translate::is_ref_array(sig)
+            })
+            .map(|(i, _)| Pinnable::Local(i))
+            .collect();
+        let array_slots: Vec<i32> = if polls {
+            array_pinnables
+                .iter()
+                .map(|p| match p {
+                    Pinnable::Local(i) => -SAVED_BYTES - 8 * (1 + *i as i32),
+                    Pinnable::Arg(_) => 0,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let reference_slots = crate::translate::reference_slots(
+            &params,
+            &effective_locals,
+            |i| -SAVED_BYTES - 8 * (1 + i as i32),
+            // An argument lives in the caller's array rather than this frame,
+            // and the array outlives the call — the tier owns it. It is rooted
+            // by the tier's own pin instead, so it contributes no frame offset.
+            |_| None,
+        );
+
+        // Slot and kind for every field access. Declined as a whole if any of
+        // them names something that has no one-word representation.
+        let Some(fields) =
+            crate::translate::field_accesses(loader, assembly, &instructions)
+        else {
+            return Err(CompileError::Unsupported(
+                "a field whose type this backend cannot carry".into(),
+            ));
+        };
+
+        // Built before emitting: the prologue writes a frame record naming
+        // this map, so its address has to exist first. Boxed, and the backing
+        // vectors moved into the result — moving a `Box` or a `Vec` does not
+        // move what it points at, so the addresses stay good.
+        let reference_slots = if polls { reference_slots } else { Vec::new() };
+        let array_slots = if polls { array_slots } else { Vec::new() };
+        let frame_map = Box::new(crate::alloc::FrameMap {
+            reference_slots: reference_slots.as_ptr(),
+            reference_len: reference_slots.len(),
+            array_slots: array_slots.as_ptr(),
+            array_len: array_slots.len(),
+        });
+        let frame_map_address = frame_map.as_ref() as *const crate::alloc::FrameMap as i64;
+
         let plan = crate::translate::Plan {
+            fields,
+            call_sites: targets.sites,
+            call_returns,
             floats,
             newarr_kinds,
             self_calls,
             arg_count: info.arg_count(),
             returns_value,
+            newobj_shapes,
+            devirt,
+            safepoints,
         };
 
+        // The frame is sized from the depth the verifier *measured*, not from
+        // the declared figure. Splicing three levels of callee into a caller
+        // can take the evaluation stack well past what the original body
+        // declared, and a frame sized from the declaration would have its
+        // spill slots land beyond its own end — over the outgoing argument
+        // array and the frame record, which is a jump to a wild address rather
+        // than a wrong answer.
         let bytes = emit(
             &instructions,
             &analysis,
@@ -305,10 +646,30 @@ impl Compiler for X64Backend {
             returns_value,
             info.arg_count(),
             &plan,
+            frame_map_address,
+            widest_callee,
+            &if polls {
+                let mut both = reference_pinnables.clone();
+                both.extend(array_pinnables.iter().copied());
+                both
+            } else {
+                reference_pinnables.clone()
+            },
         )?;
         self.methods_compiled += 1;
         self.bytes_emitted += bytes.len();
-        Ok(CompiledCode { method, tier: Tier::Jit, bytes, analysis })
+        Ok(CompiledCode {
+            method,
+            tier: Tier::Jit,
+            bytes,
+            analysis,
+            object_shapes,
+            allocates_arrays: !plan.newarr_kinds.is_empty(),
+            reference_slots,
+            array_slots,
+            frame_map: Some(frame_map),
+            call_table,
+        })
     }
 }
 
@@ -506,11 +867,12 @@ impl Assembler {
         self.imm32(offset);
     }
 
-    /// `inc reg`.
-    fn inc_reg(&mut self, reg: u8) {
+    /// `add reg, imm32`.
+    fn add_ri32(&mut self, reg: u8, value: i32) {
         self.rex(true, 0, reg);
-        self.byte(0xFF);
+        self.byte(0x81);
         self.modrm(0b11, 0, reg);
+        self.imm32(value);
     }
 
     /// `cmp reg, imm32`.
@@ -670,6 +1032,13 @@ impl Assembler {
         self.code.len() - 1
     }
 
+    /// An unconditional short jump forward, patched later by `patch_short`.
+    fn jmp_short_forward(&mut self) -> usize {
+        self.byte(0xEB);
+        self.byte(0);
+        self.code.len() - 1
+    }
+
     fn patch_short(&mut self, at: usize) {
         let distance = self.code.len() - at - 1;
         debug_assert!(distance <= 127, "short branch out of range");
@@ -764,14 +1133,22 @@ impl Assembler {
 const CC_E: u8 = 0x4;
 const CC_NE: u8 = 0x5;
 
-/// How deep compiled recursion may go before it refuses.
+/// How much machine stack compiled frames may occupy before they refuse.
 ///
-/// The machine stack is the limit here, not a frame budget the runtime can
-/// grow, so overrunning it is a crash rather than an exception. The
-/// interpreter raises `StackOverflowException` at its own budget; this trap
-/// is the compiled equivalent, and is deliberately far below anything a real
-/// stack would run out at.
-const MAX_COMPILED_DEPTH: i32 = 4096;
+/// **Bytes, not frames.** A frame count was the obvious counter and was wrong
+/// in principle the whole time: frames differ in size, so any count is either
+/// too generous for a large frame or too mean for a small one. It only became
+/// visible when frames grew — an outgoing argument array sized for the widest
+/// callee, plus a frame record — and 4096 frames stopped fitting in a thread
+/// stack. The symptom was a segfault, which is exactly what this counter
+/// exists to prevent.
+///
+/// The machine stack cannot be grown or unwound the way the interpreter's
+/// frame budget can, so overrunning it is a crash rather than an exception.
+/// This budget is deliberately a fraction of the smallest stack this runtime
+/// expects to run on, leaving the interpreter beneath and the helpers above
+/// their own room.
+const MAX_COMPILED_STACK_BYTES: i32 = 16 * 1024 * 1024;
 const CC_L: u8 = 0xC;
 const CC_GE: u8 = 0xD;
 const CC_LE: u8 = 0xE;
@@ -806,13 +1183,51 @@ pub struct X64Emitter {
     trap_slot: usize,
     /// Frame offset of the outgoing argument array a self-call fills in.
     outgoing: i32,
+    /// Slots living in [`PINNED`], in register order.
+    pinned: Vec<Pinnable>,
+    /// Whether this body polls for a collection at its loop back-edges.
+    polls: bool,
+    /// Address of this method's [`crate::alloc::FrameMap`].
+    frame_map: i64,
+    /// Frame offset of this frame's record: parent, base pointer, map.
+    record: i32,
+    /// Arguments the widest callee takes, which is what the outgoing frame has
+    /// to be big enough for — a callee's trap and context slots sit past *its*
+    /// argument count, not this method's.
+    widest_callee: usize,
     /// Frame offset of the scratch word; see [`Self::frame_scratch`].
     scratch: i32,
 }
 
 impl X64Emitter {
+    /// Machine stack this frame occupies, generously rounded.
+    ///
+    /// The reserved frame, the registers pushed above it, the return address,
+    /// and the shadow space a call reserves — everything one link of the chain
+    /// costs.
+    fn stack_cost(&self) -> i32 {
+        self.frame + SAVED_BYTES + 8 + 32
+    }
+
+    /// The register holding `slot`, if it has one.
+    fn pin_of(&self, slot: Pinnable) -> Option<u8> {
+        self.pinned.iter().position(|p| *p == slot).map(|i| PINNED[i])
+    }
+
     fn new(trap_slot: usize) -> Self {
-        Self { asm: Assembler::new(), locals: 0, frame: 0, trap_slot, scratch: 0, outgoing: 0 }
+        Self {
+            asm: Assembler::new(),
+            locals: 0,
+            frame: 0,
+            trap_slot,
+            scratch: 0,
+            outgoing: 0,
+            pinned: Vec::new(),
+            polls: false,
+            frame_map: 0,
+            record: 0,
+            widest_callee: 0,
+        }
     }
 
     /// A frame slot no local or spill uses, for holding a value while every
@@ -850,6 +1265,8 @@ impl X64Emitter {
         self.asm.byte(0x81);
         self.asm.modrm(0b11, 0, RSP);
         self.asm.imm32(self.frame);
+        self.asm.pop(R13);
+        self.asm.pop(R12);
         self.asm.pop(R15);
         self.asm.pop(R14);
         self.asm.pop(RBX);
@@ -894,18 +1311,27 @@ impl Backend for X64Emitter {
         self.asm.push(RBX);
         self.asm.push(R14);
         self.asm.push(R15);
+        self.asm.push(R12);
+        self.asm.push(R13);
 
         // Room for the argument array a recursive call hands its callee:
         // the arguments, the trap slot, the allocation context, and the depth
         // counter. Reserved once here rather than pushed per call, so the
         // stack pointer never moves inside the body.
-        let outgoing_words = self.trap_slot + 3;
+        // arguments, trap, allocation context, depth, stop flag, safepoint
+        // context, and the allocation-pressure flag.
+        let outgoing_words = self.trap_slot.max(self.widest_callee) + 8;
         self.outgoing = self.scratch - 8 * outgoing_words as i32;
+        // Three words for this frame's record. Below the outgoing frame so a
+        // call cannot overwrite the description of the frame making it.
+        self.record = self.outgoing - 24;
 
         // Reserve locals and spill slots, keeping rsp 16-byte aligned. The
-        // return address plus `push rbp` and three more pushes leave the stack
+        // return address plus `push rbp` and five more pushes leave the stack
         // misaligned by 8, so an odd number of reserved words restores it.
-        let words = locals + max_stack + 2 + outgoing_words + 1;
+        // Five pushes rather than three changes the offset but not the parity:
+        // 40 bytes and 24 bytes are both 8 mod 16.
+        let words = locals + max_stack + 2 + outgoing_words + 3 + 1;
         let words = if words % 2 == 0 { words + 1 } else { words };
         self.frame = (words * 8) as i32;
         // sub rsp, imm32
@@ -918,10 +1344,33 @@ impl Backend for X64Emitter {
         let incoming = if cfg!(windows) { RCX } else { RDI };
         self.asm.mov_rr(ARGS, incoming);
 
-        // `init_locals` semantics: every local starts at zero.
+        // This frame's record, for a safe point anywhere below it. Written
+        // unconditionally: a method that never polls itself may still call one
+        // that does, and the chain has to reach through it.
+        self.asm.mov_r_mem(RAX, ARGS, ((self.trap_slot + 6) * 8) as i32);
+        self.asm.mov_mem_r(RBP, self.record, RAX);
+        self.asm.lea(RAX, RBP, 0);
+        self.asm.mov_mem_r(RBP, self.record + 8, RAX);
+        self.asm.mov_ri(RAX, self.frame_map);
+        self.asm.mov_mem_r(RBP, self.record + 16, RAX);
+
+        // Give each pinned register its starting value. An argument's comes
+        // from the array the caller filled in; a local's is zero.
+        for (slot, reg) in self.pinned.clone().into_iter().zip(PINNED) {
+            match slot {
+                Pinnable::Arg(i) => self.asm.mov_r_mem(reg, ARGS, (i * 8) as i32),
+                Pinnable::Local(_) => self.asm.mov_ri(reg, 0),
+            }
+        }
+
+        // `init_locals` semantics: every local starts at zero. A pinned local
+        // was just zeroed in its register and has no frame slot to write.
         if locals > 0 {
             self.asm.mov_ri(RAX, 0);
             for i in 0..locals {
+                if self.pin_of(Pinnable::Local(i)).is_some() {
+                    continue;
+                }
                 let off = Backend::local_offset(self, i);
                 self.asm.mov_mem_r(RBP, off, RAX);
             }
@@ -934,6 +1383,8 @@ impl Backend for X64Emitter {
         self.asm.byte(0x81);
         self.asm.modrm(0b11, 0, RSP);
         self.asm.imm32(self.frame);
+        self.asm.pop(R13);
+        self.asm.pop(R12);
         self.asm.pop(R15);
         self.asm.pop(R14);
         self.asm.pop(RBX);
@@ -958,11 +1409,39 @@ impl Backend for X64Emitter {
     }
 
     fn load_arg(&mut self, dst: u8, index: usize) {
-        self.asm.mov_r_mem(dst, ARGS, (index * 8) as i32);
+        match self.pin_of(Pinnable::Arg(index)) {
+            Some(reg) => self.asm.mov_rr(dst, reg),
+            None => self.asm.mov_r_mem(dst, ARGS, (index * 8) as i32),
+        }
     }
 
     fn store_arg(&mut self, index: usize, src: u8) {
-        self.asm.mov_mem_r(ARGS, (index * 8) as i32, src);
+        match self.pin_of(Pinnable::Arg(index)) {
+            // The argument array is the caller's copy and nothing reads it
+            // back, so a pinned argument lives only in its register.
+            Some(reg) => self.asm.mov_rr(reg, src),
+            None => self.asm.mov_mem_r(ARGS, (index * 8) as i32, src),
+        }
+    }
+
+    fn load_local(&mut self, dst: u8, index: usize) {
+        match self.pin_of(Pinnable::Local(index)) {
+            Some(reg) => self.asm.mov_rr(dst, reg),
+            None => {
+                let off = Backend::local_offset(self, index);
+                self.asm.mov_r_mem(dst, RBP, off)
+            }
+        }
+    }
+
+    fn store_local(&mut self, index: usize, src: u8) {
+        match self.pin_of(Pinnable::Local(index)) {
+            Some(reg) => self.asm.mov_rr(reg, src),
+            None => {
+                let off = Backend::local_offset(self, index);
+                self.asm.mov_mem_r(RBP, off, src)
+            }
+        }
     }
 
     fn binop(&mut self, op: BinOp, dst: u8, lhs: u8, rhs: u8) {
@@ -1197,10 +1676,88 @@ impl Backend for X64Emitter {
         self.asm.mov_mem_r(RBP, self.outgoing + 8 * index as i32, src);
     }
 
+    fn call_other(&mut self, dst: u8, index: usize, arg_count: usize) {
+        // The callee reads its trap and context words past *its* arguments, so
+        // every offset here is relative to the callee's count rather than this
+        // method's. Getting that wrong would have the callee read its trap slot
+        // out of an argument.
+        let base = self.outgoing + 8 * arg_count as i32;
+        let trap = base;
+        let ctx = base + 8;
+        let depth = base + 16;
+        let flag = base + 24;
+        let safepoint_ctx = base + 32;
+        let pressure = base + 40;
+        let parent = base + 48;
+        let callee_table = base + 56;
+
+        // A clear trap slot, and the same context this frame runs with: the
+        // callee allocates into the same sink, polls the same flags, and
+        // reports through the same fault word.
+        self.asm.mov_ri(RAX, 0);
+        self.asm.mov_mem_r(RBP, trap, RAX);
+        for (offset, slot) in
+            [(ctx, 1usize), (flag, 3), (safepoint_ctx, 4), (pressure, 5)]
+        {
+            self.asm.mov_r_mem(RAX, ARGS, (slot * 8) as i32 + (self.trap_slot * 8) as i32);
+            self.asm.mov_mem_r(RBP, offset, RAX);
+        }
+        // Its parent is this frame, so a safe point anywhere below can walk
+        // back up and describe everything still live.
+        self.asm.lea(RAX, RBP, self.record);
+        self.asm.mov_mem_r(RBP, parent, RAX);
+
+        // Stack guard, shared with recursion: mutual recursion runs on the
+        // machine stack exactly as direct recursion does.
+        self.asm.mov_r_mem(RAX, ARGS, ((self.trap_slot + 2) * 8) as i32);
+        self.asm.add_ri32(RAX, self.stack_cost());
+        self.asm.mov_mem_r(RBP, depth, RAX);
+        self.asm.cmp_ri32(RAX, MAX_COMPILED_STACK_BYTES);
+        let shallow = self.asm.jcc_short_forward(CC_L);
+        self.asm.mov_ri(RAX, 3);
+        self.asm.mov_mem_r(ARGS, (self.trap_slot * 8) as i32, RAX);
+        self.asm.mov_ri(RAX, 0);
+        self.epilogue_inline();
+        self.asm.patch_short(shallow);
+
+        // The callee's entry *and its own call table*, out of the table the
+        // tier filled in. Both are needed: a callee that calls anything reads
+        // its table out of the argument array this frame is building, and
+        // leaving that slot unwritten sends it jumping through whatever the
+        // stack happened to hold. Two words per entry for exactly that reason.
+        self.asm.mov_r_mem(RDX, ARGS, ((self.trap_slot + 7) * 8) as i32);
+        self.asm.mov_r_mem(RAX, RDX, 16 * index as i32 + 8);
+        self.asm.mov_mem_r(RBP, callee_table, RAX);
+        self.asm.mov_r_mem(RAX, RDX, 16 * index as i32);
+        let incoming = if cfg!(windows) { RCX } else { RDI };
+        self.asm.lea(incoming, RBP, self.outgoing);
+        self.asm.sub_rsp(32);
+        self.asm.call_reg(RAX);
+        self.asm.add_rsp(32);
+
+        // A trap raised inside the callee has to reach the tier, which only
+        // reads *this* frame's slot.
+        if dst != RAX {
+            self.asm.mov_rr(dst, RAX);
+        }
+        self.asm.mov_r_mem(RDX, RBP, trap);
+        self.asm.cmp_ri(RDX, 0);
+        let clean = self.asm.jcc_short_forward(CC_E);
+        self.asm.mov_mem_r(ARGS, (self.trap_slot * 8) as i32, RDX);
+        self.asm.mov_ri(RAX, 0);
+        self.epilogue_inline();
+        self.asm.patch_short(clean);
+    }
+
     fn call_self(&mut self, dst: u8) {
         let trap = self.outgoing + 8 * self.trap_slot as i32;
         let ctx = trap + 8;
         let depth = ctx + 8;
+        let flag = depth + 8;
+        let safepoint_ctx = flag + 8;
+        let pressure = safepoint_ctx + 8;
+        let parent = pressure + 8;
+        let callee_table = parent + 8;
 
         // The callee starts with a clear trap slot, and inherits the
         // allocation context so it can allocate as this frame can.
@@ -1209,14 +1766,30 @@ impl Backend for X64Emitter {
         self.asm.mov_r_mem(RAX, ARGS, ((self.trap_slot + 1) * 8) as i32);
         self.asm.mov_mem_r(RBP, ctx, RAX);
 
-        // Depth guard. Compiled recursion runs on the *machine* stack, and
+        // A recursive callee polls where this frame does, so it inherits every
+        // context word, and its parent is this frame — which is what makes the
+        // chain of frames a chain rather than a single link.
+        self.asm.mov_r_mem(RAX, ARGS, ((self.trap_slot + 3) * 8) as i32);
+        self.asm.mov_mem_r(RBP, flag, RAX);
+        self.asm.mov_r_mem(RAX, ARGS, ((self.trap_slot + 4) * 8) as i32);
+        self.asm.mov_mem_r(RBP, safepoint_ctx, RAX);
+        self.asm.mov_r_mem(RAX, ARGS, ((self.trap_slot + 5) * 8) as i32);
+        self.asm.mov_mem_r(RBP, pressure, RAX);
+        self.asm.lea(RAX, RBP, self.record);
+        self.asm.mov_mem_r(RBP, parent, RAX);
+        // The callee is this method, so it calls through this method's table.
+        self.asm.mov_r_mem(RAX, ARGS, ((self.trap_slot + 7) * 8) as i32);
+        self.asm.mov_mem_r(RBP, callee_table, RAX);
+
+        // Stack guard. Compiled recursion runs on the *machine* stack, and
         // overrunning that is a crash rather than an exception — which this
-        // runtime does not accept anywhere else either. One more than the
-        // caller's depth, and a trap if it goes too deep.
+        // runtime does not accept anywhere else either. What accumulates is
+        // this frame's own size, so the running total is the bytes every frame
+        // below the callee occupies.
         self.asm.mov_r_mem(RAX, ARGS, ((self.trap_slot + 2) * 8) as i32);
-        self.asm.inc_reg(RAX);
+        self.asm.add_ri32(RAX, self.stack_cost());
         self.asm.mov_mem_r(RBP, depth, RAX);
-        self.asm.cmp_ri32(RAX, MAX_COMPILED_DEPTH);
+        self.asm.cmp_ri32(RAX, MAX_COMPILED_STACK_BYTES);
         let shallow = self.asm.jcc_short_forward(CC_L);
         self.asm.mov_ri(RAX, 3);
         self.asm.mov_mem_r(ARGS, (self.trap_slot * 8) as i32, RAX);
@@ -1276,7 +1849,7 @@ impl Backend for X64Emitter {
         // tolerates. The prologue keeps rsp 16-byte aligned and 32 is a
         // multiple of 16, so the alignment the ABI wants at the `call` holds.
         self.asm.sub_rsp(32);
-        self.asm.mov_ri(RAX, crate::alloc::alloc_array as usize as i64);
+        self.asm.mov_ri(RAX, crate::alloc::alloc_array as *const () as usize as i64);
         self.asm.call_reg(RAX);
         self.asm.add_rsp(32);
 
@@ -1293,6 +1866,198 @@ impl Backend for X64Emitter {
 
         if dst != RAX {
             self.asm.mov_rr(dst, RAX);
+        }
+    }
+
+    fn field_load(&mut self, dst: u8, receiver: u8, slot: usize, kind: i64) {
+        // The receiver has to survive being marshalled into an argument
+        // register, and may already be one.
+        self.asm.mov_mem_r(RBP, self.frame_scratch(), receiver);
+        let (a0, a1, a2, a3) = if cfg!(windows) {
+            (RCX, RDX, R8, R9)
+        } else {
+            (RDI, RSI, RDX, RCX)
+        };
+        self.asm.mov_r_mem(a0, ARGS, ((self.trap_slot + 1) * 8) as i32);
+        self.asm.mov_r_mem(a1, RBP, self.frame_scratch());
+        self.asm.mov_ri(a2, slot as i64);
+        self.asm.mov_ri(a3, kind);
+        self.asm.sub_rsp(32);
+        self.asm.mov_ri(RAX, crate::alloc::field_load as *const () as usize as i64);
+        self.asm.call_reg(RAX);
+        self.asm.add_rsp(32);
+        if dst != RAX {
+            self.asm.mov_rr(dst, RAX);
+        }
+    }
+
+    fn field_store(&mut self, receiver: u8, slot: usize, kind: i64, value: u8) {
+        self.asm.mov_mem_r(RBP, self.frame_scratch(), receiver);
+        self.asm.mov_mem_r(RBP, self.frame_scratch() - 8, value);
+        let (a0, a1, a2, a3) = if cfg!(windows) {
+            (RCX, RDX, R8, R9)
+        } else {
+            (RDI, RSI, RDX, RCX)
+        };
+        self.asm.mov_r_mem(a0, ARGS, ((self.trap_slot + 1) * 8) as i32);
+        self.asm.mov_r_mem(a1, RBP, self.frame_scratch());
+        self.asm.mov_ri(a2, slot as i64);
+        self.asm.mov_ri(a3, kind);
+        // The fifth argument goes in a register on System V and on the stack
+        // inside the shadow space on Windows, which is what the two ABIs
+        // actually differ about here.
+        self.asm.sub_rsp(48);
+        if cfg!(windows) {
+            self.asm.mov_r_mem(RAX, RBP, self.frame_scratch() - 8);
+            self.asm.mov_mem_r(RSP, 32, RAX);
+        } else {
+            self.asm.mov_r_mem(R8, RBP, self.frame_scratch() - 8);
+        }
+        self.asm.mov_ri(RAX, crate::alloc::field_store as *const () as usize as i64);
+        self.asm.call_reg(RAX);
+        self.asm.add_rsp(48);
+    }
+
+    fn safepoint(&mut self) {
+        // Two words, either of which means "enter the helper".
+        //
+        // The first is the registry's stop flag: *another* thread wants to
+        // collect and is waiting for this one to park. The second is this
+        // call's own allocation pressure, raised inside the allocation helper
+        // where the heap lock is already held. Both are needed — with a single
+        // thread nothing ever sets the first, and a compiled loop that
+        // allocates would otherwise never reclaim anything.
+        //
+        // Neither is synchronised, because a stale read is harmless in both
+        // directions: a missed set is caught at the next back-edge, and a
+        // spurious one finds nothing to do.
+        self.asm.mov_r_mem(RAX, ARGS, ((self.trap_slot + 3) * 8) as i32);
+        self.asm.cmp_ri(RAX, 0);
+        let no_stop_flag = self.asm.jcc_short_forward(CC_E);
+        self.asm.mov_r_mem(RAX, RAX, 0);
+        self.asm.cmp_ri(RAX, 0);
+        let stop_wanted = self.asm.jcc_short_forward(CC_NE);
+        self.asm.patch_short(no_stop_flag);
+
+        self.asm.mov_r_mem(RAX, ARGS, ((self.trap_slot + 5) * 8) as i32);
+        self.asm.cmp_ri(RAX, 0);
+        let quiet = self.asm.jcc_short_forward(CC_E);
+        self.asm.mov_r_mem(RAX, RAX, 0);
+        self.asm.cmp_ri(RAX, 0);
+        let nothing_to_do = self.asm.jcc_short_forward(CC_E);
+        self.asm.patch_short(stop_wanted);
+
+        // A collection is under way. Hand the helper this frame, which is all
+        // it needs: the offsets of the slots holding handles were worked out
+        // when this method was compiled and travel in the context.
+        let (a0, a1) = if cfg!(windows) { (RCX, RDX) } else { (RDI, RSI) };
+        self.asm.mov_r_mem(a0, ARGS, ((self.trap_slot + 4) * 8) as i32);
+        self.asm.lea(a1, RBP, self.record);
+        self.asm.sub_rsp(32);
+        self.asm.mov_ri(RAX, crate::alloc::safepoint as *const () as usize as i64);
+        self.asm.call_reg(RAX);
+        self.asm.add_rsp(32);
+
+        self.asm.patch_short(quiet);
+        self.asm.patch_short(nothing_to_do);
+    }
+
+    fn array_load_ref(&mut self, dst: u8, descriptor: u8, index: u8) {
+        // Identical encoding to the `double` load: eight bytes, scale 3. A
+        // handle is `repr(transparent)` over `u64`, so the raw bits *are* the
+        // value — and unlike a pointer, they cannot be dereferenced here.
+        let limit = if dst == descriptor { RDX } else { dst };
+        self.asm.mov_r_mem(limit, descriptor, 8);
+        self.bounds_check(index, limit);
+        self.asm.mov_r_mem(descriptor, descriptor, 0);
+        self.asm.mov_r_mem_index(dst, descriptor, index, 3);
+    }
+
+    fn array_store_ref(&mut self, descriptor: u8, index: u8, value: u8) {
+        self.asm.mov_mem_r(RBP, self.frame_scratch(), value);
+        let limit = value;
+        self.asm.mov_r_mem(limit, descriptor, 8);
+        self.bounds_check(index, limit);
+        self.asm.mov_r_mem(descriptor, descriptor, 0);
+        self.asm.mov_r_mem(limit, RBP, self.frame_scratch());
+        self.asm.mov_mem_index_r(descriptor, index, 3, limit);
+    }
+
+    fn alloc_object(&mut self, dst: u8, shape: i64) {
+        let (a0, a1) = if cfg!(windows) { (RCX, RDX) } else { (RDI, RSI) };
+        self.asm.mov_r_mem(a0, ARGS, ((self.trap_slot + 1) * 8) as i32);
+        self.asm.mov_ri(a1, shape);
+        self.asm.sub_rsp(32);
+        self.asm.mov_ri(RAX, crate::alloc::alloc_object as *const () as usize as i64);
+        self.asm.call_reg(RAX);
+        self.asm.add_rsp(32);
+
+        // Zero is `Handle::NULL`: the heap could not satisfy it. Same trap the
+        // array path takes, so the tier raises OutOfMemoryException where there
+        // is a frame to raise it into.
+        self.asm.cmp_ri(RAX, 0);
+        let ok = self.asm.jcc_short_forward(CC_NE);
+        self.asm.mov_ri(RAX, 2);
+        self.asm.mov_mem_r(ARGS, (self.trap_slot * 8) as i32, RAX);
+        self.asm.mov_ri(RAX, 0);
+        self.epilogue_inline();
+        self.asm.patch_short(ok);
+
+        if dst != RAX {
+            self.asm.mov_rr(dst, RAX);
+        }
+    }
+
+    fn devirt_dispatch(&mut self, dst: u8, receiver: u8, candidates: &[(i64, i64)]) {
+        // The receiver's runtime type, as a registry index. The lookup happens
+        // in Rust — compiled code never reads an object's memory, so no part of
+        // `ClrObject`'s layout is assumed here.
+        let (a0, a1) = if cfg!(windows) { (RCX, RDX) } else { (RDI, RSI) };
+        self.asm.mov_mem_r(RBP, self.frame_scratch(), receiver);
+        self.asm.mov_r_mem(a0, ARGS, ((self.trap_slot + 1) * 8) as i32);
+        self.asm.mov_r_mem(a1, RBP, self.frame_scratch());
+        self.asm.sub_rsp(32);
+        self.asm.mov_ri(RAX, crate::alloc::type_of as *const () as usize as i64);
+        self.asm.call_reg(RAX);
+        self.asm.add_rsp(32);
+
+        // Null first, and as its own answer. A virtual call on a null receiver
+        // owes the program a NullReferenceException; letting it fall through
+        // the guards would report it as a failure of the hierarchy analysis,
+        // which is both wrong and misleading.
+        self.asm.cmp_ri(RAX, -1);
+        let not_null = self.asm.jcc_short_forward(CC_NE);
+        self.asm.mov_ri(RDX, 6);
+        self.asm.mov_mem_r(ARGS, (self.trap_slot * 8) as i32, RDX);
+        self.asm.mov_ri(RAX, 0);
+        self.epilogue_inline();
+        self.asm.patch_short(not_null);
+
+        // One compare per candidate. Two of them is the common shape, and a
+        // linear chain beats a jump table at that size.
+        let mut done = Vec::with_capacity(candidates.len());
+        for (type_index, value) in candidates {
+            self.asm.cmp_ri32(RAX, *type_index as i32);
+            let next = self.asm.jcc_short_forward(CC_NE);
+            self.asm.mov_ri(RDX, *value);
+            done.push(self.asm.jmp_short_forward());
+            self.asm.patch_short(next);
+        }
+
+        // Unreachable by class-hierarchy analysis: the compiler proved no other
+        // type can reach this call. Trapping rather than falling through means
+        // a proof that was somehow wrong reports itself instead of returning a
+        // number nobody can account for.
+        self.asm.mov_ri(RAX, 5);
+        self.asm.mov_mem_r(ARGS, (self.trap_slot * 8) as i32, RAX);
+        self.asm.mov_ri(RAX, 0);
+        self.epilogue_inline();
+
+        for patch in done {
+            self.asm.patch_short(patch);
+        }
+        if dst != RDX {
+            self.asm.mov_rr(dst, RDX);
         }
     }
 
@@ -1378,8 +2143,17 @@ fn emit(
     returns_value: bool,
     trap_slot: usize,
     plan: &crate::translate::Plan,
+    frame_map: i64,
+    widest_callee: usize,
+    reference_slots: &[Pinnable],
 ) -> Result<Vec<u8>, CompileError> {
     let mut e = X64Emitter::new(trap_slot);
+    e.frame_map = frame_map;
+    e.widest_callee = widest_callee;
+    e.polls = !plan.safepoints.is_empty();
+    // Chosen before anything is emitted: the prologue seeds these registers,
+    // and every later access has to agree with what it decided.
+    e.pinned = slots_worth_pinning(instructions, locals, reference_slots);
     crate::translate::translate_with_plan(
         &mut e,
         instructions,
@@ -1435,7 +2209,7 @@ mod tests {
 mod machine_tests {
     use super::*;
     use crate::verify::analyse;
-    use rustclr_core::opcode::decode_all;
+    use rustclr_core::opcode::{decode_all, Op};
 
     /// Assembles a method body directly, bypassing the loader, and runs it.
     fn run(il: &[u8], locals: usize, args: &[i64]) -> i64 {
@@ -1446,6 +2220,10 @@ mod machine_tests {
         .expect("verify");
         // These helpers compile array-free bodies, so the trap slot is never
         // written; one past the arguments keeps it consistent with the tier.
+        // The prologue still *reads* the context slots past it — the frame
+        // record it writes names the parent frame — so the array handed over
+        // below has to be the full shape the tier passes, not just the
+        // arguments.
         let code = emit(
             &instructions,
             &analysis,
@@ -1453,13 +2231,23 @@ mod machine_tests {
             true,
             args.len(),
             &crate::translate::Plan::default(),
+            // These helpers compile bodies with no references and no loop, so
+            // there is nothing for a safe point to describe and no map to name.
+            0,
+            // And no callees, so the outgoing frame need only fit this method.
+            0,
+            &[],
         )
         .expect("emit");
         let page = CodePage::commit(&code).expect("commit");
+        // Arguments, then the trap slot and the six context words the tier
+        // supplies. All zero: no allocation context, no safe point, no parent.
+        let mut frame: Vec<i64> = args.to_vec();
+        frame.extend([0i64; 7]);
         // SAFETY: `emit` produced this page and the signature matches.
         let f: extern "C" fn(*const i64) -> i64 =
             unsafe { core::mem::transmute(page.as_ptr()) };
-        f(args.as_ptr())
+        f(frame.as_ptr())
     }
 
     #[test]

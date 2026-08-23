@@ -13,6 +13,11 @@ pub mod type_attributes {
     pub const NOT_PUBLIC: u32 = 0x0000_0000;
     pub const PUBLIC: u32 = 0x0000_0001;
     pub const NESTED_PUBLIC: u32 = 0x0000_0002;
+    pub const NESTED_PRIVATE: u32 = 0x0000_0003;
+    pub const NESTED_FAMILY: u32 = 0x0000_0004;
+    pub const NESTED_ASSEMBLY: u32 = 0x0000_0005;
+    pub const NESTED_FAM_AND_ASSEM: u32 = 0x0000_0006;
+    pub const NESTED_FAM_OR_ASSEM: u32 = 0x0000_0007;
 
     pub const LAYOUT_MASK: u32 = 0x0000_0018;
     pub const AUTO_LAYOUT: u32 = 0x0000_0000;
@@ -137,6 +142,20 @@ impl<'a> TypeDefRow<'a> {
 
     pub fn is_sealed(&self) -> bool {
         self.flags & type_attributes::SEALED != 0
+    }
+
+    /// Whether code outside this assembly could derive from this type.
+    ///
+    /// Only the visibilities that let another assembly *see* the type let it
+    /// extend the type, and that is what decides whether class-hierarchy
+    /// analysis over the loaded types is a proof or a guess. `family` counts:
+    /// a subclass in another assembly is exactly what protected access is for.
+    pub fn is_externally_extensible(&self) -> bool {
+        use type_attributes as ta;
+        matches!(
+            self.flags & ta::VISIBILITY_MASK,
+            ta::PUBLIC | ta::NESTED_PUBLIC | ta::NESTED_FAMILY | ta::NESTED_FAM_OR_ASSEM
+        )
     }
 
     pub fn is_explicit_layout(&self) -> bool {

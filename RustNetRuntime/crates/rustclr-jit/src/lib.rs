@@ -25,6 +25,8 @@
 //! actually handled rather than implying more.
 
 pub mod alloc;
+pub mod devirt;
+pub mod escape;
 pub mod floats;
 pub mod aarch64;
 pub mod codepage;
@@ -64,6 +66,24 @@ pub struct CompiledCode {
     /// Emitted machine code, empty for the interpreted tier.
     pub bytes: Vec<u8>,
     pub analysis: MethodAnalysis,
+    /// Classes this body allocates or tests against, numbered as its code
+    /// refers to them. Empty unless the body needed any.
+    pub object_shapes: Vec<(rustclr_core::TypeId, usize, rustclr_core::TypeId)>,
+    /// Whether the body contains a `newarr` this backend emitted.
+    pub allocates_arrays: bool,
+    /// Frame offsets of the slots a collection must read as roots.
+    pub reference_slots: Vec<i32>,
+    /// Frame offsets of the slots holding an array descriptor address.
+    pub array_slots: Vec<i32>,
+    /// The description compiled code hands a safe point, at a stable address.
+    ///
+    /// Boxed and built before the code is emitted, because the emitted
+    /// prologue bakes this address into the frame record it writes.
+    pub frame_map: Option<Box<crate::alloc::FrameMap>>,
+    /// The methods this body calls, in the order its code indexes them.
+    ///
+    /// The tier turns these into entry addresses before the body first runs.
+    pub call_table: Vec<MethodId>,
 }
 
 /// Why a method could not be compiled by a backend.
@@ -169,6 +189,12 @@ impl Compiler for InterpreterTier {
             tier: Tier::Interpreted,
             bytes: Vec::new(),
             analysis,
+            object_shapes: Vec::new(),
+            allocates_arrays: false,
+            reference_slots: Vec::new(),
+            array_slots: Vec::new(),
+            frame_map: None,
+            call_table: Vec::new(),
         })
     }
 }
@@ -178,7 +204,7 @@ impl Compiler for InterpreterTier {
 /// This has to be exact. An approximation makes the verifier report problems
 /// that are not there — and a verifier that cries wolf is worse than none,
 /// because people stop reading it.
-fn call_stack_delta(
+pub(crate) fn call_stack_delta(
     loader: &Loader,
     assembly: &rustclr_core::LoadedAssembly,
     enclosing_returns_value: bool,
