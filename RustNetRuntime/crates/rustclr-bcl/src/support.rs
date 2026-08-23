@@ -318,8 +318,12 @@ pub fn read_string(interp: &Interpreter, h: Handle) -> String {
 pub fn sleep_millis(interp: &mut Interpreter, ms: u64) {
     #[cfg(feature = "std")]
     {
-        let _ = interp;
-        std::thread::sleep(std::time::Duration::from_millis(ms));
+        // Inside `blocking`, which matters twice. A sleeping thread reaches no
+        // safe point, so a collection would otherwise wait out the whole sleep
+        // for it — and with several threads asleep, every collection stalls.
+        // It also tells the pool it has lost a worker, so queued work is not
+        // stuck behind something that is only sleeping.
+        interp.blocking(|_| std::thread::sleep(std::time::Duration::from_millis(ms)));
     }
     #[cfg(not(feature = "std"))]
     {

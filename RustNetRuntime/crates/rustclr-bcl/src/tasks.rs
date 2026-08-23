@@ -742,6 +742,15 @@ fn settle(interp: &mut Interpreter, task: Handle) -> ExecResult<()> {
     // And it is bounded by whether anything can still complete the task. When
     // no work is outstanding and no other thread is running, nothing ever will,
     // and saying so beats hanging.
+    //
+    // "Nothing can complete it" has to be *persistent* before it is believed.
+    // The counters it reads are sampled without a lock, and a job that has
+    // been taken off the queue but has not yet completed its task leaves a
+    // window where they say idle and a completion is still coming. Treating
+    // one such sample as final turned a slow task into a spurious "this task
+    // never completed" — rare, and only under load.
+    const IDLE_SAMPLES_BEFORE_GIVING_UP: u32 = 50;
+    let mut idle = 0;
     let mut settled = false;
     while !settled {
         if status_of(interp, task) != PENDING {
@@ -749,16 +758,24 @@ fn settle(interp: &mut Interpreter, task: Handle) -> ExecResult<()> {
             break;
         }
         if interp.help_with_queued_work() {
+            idle = 0;
             continue;
         }
-        if !interp.work_may_still_arrive() {
-            break;
+        if interp.work_may_still_arrive() {
+            idle = 0;
+        } else {
+            idle += 1;
+            if idle >= IDLE_SAMPLES_BEFORE_GIVING_UP {
+                break;
+            }
         }
         settled = interp.blocking(|i| {
-            // Re-check under the blocked state, then give the CPU up briefly.
             if status_of(i, task) != PENDING {
                 return true;
             }
+            // A yield rather than a sleep: the common case is a task about to
+            // finish on another thread, and the samples above only need to be
+            // separated, not spaced out.
             std::thread::yield_now();
             status_of(i, task) != PENDING
         });

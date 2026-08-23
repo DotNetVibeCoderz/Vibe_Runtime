@@ -27,8 +27,7 @@ use crate::support::*;
 #[allow(unused_imports)]
 use crate::prelude::*;
 use rustclr_core::{
-    ByRef, ClrDelegate, ClrObject, ExecResult, ExecutionError, Interpreter, Value,
-};
+    ByRef, ClrDelegate, ClrObject, ExecResult, ExecutionError, Interpreter, Value, ClrExceptionKind};
 
 pub fn register(interp: &mut Interpreter) {
     register_thread(interp);
@@ -229,11 +228,40 @@ fn register_monitor(interp: &mut Interpreter) {
             Ok(None)
         });
     }
-    // `Pulse` wakes a waiter. Nothing here waits on a condition — `Monitor.Wait`
-    // is not implemented — so there is nobody to wake, and saying so is better
-    // than pretending. `Enter` already re-checks whenever a lock is released.
-    interp.register_native("System.Threading.Monitor::Pulse(object)", |_i, _a| Ok(None));
-    interp.register_native("System.Threading.Monitor::PulseAll(object)", |_i, _a| Ok(None));
+    // `Monitor.Wait` releases the lock, waits for a pulse, and retakes it at the
+    // depth it had. That is what a producer/consumer queue is built from, and
+    // what `lock`/`Wait`/`Pulse` means in C#.
+    for member in ["Wait(object)", "Wait/1", "Wait(object,int)", "Wait/2"] {
+        interp.register_native(key_monitor(member), |i, a| {
+            let object = arg_handle(i, a, 0)?;
+            // The overload taking a timeout reports whether it was pulsed
+            // before the time ran out. A negative timeout is `Infinite`.
+            // Static, so argument 0 is the object and argument 1 the timeout:
+            // two arguments in total, not three.
+            let timeout = match a.len() > 1 {
+                true => match arg_i32(i, a, 1)? {
+                    ms if ms < 0 => None,
+                    ms => Some(core::time::Duration::from_millis(ms as u64)),
+                },
+                false => None,
+            };
+            match i.monitor_wait(object, timeout) {
+                rustclr_core::monitor::Wait::Pulsed => Ok(Some(Value::I32(1))),
+                rustclr_core::monitor::Wait::TimedOut => Ok(Some(Value::I32(0))),
+                rustclr_core::monitor::Wait::NotHeld => Err(ExecutionError::exception(
+                    ClrExceptionKind::InvalidOperation,
+                    "Object synchronization method was called from an unsynchronized block of code.",
+                )),
+            }
+        });
+    }
+    for member in ["Pulse(object)", "Pulse/1", "PulseAll(object)", "PulseAll/1"] {
+        interp.register_native(key_monitor(member), |i, a| {
+            let object = arg_handle(i, a, 0)?;
+            i.monitor_pulse(object);
+            Ok(None)
+        });
+    }
     interp.register_native("System.Threading.Monitor::IsEntered(object)", |i, a| {
         let object = arg_handle(i, a, 0)?;
         Ok(Some(Value::I32(i.monitor_held(object) as i32)))

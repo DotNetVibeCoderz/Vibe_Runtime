@@ -8,7 +8,7 @@ the assistant against a live LLM — produce byte-identical output on RustCLR an
 .NET.
 
 ```
-Conformance    IDENTICAL — checks=285 failures=0
+Conformance    IDENTICAL — checks=308 failures=0
 ModernSyntax   IDENTICAL — checks=35 failures=0
 UserDirectory  IDENTICAL
 PrimeSieve     IDENTICAL   (written by Jack from a prompt)
@@ -24,11 +24,262 @@ SensorGateway  IDENTICAL   (edited by Jack from a prompt)
 | `rustclr-metadata` | PE/COFF + ECMA-335 reader, signatures, IL bodies | 27 tests, incl. 9 against a real Roslyn-built assembly |
 | `rustclr-gc` | Handle-based heap, pluggable collectors, mark-sweep, **shared heap + stop-the-world safepoints** | 19 tests; 200k-deep graph marks without stack overflow |
 | `rustclr-core` | Type system, loader, IL interpreter, exception handling | 18 unit + 3 multi-threaded |
-| `rustclr-bcl` | Native BCL: Console, String, Math, interpolation, tuples, ranges, Nullable, generic collections, LINQ, Task and async, reflection | 20 unit + 8 integration; 836 bindings |
+| `rustclr-bcl` | Native BCL: Console, String, Math, interpolation, tuples, ranges, Nullable, generic collections, LINQ, Task and async, reflection | 20 unit + 8 integration; 988 bindings |
 | `rustclr-sched` | Lock-free MS queue, MPMC channel, thread pool | 16 tests |
 | `rustclr-interop` | P/Invoke, dynamic loading, marshalling | 9 tests; calls the real `GetCurrentProcessId` |
 | `rustclr-jit` | Compiler trait, IL verifier, analysis, **x86-64 code generator**, W^X pages, tiering | 25 unit + 3 differential |
 | `rustnet-cli` | `run` / `info` / `disasm` / `verify` / `build` / `capabilities` | Drives every fixture |
+
+### Recursion compiles
+
+`sort` went from 2,757 ms to **236 ms** and `fib` from 460 ms to **75 ms**.
+Fifteen methods in the benchmark suite compile now, and `alloc`, `virtual` and
+`fields` are the only rows still dominated by interpretation.
+
+Recursion is the one call shape the inliner cannot remove — splicing a method
+into itself does not terminate — so it is the one that needed a calling
+convention. The arguments go into an outgoing frame the prologue reserves, and
+the callee is entered exactly as the tier enters the method: same
+argument-array shape, same trap slot, same allocation context. The call target
+is the first byte of the method's own code, so the displacement is known at emit
+time and needs no fixup.
+
+Only *self*-calls. A call to another method needs an address that may not exist
+when the caller is compiled, and the inliner already covers the small-callee
+case. `Sort`, the wrapper that calls `QuickSort`, is still interpreted.
+
+**Compiled recursion runs on the machine stack**, which cannot be grown or
+unwound the way the interpreter's frame budget can — so overrunning it would be
+a crash rather than an exception, and this runtime does not accept that anywhere
+else. Compiled code counts its own depth and traps past a limit. A 200,000-deep
+recursion reports the same catchable exception interpreted and compiled; .NET
+stack-overflows and dies.
+
+**Two bugs, and the second was caught by a test I had already broken.**
+
+The verifier rejected `QuickSort` with "reached with stack depth 3, but 0 on
+another path". That was the verifier being right: the depth walk treated a
+`call` as moving the stack by zero, when it pops its arguments and may push a
+result. The method was fine; the analysis was not.
+
+The second was mine from an hour earlier. Two gate functions share an identical
+`.all(is_supported(...))` line, and a one-shot replace had put an earlier edit
+in the wrong one — so the *no-inlining* screen started waving calls through. The
+differential test said exactly that: "Blend contains calls, so without inlining
+the backend must decline it". I had noticed the mis-targeted edit at the time,
+fixed the intended function, and left the accidental one in place.
+
+### A method that loops compiles on its first call
+
+`sieve` went from 1,439 ms to **60 ms** and `matrix` from 1,731 ms to **84 ms**,
+with no flag and no change to either benchmark. `noop` is unchanged at 70 ms, so
+this cost nothing at startup.
+
+A call count is a proxy for "worth compiling", and it is simply the wrong proxy
+for a method called *once* that runs for seconds. `Sieve` and `Matrix` are
+exactly that shape: they had been compilable for a while, and the previous
+entries had to say "measured with `--jit-threshold 1`" because at the default
+threshold they never compiled at all. The signal that was missing is in the body
+— a backward branch — and it is available before the call is made.
+
+So: a method whose body loops compiles on its first call; a loop-free method
+still waits for the count, because compiling one that is called once is pure
+loss. Compilation costs microseconds against the seconds a loop can run.
+
+**This is not on-stack replacement.** The decision happens *before* the call, so
+a method already running cannot be swapped for a compiled one. A single call
+that enters a long loop still runs interpreted if the decision went the other
+way — which is why the heuristic is deliberately eager rather than clever.
+
+**Both rows are now at the process-start floor**, and that is worth saying
+plainly: `noop` is 70 ms, so most of what is left in `sieve` and `matrix` is
+starting the process, and their ratios against .NET are dominated by RustCLR's
+faster startup rather than by faster arithmetic. Reading them as "twice as fast
+as .NET at numerics" would be wrong.
+
+### bool[] compiles, and sieve joins matrix
+
+`bool[]` elements — one byte, zero-extended on the way in — compile, so `sieve`
+does too: **20.3×**. Thirteen methods in the benchmark suite compile now.
+
+The element work was small; the gates were the obstacle. Three separate screens
+all rejected an array-typed *local*, each for the same reason, and that reason
+had expired: a local declared `int[]` used to be ambiguous between a descriptor
+the tier passed in and the result of a `newarr` the backend could not emit.
+Both are descriptor addresses now. Widening one screen and not the others left
+`sieve` declined with no visible change, twice.
+
+The CLI's explanation was stale in the same way — it still said "local 0 is not
+an integer" for a method the backend would now take. A stale explanation is
+worse than none: it sends a reader looking for the wrong thing, which is exactly
+what it did to me here.
+
+**The benchmark suite still shows the interpreted times for both.** `Sieve` and
+`Matrix` are each called once, so at the default tiering threshold they never
+compile; the 20× and 21× figures come from `--jit-threshold 1`. I have not
+changed the threshold or the benchmark to make the table look better.
+
+### Compiled code can allocate, and matrix is 21× faster
+
+`new int[n]` and `new double[n]` inside a compiled method work. `matrix` — the
+benchmark that has been the motivating example for two sessions — compiles at
+last: **1,757 ms interpreted against 83 ms, 21.2×**, same checksum.
+
+**The reason it was declined was never "allocation is hard".** It was that
+compiled code reaches no safe point, so a collection during the call would have
+to walk a frame the collector cannot read, and would free the arrays whose raw
+pointers compiled code holds. Three facts dissolve that, and the design needs
+all three:
+
+`Heap::alloc` does not collect — it allocates and records pressure, and the
+*interpreter* collects between instructions. Compiled code has no
+between-instructions, so allocating from it cannot trigger a collection at all.
+
+A compiled method cannot return a reference, because its return type must be an
+integer or a float. So every array it allocates is unreachable the moment the
+call ends: the sink owns them for the call and drops them after, and nothing
+needs rooting.
+
+And a `newarr` inside a loop is **declined**. Without that, a compiled loop
+allocating would exhaust a heap the interpreter would have collected — a program
+that runs interpreted and fails compiled, which is the one difference this
+runtime will not accept.
+
+**The ABI turned out to be the easy part.** `RBX`, `R14` and `R15` — the
+argument pointer and the two cached stack slots — are callee-saved in both the
+Windows and System V conventions, so a C call preserves them; the temps are
+volatile and nothing is live across an instruction boundary anyway. The
+allocation context rides in the argument array, one past the trap slot, so
+nothing about how compiled code is *entered* had to change.
+
+**Two bugs.** `find_sz_array` returns the constructions something has already
+named, and `System.Double[]` often has not been, so every allocation failed
+until the base `System.Array` stood in — the same fallback the interpreter
+already uses.
+
+The second was not mine and was worth catching: the full workspace test run
+failed intermittently with "this task never completed", while passing in
+isolation every time. `settle` reads counters without a lock, and a job taken
+off the queue but not yet finished leaves a window where they say idle. Treating
+one sample as final turned a slow task into a spurious error. It now wants the
+idle reading to persist. Three consecutive clean workspace runs afterwards.
+
+### double[] compiles
+
+Element access on a `double[]` that arrives as a parameter compiles: a dot
+product over 512 elements is **37× faster** than interpreted, same answer.
+Conformance 294 → 299 checks.
+
+Most of it already existed. The descriptor the tier builds for an `int[]` —
+pointer and length — is the same shape for a `double[]`, and the assembler
+already had scaled-index moves with a scale parameter, sitting unused behind a
+dead-code warning. An eight-byte element is in fact *simpler* than a four-byte
+one: `int[]` has to sign-extend 32 bits to 64 or a negative element comes back
+as a huge positive number, and a `double` is already the width of a slot, so the
+load is a plain move of the bit pattern.
+
+**`matrix` still does not compile**, and it is worth being exact about why,
+because "double arrays are supported" would imply otherwise. It allocates its
+arrays as locals — `double[] a = new double[n * n]` — and allocation is
+disqualifying whatever the element type: compiled code runs with no safepoint,
+so a collection must not be able to happen inside it. An array passed in is
+fine; one created inside the method is not. The 37× figure comes from a shape
+that does compile, not from the benchmark.
+
+I did not restructure the benchmark to make the number look better. It measures
+what it measures.
+
+### The code generator compiles floating point
+
+`double` arithmetic, comparison, negation and conversion compile to SSE2.
+Conformance is 289 → 294 checks, identical interpreted and compiled.
+
+**The problem was type inference, not code generation.** IL's `add` is `add`
+whether its operands are integers or doubles — the difference is in the types
+that reached it, which an interpreter can see in the values it holds and a
+compiler cannot. `floats::infer` walks the stream keeping an abstract stack of
+kinds and records which instructions are floating-point, declining the method
+when it cannot follow rather than picking a kind.
+
+Doubles needed no register class of their own: a slot is eight bytes and so is
+a `double`, so they travel as bit patterns through the same slots and
+general-purpose registers, and only the arithmetic moves them into xmm and back.
+
+**Three bugs, and the shape of all three is the same.**
+
+The differential run passed with **zero methods compiled** — an `accepts` screen
+rejected float signatures before `compile` was ever reached, so identical output
+proved only that the interpreter agrees with itself. Checking the compile count
+is what caught it. That is the second time this session a test passed while
+measuring nothing.
+
+Then the numbers came back wrong in a very particular way: `ConstOnly()`
+returning 1.0 gave 4.6071824188000174E+18, which is *exactly the bit pattern of
+1.0*. The compiled code was right; the tier's `widen` had no float case, so the
+correct bits came back as `Value::I64`. The round trip is now a test in its own
+right, because getting one direction right and not the other is precisely how
+this looked.
+
+And `(int)3.5` gave 0. `conv.i4` on a double was narrowing the bit pattern
+instead of converting first — the low 32 bits of 3.5's representation are zero.
+Only the conformance check found that one, which is what conformance checks are
+for.
+
+**`matrix` is not faster, and that was measured rather than assumed.** It uses
+`double[]`, and array support covered `int[]` only, so the method was still
+declined — 1,773 ms interpreted against 1,734 ms compiled is noise. `double[]`
+landed next; `matrix` still does not compile, for a different reason given
+below.
+
+### The pool grows, and a sleeping thread stops stalling collections
+
+Thirty-two tasks that each sleep 400 ms: **1,610 ms before, 469 ms after** —
+four rounds against roughly one. A worker that blocks tells the pool it is gone
+for the duration, and if that leaves queued work with nobody to run it, another
+worker starts, up to a ceiling. Unbounded growth would turn a program that
+blocks a lot into one that runs out of threads.
+
+**It began as a collector bug, and that is the part worth keeping.** The growth
+code was in place and never fired, because `Thread.Sleep` slept without
+announcing itself blocked. That is not only a scheduling matter: a sleeping
+thread reaches no safe point, so a collection waited out the entire sleep for
+it, and several sleeping threads stalled every collection. One `blocking`
+wrapper fixed the collector and the pool at once.
+
+Worth noting what the first version of the test proved, which was nothing: 32
+tasks sleeping 200 ms on 8 workers is four rounds of 200 ms, comfortably inside
+the 1,200 ms bound it checked. Doubling the sleep made the two outcomes 1,600 ms
+and 400 ms, which a threshold can actually tell apart.
+
+### Monitor.Wait and Pulse
+
+A producer/consumer queue on `lock`/`Wait`/`Pulse` runs; a conformance check
+moves 500 items through one, with the consumer made to reach `Wait` on an empty
+queue before anything is produced, so the answer depends on it being woken
+rather than on timing.
+
+`Wait` releases the monitor at whatever depth it was held and retakes it at that
+depth. That detail is the whole of it: `lock` is re-entrant, so a method that
+locked three deep and then waits must come back three deep, or its own `finally`
+blocks release a lock it no longer holds.
+
+`Wait(obj, ms)` honours its timeout and reports whether it was pulsed. It comes
+back holding the monitor either way, which is the part worth being careful
+about: `Wait` is defined to return holding it, and a timeout does not change
+that — a caller whose `finally` released a lock it never retook would corrupt
+the count for every other thread.
+
+The bug there was mine and was silent: `Monitor.Wait` is *static*, so the object
+is argument zero and the timeout argument one — two in total. Testing for three
+meant the timeout was never read and every timed wait was infinite. It hung
+rather than answering wrongly, which is the better failure of the two.
+
+`Pulse` wakes every waiter rather than one, and that is deliberate rather than a
+shortcut. It is a *weaker* promise than the API makes, and a `Wait` written in
+the re-check loop the API requires already tolerates it, because a spurious
+wake-up is always possible. Waking exactly one and picking the wrong one would
+not be tolerable. The pulse is a counter rather than a flag, so a waiter that
+had not yet reached the wait when the pulse arrived does not miss it.
 
 ### A thread pool, and `rustclr-sched` finally earns its keep
 
@@ -623,7 +874,7 @@ in the benchmark I had just written.
 ### The interpreter runs on Xtensa
 
 An **M5Stack Tough** — ESP32-D0WD rev v3.1, dual core, 16 MB flash — executes
-`HelloWorld.Main` with all 836 native bindings:
+`HelloWorld.Main` with all 988 native bindings:
 [docs/logs/m5stack-tough.log](docs/logs/m5stack-tough.log). That is the second
 architecture, and the same source file as the RISC-V ESP32-C3: 68 IL
 instructions and 6 calls on x86-64, on RISC-V 32 and on Xtensa LX6 alike.
@@ -781,7 +1032,7 @@ template.
 property nothing checked, and the convention says templates carrying it must
 actually run there. The command scaffolds all 20 templates, builds them, runs
 them on both runtimes and diffs the output — board templates against
-`--bcl minimal`, since passing with all 836 bindings says nothing about a 192 KB
+`--bcl minimal`, since passing with all 988 bindings says nothing about a 192 KB
 board. It found four real things on its first run:
 
 1. **`Console.ReadLine()` hung the runner.** `ProcessRunner` redirected stdout
@@ -840,7 +1091,7 @@ carries on with the metadata reader and the collector.
 **An unplanned result worth recording: it does not pay flash for what it cannot
 use.** `Tier::for_budget` is a `const fn` and `HEAP_BYTES` is a constant, so LTO
 folds the decision, finds the `Full` and `Minimal` arms unreachable, and strips
-the loader and all 836 native bindings. `.text` is 21 KB on the F401RE against
+the loader and all 988 native bindings. `.text` is 21 KB on the F401RE against
 282 KB on the F427VI, from the same source file. That fell out of making the
 tier a constant expression rather than a runtime check — worth knowing, because
 it means adding a board below the threshold costs nothing but its own bring-up.
@@ -913,7 +1164,7 @@ reached only `lib.rs`, and `Image` was gated on `std` in its entirety when only
 ### The interpreter runs on the chip
 
 **C# executes on an ESP32-C3** — RISC-V, 400 KB of SRAM, no operating system.
-The loader builds a type registry, RustBCL registers all 836 of its native
+The loader builds a type registry, RustBCL registers all 988 of its native
 bindings, and `HelloWorld.Main` prints the same three lines `dotnet` prints,
 CRLF included, with the same 68 IL instructions and 6 calls:
 [docs/logs/esp32c3-interpreter.log](docs/logs/esp32c3-interpreter.log).
@@ -1256,7 +1507,7 @@ Ordered as in [Plan.md](Plan.md):
    shared without a lock and a mutable part behind one, because a lock across
    `registry.ty()` — called on nearly every instruction — would cost more than
    the whole heap change did.
-3. **Native code generation beyond integer methods and `int[]`** — the x86-64
+3. **Native code generation beyond scalar arithmetic and `int[]`** — the x86-64
    backend is 11.0× faster on arithmetic and 89.8× on an array walk. It still
    declines allocation, exception handling, floating point and object field
    access; an array created *inside* a method falls under allocation, which is

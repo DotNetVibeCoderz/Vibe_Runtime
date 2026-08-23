@@ -245,6 +245,10 @@ pub struct Interpreter {
     /// program that never starts a task should not pay for that.
     #[cfg(feature = "std")]
     pool: Option<crate::pool::TaskPool>,
+    /// Whether this interpreter *is* a pool worker, rather than one that uses
+    /// the pool. Only a worker's blocking should make the pool grow.
+    #[cfg(feature = "std")]
+    is_pool_worker: bool,
     /// Threads started by this one, waiting to be joined.
     #[cfg(feature = "std")]
     threads: HashMap<u64, std::thread::JoinHandle<(ExecResult<()>, bool)>>,
@@ -313,6 +317,8 @@ impl Interpreter {
             monitors: crate::monitor::Monitors::default(),
             #[cfg(feature = "std")]
             pool: None,
+            #[cfg(feature = "std")]
+            is_pool_worker: false,
             #[cfg(feature = "std")]
             threads: HashMap::new(),
             #[cfg(feature = "std")]
@@ -850,6 +856,29 @@ impl Interpreter {
         });
     }
 
+    /// `Monitor.Wait` — releases the monitor, waits for a pulse, retakes it.
+    ///
+    /// `false` when this thread does not hold the monitor.
+    pub fn monitor_wait(
+        &mut self,
+        object: Handle,
+        timeout: Option<core::time::Duration>,
+    ) -> crate::monitor::Wait {
+        let monitors = self.monitors.clone();
+        let mutators = self.mutators.clone();
+        let roots = self.roots();
+        monitors.wait(object, timeout, &mut |wait| {
+            let guard = mutators.blocked_with(roots.clone());
+            wait();
+            drop(guard);
+        })
+    }
+
+    /// `Monitor.Pulse` — lets waiters on `object` re-check.
+    pub fn monitor_pulse(&mut self, object: Handle) {
+        self.monitors.pulse(object);
+    }
+
     /// Releases one level of the monitor on `object`.
     pub fn monitor_exit(&mut self, object: Handle) {
         self.monitors.exit(object);
@@ -952,9 +981,24 @@ impl Interpreter {
         // local in its frames, and a collection that ran while it was away used
         // to sweep them.
         let guard = self.mutators.blocked_with(self.roots());
+        // A pool worker that blocks is a worker the pool has lost for the
+        // duration, so it says so — and the pool starts another if that leaves
+        // queued work with nobody to run it.
+        #[cfg(feature = "std")]
+        let pool = self.pool.clone().filter(|_| self.is_pool_worker);
+        #[cfg(feature = "std")]
+        let _away = pool.as_ref().map(|p| p.worker_blocking(self));
+
         let out = f(self);
         drop(guard);
         out
+    }
+
+    /// Marks this interpreter as one of the pool's own workers.
+    #[cfg(feature = "std")]
+    pub fn mark_as_pool_worker(&mut self, pool: crate::pool::TaskPool) {
+        self.pool = Some(pool);
+        self.is_pool_worker = true;
     }
 
     // -- compilation ---------------------------------------------------------

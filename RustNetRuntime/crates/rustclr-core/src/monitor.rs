@@ -34,6 +34,32 @@ use rustclr_gc::Handle;
 struct State {
     /// Owner and recursion depth, by locked object.
     held: HashMap<u64, (ThreadId, usize)>,
+    /// How many times each object has been pulsed.
+    ///
+    /// A counter rather than a flag: a waiter records the value it saw before
+    /// releasing the lock and waits for it to move. A flag would be missed by
+    /// a waiter that had not yet reached the wait when the pulse arrived, and
+    /// consumed twice by two that had.
+    pulses: HashMap<u64, u64>,
+}
+
+/// How a [`Monitors::wait`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wait {
+    /// Woken by a pulse, and holding the monitor again.
+    Pulsed,
+    /// The timeout passed. Still holding the monitor, as `Monitor.Wait`
+    /// guarantees whether or not it was pulsed.
+    TimedOut,
+    /// The caller did not hold the monitor. .NET reports this as
+    /// `SynchronizationLockException`.
+    NotHeld,
+}
+
+/// Whether a deadline has passed. `None` never has.
+#[cfg(feature = "std")]
+fn timed_out(deadline: Option<std::time::Instant>) -> bool {
+    deadline.is_some_and(|at| std::time::Instant::now() >= at)
 }
 
 /// The monitors of one runtime.
@@ -133,6 +159,94 @@ impl Monitors {
             .is_some_and(|(owner, _)| *owner == me)
     }
 
+    /// `Monitor.Wait` — releases the monitor, waits to be pulsed, retakes it.
+    ///
+    /// The recursion depth is preserved across the wait: a method that locked
+    /// an object three times deep and then waits must come back three deep, or
+    /// its own `finally` blocks release a lock it no longer holds.
+    ///
+    /// Returns `false` if this thread does not hold the monitor, which .NET
+    /// reports as `SynchronizationLockException`.
+    pub fn wait(
+        &self,
+        object: Handle,
+        timeout: Option<core::time::Duration>,
+        blocked: &mut dyn FnMut(&mut dyn FnMut()),
+    ) -> Wait {
+        let me = std::thread::current().id();
+        let key = object.to_bits();
+
+        // Release fully, remembering how deep we were.
+        let depth = {
+            let mut state = self.lock();
+            match state.held.get(&key) {
+                Some((owner, depth)) if *owner == me => {
+                    let depth = *depth;
+                    state.held.remove(&key);
+                    depth
+                }
+                _ => return Wait::NotHeld,
+            }
+        };
+        self.inner.released.notify_all();
+
+        let deadline = timeout.map(|t| std::time::Instant::now() + t);
+        let mut pulsed = false;
+        blocked(&mut || {
+            let mut state = self.lock();
+            let seen = state.pulses.get(&key).copied().unwrap_or(0);
+            loop {
+                let woken = state.pulses.get(&key).copied().unwrap_or(0) > seen;
+                // The monitor has to be free before returning, pulsed or not:
+                // `Wait` is defined to come back holding it, and a timeout does
+                // not change that. A caller whose `finally` releases a lock it
+                // never retook would corrupt the count for everyone.
+                if (woken || timed_out(deadline)) && !state.held.contains_key(&key) {
+                    state.held.insert(key, (me, depth));
+                    pulsed = woken;
+                    return;
+                }
+                state = match deadline {
+                    Some(at) => {
+                        let left = at.saturating_duration_since(std::time::Instant::now());
+                        // A floor, so a thread that has timed out still wakes to
+                        // notice the monitor becoming free.
+                        let left = left.max(core::time::Duration::from_millis(1));
+                        self.inner
+                            .released
+                            .wait_timeout(state, left)
+                            .expect("the monitor registry is poisoned")
+                            .0
+                    }
+                    None => self
+                        .inner
+                        .released
+                        .wait(state)
+                        .expect("the monitor registry is poisoned"),
+                };
+            }
+        });
+        if pulsed {
+            Wait::Pulsed
+        } else {
+            Wait::TimedOut
+        }
+    }
+
+    /// `Monitor.Pulse` / `PulseAll` — lets waiters re-check.
+    ///
+    /// Both do the same thing here. `Pulse` is documented to release one
+    /// waiter, and releasing all of them is a *weaker* promise that every
+    /// correctly written `Monitor.Wait` already tolerates, because a waiter has
+    /// to re-check its condition in a loop — a spurious wake-up is always
+    /// possible. Waking one and picking the wrong one would not be.
+    pub fn pulse(&self, object: Handle) {
+        let mut state = self.lock();
+        *state.pulses.entry(object.to_bits()).or_insert(0) += 1;
+        drop(state);
+        self.inner.released.notify_all();
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.inner.state.lock().expect("the monitor registry is poisoned")
     }
@@ -167,4 +281,21 @@ impl Monitors {
     pub fn holds(&self, object: Handle) -> bool {
         self.inner.borrow().contains_key(&object.to_bits())
     }
+
+    /// One thread, so a wait can never be pulsed: nothing else runs to do it.
+    /// Reporting a timeout beats blocking forever.
+    pub fn wait(
+        &self,
+        object: Handle,
+        _timeout: Option<core::time::Duration>,
+        _blocked: &mut dyn FnMut(&mut dyn FnMut()),
+    ) -> Wait {
+        if self.holds(object) {
+            Wait::TimedOut
+        } else {
+            Wait::NotHeld
+        }
+    }
+
+    pub fn pulse(&self, _object: Handle) {}
 }

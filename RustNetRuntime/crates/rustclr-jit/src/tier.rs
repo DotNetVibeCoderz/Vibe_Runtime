@@ -27,6 +27,8 @@ pub struct JitTier {
     compiled: HashMap<MethodId, NativeMethod>,
     /// Methods the backend cannot take, so they are not analysed again.
     declined: HashSet<MethodId>,
+    /// Whether a method's body loops, decoded once and remembered.
+    loops: HashMap<MethodId, bool>,
 }
 
 impl Default for JitTier {
@@ -49,6 +51,7 @@ impl JitTier {
             counts: HashMap::new(),
             compiled: HashMap::new(),
             declined: HashSet::new(),
+            loops: HashMap::new(),
         }
     }
 
@@ -113,7 +116,19 @@ impl NativeTier for JitTier {
         if !self.compiled.contains_key(&method) {
             let count = self.counts.entry(method).or_insert(0);
             *count += 1;
-            if *count < self.threshold.max(1) {
+            // A call count is a proxy for "this method is worth compiling", and
+            // it is the wrong proxy for a method that loops: `Sieve` and
+            // `Matrix` are each called *once* and run for seconds, so they
+            // never crossed the threshold however long they ran. Compiling on
+            // the first call when the body contains a backward branch fixes
+            // that, and costs a few microseconds when the loop turns out to be
+            // short — against seconds when it is not.
+            //
+            // This is not on-stack replacement: the decision is made before the
+            // call, so a method already running cannot be swapped. A loop-free
+            // method still waits for the count, because compiling one that is
+            // called once is pure loss.
+            if *count < self.threshold.max(1) && !self.loops(loader, method) {
                 return None;
             }
             if !self.compile_now(loader, method) {
@@ -130,10 +145,13 @@ impl NativeTier for JitTier {
         // the compiled code holds its address.
         //
         // Taking a raw pointer into the managed heap is sound here for a reason
-        // worth stating rather than assuming: the backend declines any method
-        // that allocates, so no collection can run while the compiled code is
-        // executing, and this collector never moves an object in any case.
-        // Both would have to change together for the pointer to go stale.
+        // worth stating rather than assuming: nothing collects while compiled
+        // code runs, and this collector never moves an object in any case.
+        //
+        // Compiled code can allocate now, which sounds like it breaks the
+        // first half and does not: `Heap::alloc` records pressure and returns,
+        // and it is the *interpreter* that collects, between instructions.
+        // Compiled code has no between-instructions. See `crate::alloc`.
         let mut descriptors: Vec<[i64; 2]> = Vec::with_capacity(native.arg_count);
         for i in 0..native.arg_count {
             if let Value::Obj(handle) = args.get(i)? {
@@ -162,6 +180,24 @@ impl NativeTier for JitTier {
         // prologue still dereferences.
         marshalled.push(0);
 
+        // And one past *that* is the allocation context. The sink owns every
+        // array the call allocates and drops them when it returns, which is
+        // sound because a compiled method cannot return a reference — so
+        // nothing it allocated can outlive the call.
+        let mut sink = self.array_types(loader).map(|types| {
+            crate::alloc::AllocSink::new(heap.clone(), types)
+        });
+        marshalled.push(
+            sink.as_mut()
+                .map(|s| s as *mut crate::alloc::AllocSink as i64)
+                .unwrap_or(0),
+        );
+        // And one past that, the recursion depth. Compiled recursion runs on
+        // the machine stack, which cannot be grown or unwound the way the
+        // interpreter's frame budget can, so compiled code counts its own
+        // depth and refuses rather than overrunning it.
+        marshalled.push(0);
+
         // SAFETY: `marshalled` holds `arg_count` values plus the trap slot,
         // which is exactly what the emitted code reads. Each array slot points
         // at a descriptor that outlives the call.
@@ -172,11 +208,32 @@ impl NativeTier for JitTier {
         // the exception is raised here. Declining instead would be wrong:
         // stores that already happened stay done, and re-running the method
         // interpreted would repeat them.
-        if marshalled[native.arg_count] != 0 {
-            return Some(Err(ExecutionError::exception(
-                ClrExceptionKind::IndexOutOfRange,
-                "Index was outside the bounds of the array.",
-            )));
+        match marshalled[native.arg_count] {
+            0 => {}
+            1 => {
+                return Some(Err(ExecutionError::exception(
+                    ClrExceptionKind::IndexOutOfRange,
+                    "Index was outside the bounds of the array.",
+                )))
+            }
+            // The heap could not satisfy an allocation. Declining and
+            // re-running interpreted would be wrong for the same reason a
+            // failed bounds check cannot: stores already made stay made.
+            2 => {
+                return Some(Err(ExecutionError::exception(
+                    ClrExceptionKind::InvalidOperation,
+                    "The managed heap could not satisfy an allocation from compiled code.",
+                )))
+            }
+            // Compiled recursion went deeper than the machine stack can be
+            // trusted for. The interpreter raises the same exception at its own
+            // frame budget, so a program sees one answer either way.
+            _ => {
+                return Some(Err(ExecutionError::exception(
+                    ClrExceptionKind::StackOverflow,
+                    "Compiled recursion exceeded the depth this runtime allows.",
+                )))
+            }
         }
 
         if !native.returns_value {
@@ -191,11 +248,69 @@ impl NativeTier for JitTier {
     }
 }
 
+impl JitTier {
+    /// Whether the method's body contains a backward branch.
+    ///
+    /// The cheapest signal that a single call could run for a long time, and
+    /// the only one available before the call happens. Decoded once per method
+    /// and remembered, because this is asked on a hot path.
+    fn loops(&mut self, loader: &Loader, method: MethodId) -> bool {
+        if let Some(known) = self.loops.get(&method) {
+            return *known;
+        }
+        let answer = match &loader.registry.method(method).kind {
+            rustclr_core::MethodKind::Il(body) => {
+                match rustclr_core::opcode::decode_all(&body.il) {
+                    Ok(instructions) => instructions.iter().any(|ins| {
+                        ins.operand.as_target().is_some_and(|t| t <= ins.offset)
+                    }),
+                    // Undecodable IL is not compilable either; saying "no loop"
+                    // leaves the count in charge, and `compile_now` refuses.
+                    Err(_) => false,
+                }
+            }
+            _ => false,
+        };
+        self.loops.insert(method, answer);
+        answer
+    }
+
+    /// The array types compiled code may allocate.
+    ///
+    /// `None` when the framework contract is not loaded, which leaves the sink
+    /// absent and any `newarr` in compiled code taking the trap path — a
+    /// refusal rather than a wrong answer.
+    fn array_types(&self, loader: &Loader) -> Option<crate::alloc::ArrayTypes> {
+        let int_element = loader.registry.find_type_by_name("System.Int32")?;
+        let double_element = loader.registry.find_type_by_name("System.Double")?;
+        let bool_element = loader.registry.find_type_by_name("System.Boolean")?;
+        // `find_sz_array` only knows the constructions something has already
+        // named. `System.Double[]` may be absent when nothing has built one
+        // yet, so the base `System.Array` stands in — the same fallback
+        // `Interpreter::alloc_value_array` uses, and enough for an array whose
+        // elements are read by width rather than by type.
+        let fallback = loader.core().array;
+        Some(crate::alloc::ArrayTypes {
+            int_array: loader.registry.find_sz_array(int_element).unwrap_or(fallback),
+            int_element,
+            double_array: loader.registry.find_sz_array(double_element).unwrap_or(fallback),
+            double_element,
+            bool_array: loader.registry.find_sz_array(bool_element).unwrap_or(fallback),
+            bool_element,
+        })
+    }
+}
+
 /// An evaluation-stack value as a machine word.
+///
+/// A `double` goes across as its bit pattern, which is what compiled code
+/// expects: floats travel through slots and general-purpose registers as bits
+/// there, and only the arithmetic moves them into xmm.
 fn as_i64(v: &Value) -> Option<i64> {
     match v {
         Value::I32(n) => Some(*n as i64),
         Value::I64(n) | Value::NativeInt(n) => Some(*n),
+        Value::F(f) => Some(f.to_bits() as i64),
         _ => None,
     }
 }
@@ -215,6 +330,13 @@ fn widen(return_type: &TypeSig, raw: i64) -> Value {
         TypeSig::I4 => Value::I32(raw as i32),
         TypeSig::U4 => Value::I32(raw as u32 as i32),
         TypeSig::I8 | TypeSig::U8 => Value::I64(raw),
+        // A float result arrives as its bit pattern, and reading it back as an
+        // integer was a silent wrong answer of the worst kind: the *bits* were
+        // right, so a method returning 1.0 handed back 4.6e18 and every check
+        // downstream compared two numbers that were both wrong in the same way.
+        TypeSig::R8 => Value::F(f64::from_bits(raw as u64)),
+        // `conv.r4` rounds through `f32`; the stack type stays `F`.
+        TypeSig::R4 => Value::F(f64::from_bits(raw as u64) as f32 as f64),
         _ => Value::I64(raw),
     }
 }
@@ -235,11 +357,26 @@ mod tests {
     }
 
     #[test]
-    fn only_integers_marshal_into_a_register() {
+    fn numbers_marshal_into_a_register_and_references_do_not() {
         assert_eq!(as_i64(&Value::I32(7)), Some(7));
         assert_eq!(as_i64(&Value::I64(7)), Some(7));
         assert_eq!(as_i64(&Value::Null), None, "a reference is not a machine word");
-        assert_eq!(as_i64(&Value::F(1.0)), None);
+        // A double crosses as its bit pattern. This used to be `None`, which
+        // was right while the backend had no float support and is the wrong
+        // answer now.
+        assert_eq!(as_i64(&Value::F(1.0)), Some(0x3FF0_0000_0000_0000));
+    }
+
+    /// The round trip is what has to hold: whatever `as_i64` sends in, `widen`
+    /// must bring back unchanged. Getting one side right and not the other is
+    /// how a method returning 1.0 came back as 4.6e18 — correct bits, read as
+    /// the wrong kind.
+    #[test]
+    fn a_double_survives_the_round_trip() {
+        for value in [0.0, 1.0, -1.0, 0.25, 2.9289682539682538, f64::MIN, f64::MAX] {
+            let raw = as_i64(&Value::F(value)).expect("a double is a machine word");
+            assert_eq!(widen(&TypeSig::R8, raw), Value::F(value), "{value} round-trips");
+        }
     }
 
     #[test]
@@ -261,6 +398,10 @@ fn int_array_descriptor(heap: &SharedHeap, handle: Handle) -> Option<[i64; 2]> {
     }
     heap.with::<ClrArray, _>(handle, |array| match &array.storage {
         ArrayStorage::I32(values) => Some([values.as_ptr() as i64, values.len() as i64]),
+        // A `double[]` has the same descriptor shape; the compiled code knows
+        // the element is eight bytes because the *opcode* said so.
+        ArrayStorage::F64(values) => Some([values.as_ptr() as i64, values.len() as i64]),
+        ArrayStorage::Bool(values) => Some([values.as_ptr() as i64, values.len() as i64]),
         _ => None,
     })
     .flatten()

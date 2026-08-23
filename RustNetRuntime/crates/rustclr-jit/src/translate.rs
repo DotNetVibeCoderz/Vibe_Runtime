@@ -18,6 +18,8 @@
 //! arguments arrive as a pointer to an `i64` array, which is one incoming
 //! parameter and therefore the same shape under every calling convention.
 
+use crate::floats::FloatMap;
+use std::collections::{BTreeMap, BTreeSet};
 use crate::verify::MethodAnalysis;
 use crate::CompileError;
 use rustclr_core::opcode::{Instruction, Op, Operand};
@@ -129,6 +131,57 @@ pub trait Backend {
     // executing, and the mark-sweep collector never moves an object even when
     // it does. The pointer is stable for exactly as long as the call.
 
+    // -- floating point -------------------------------------------------
+    //
+    // A `double` is eight bytes and so is a slot, so floats travel through the
+    // same slots and the same general-purpose registers as integers, as bit
+    // patterns. Only the arithmetic needs floating-point registers, and these
+    // are the operations that move a pattern into one, work on it, and move
+    // the result back.
+    //
+    // Which instruction is which is not visible in the opcode — IL's `add` is
+    // `add` for both — so `floats::infer` works it out from the signature
+    // beforehand. See that module on why a guess is not acceptable here.
+
+    /// Whether this backend implements the floating-point operations below.
+    ///
+    /// Same reasoning as `supports_arrays`: only x86-64 has ever executed an
+    /// instruction, and untested float encodings on an untested backend would
+    /// be two unknowns stacked.
+    fn supports_floats(&self) -> bool {
+        false
+    }
+
+    /// `dst = lhs <op> rhs`, on the bit patterns in those registers.
+    fn float_binop(&mut self, _op: BinOp, _dst: u8, _lhs: u8, _rhs: u8) {
+        unreachable!("a backend without float support was asked for float arithmetic")
+    }
+
+    /// `dst = -src`.
+    fn float_neg(&mut self, _dst: u8, _src: u8) {
+        unreachable!("a backend without float support was asked to negate")
+    }
+
+    /// Materialise a floating-point comparison as 0 or 1 in `dst`.
+    fn float_compare(&mut self, _cond: Cond, _dst: u8, _lhs: u8, _rhs: u8) {
+        unreachable!("a backend without float support was asked to compare")
+    }
+
+    /// Branch on a floating-point comparison.
+    fn float_branch_compare(&mut self, _cond: Cond, _lhs: u8, _rhs: u8, _target: u32) {
+        unreachable!("a backend without float support was asked to branch on floats")
+    }
+
+    /// `dst = (double) src`, from a signed 64-bit integer.
+    fn int_to_float(&mut self, _dst: u8, _src: u8) {
+        unreachable!("a backend without float support was asked to convert")
+    }
+
+    /// `dst = (long) src`, truncating toward zero as `conv.i8` does.
+    fn float_to_int(&mut self, _dst: u8, _src: u8) {
+        unreachable!("a backend without float support was asked to convert")
+    }
+
     /// Whether this backend implements the operations below.
     ///
     /// Only x86-64 does. The other two have never executed an instruction, so
@@ -157,12 +210,87 @@ pub trait Backend {
         let _ = (descriptor, index, value);
         unreachable!("this backend declines array access");
     }
+
+    /// `dst = descriptor.data[index]` for a `double[]`.
+    ///
+    /// Eight bytes moved as they are: a `double` travels as a bit pattern
+    /// everywhere in compiled code, so there is nothing to sign-extend and
+    /// nothing to convert. That is the whole difference from the `int[]` form,
+    /// which has to widen 32 bits to 64.
+    fn array_load_f64(&mut self, dst: u8, descriptor: u8, index: u8) {
+        let _ = (dst, descriptor, index);
+        unreachable!("this backend declines array access");
+    }
+
+    /// `descriptor.data[index] = value` for a `double[]`.
+    fn array_store_f64(&mut self, descriptor: u8, index: u8, value: u8) {
+        let _ = (descriptor, index, value);
+        unreachable!("this backend declines array access");
+    }
+
+    /// `dst = descriptor.data[index]` for a `bool[]`, zero-extended.
+    ///
+    /// Zero extension rather than sign: `ldelem.u1` is the unsigned form, and
+    /// a `bool` is 0 or 1. Sign-extending would turn a byte of 0xFF — which a
+    /// `bool[]` should never hold, but a `byte[]` would — into -1.
+    fn array_load_u8(&mut self, dst: u8, descriptor: u8, index: u8) {
+        let _ = (dst, descriptor, index);
+        unreachable!("this backend declines array access");
+    }
+
+    /// `descriptor.data[index] = value` for a `bool[]`, one byte.
+    fn array_store_u8(&mut self, descriptor: u8, index: u8, value: u8) {
+        let _ = (descriptor, index, value);
+        unreachable!("this backend declines array access");
+    }
+
+    /// Whether this backend can call itself recursively.
+    fn supports_self_calls(&self) -> bool {
+        false
+    }
+
+    /// Writes outgoing argument `index` for a self-call.
+    fn outgoing_arg(&mut self, _index: usize, _src: u8) {
+        unreachable!("this backend declines calls");
+    }
+
+    /// Calls the method being compiled, recursively, leaving any result in
+    /// `dst`. A trap raised inside the callee propagates to this frame.
+    fn call_self(&mut self, _dst: u8) {
+        unreachable!("this backend declines calls");
+    }
+
+    /// Whether this backend can allocate.
+    fn supports_allocation(&self) -> bool {
+        false
+    }
+
+    /// `dst = new array of `length` elements of `kind`', as a descriptor
+    /// address; takes the trap path when the heap cannot satisfy it.
+    ///
+    /// `kind` is one of [`crate::alloc::ELEMENT_I4`] or
+    /// [`crate::alloc::ELEMENT_R8`]. The call goes to
+    /// [`crate::alloc::alloc_array`] through a context pointer the tier left
+    /// in the argument array.
+    fn alloc_array(&mut self, _dst: u8, _kind: i64, _length: u8) {
+        unreachable!("this backend declines allocation");
+    }
 }
 
 /// Whether an opcode the walk understands is one this crate emits code for.
 /// Opcodes that only compile when the backend supports arrays.
 pub fn is_array_op(op: Op) -> bool {
-    matches!(op, Op::Ldlen | Op::LdelemI4 | Op::StelemI4)
+    matches!(
+        op,
+        Op::Ldlen
+            | Op::LdelemI4
+            | Op::StelemI4
+            | Op::LdelemR8
+            | Op::StelemR8
+            | Op::LdelemU1
+            | Op::StelemI1
+            | Op::Newarr
+    )
 }
 
 pub fn is_supported(op: Op) -> bool {
@@ -280,6 +408,26 @@ pub fn is_int_array(sig: &rustclr_metadata::TypeSig) -> bool {
         if matches!(inner.unwrap_modifiers(), rustclr_metadata::TypeSig::I4))
 }
 
+/// Whether a signature is `bool[]`.
+///
+/// `byte[]` and `sbyte[]` have the same element width and are deliberately
+/// left out: they would need the signed and unsigned loads told apart, and
+/// nothing has needed them yet.
+pub fn is_bool_array(sig: &rustclr_metadata::TypeSig) -> bool {
+    matches!(sig.unwrap_modifiers(), rustclr_metadata::TypeSig::SzArray(inner)
+        if matches!(inner.unwrap_modifiers(), rustclr_metadata::TypeSig::Boolean))
+}
+
+/// Whether a signature is `double[]`.
+///
+/// `float[]` is deliberately excluded: its elements are four bytes and the
+/// evaluation stack is `F`, so every load would have to widen and every store
+/// round — real work, and nothing this runtime has met needs it yet.
+pub fn is_double_array(sig: &rustclr_metadata::TypeSig) -> bool {
+    matches!(sig.unwrap_modifiers(), rustclr_metadata::TypeSig::SzArray(inner)
+        if matches!(inner.unwrap_modifiers(), rustclr_metadata::TypeSig::R8))
+}
+
 /// The shape check, told whether the backend can take arrays.
 ///
 /// Only x86-64 can. The AArch64 and RISC-V backends have never executed an
@@ -313,6 +461,10 @@ pub fn shape_is_compilable_with(
         return false;
     }
     let Ok(instructions) = rustclr_core::opcode::decode_all(&body.il) else { return false };
+    // No `call` here. This is the screen used when the inliner is *off*, and
+    // it cannot resolve a token to see whether a call targets this method
+    // itself — so it declines them all, and a recursive method is compiled
+    // only in the ordinary inlining path where `compile` can check properly.
     instructions
         .iter()
         .all(|i| is_supported(i.op) || (arrays && is_array_op(i.op)))
@@ -364,15 +516,16 @@ pub fn shape_might_compile_after_inlining(
     if !integer_shaped(&info.signature.return_type) && !info.returns_void() {
         return false;
     }
-    if !info
-        .signature
-        .params
-        .iter()
-        .all(|p| integer_shaped(p) || is_int_array(p))
-    {
+    // Arrays in either place. `compile` makes the real decision once it can
+    // see the rewritten body; this only has to avoid rejecting something that
+    // would have compiled.
+    let slot_ok = |p: &rustclr_metadata::TypeSig| {
+        integer_shaped(p) || is_int_array(p) || is_bool_array(p)
+    };
+    if !info.signature.params.iter().all(slot_ok) {
         return false;
     }
-    if !body.locals.iter().all(integer_shaped) {
+    if !body.locals.iter().all(slot_ok) {
         return false;
     }
     let Ok(instructions) = rustclr_core::opcode::decode_all(&body.il) else { return false };
@@ -387,6 +540,168 @@ pub fn shape_might_compile_after_inlining(
 /// own IL, and after inlining the stream no longer matches what is in the
 /// image. The signature and local checks are the same; only the opcode source
 /// differs.
+/// IL offsets whose `call` targets `method` itself.
+///
+/// `None` when the body contains a call this backend cannot emit — anything
+/// that is not a self-call, since a call to another method needs an address
+/// that may not exist yet. The inliner handles the small-leaf-callee case;
+/// this handles the one it cannot, which is recursion.
+pub fn self_calls(
+    loader: &rustclr_core::Loader,
+    assembly: rustclr_core::AssemblyId,
+    method: rustclr_core::MethodId,
+    instructions: &[Instruction],
+) -> Option<BTreeSet<u32>> {
+    let mut offsets = BTreeSet::new();
+    for ins in instructions {
+        if ins.op != Op::Call {
+            continue;
+        }
+        let token = ins.operand.as_token()?;
+        let target = loader.resolve_method_token(loader.assembly(assembly), token)?;
+        if target != method {
+            return None;
+        }
+        offsets.insert(ins.offset);
+    }
+    Some(offsets)
+}
+
+/// The element kind each `newarr` allocates, when every one of them is
+/// something this backend can allocate *and* outside any loop.
+///
+/// `None` declines the method. Two reasons, and both matter:
+///
+/// * an element type other than `int` or `double` has no allocation path here;
+/// * a `newarr` inside a loop makes the number of allocations unbounded, and
+///   compiled code never collects — so a loop allocating would exhaust the
+///   heap where the interpreter would not. A program that runs interpreted and
+///   fails compiled is the one difference this runtime will not accept.
+pub fn newarr_kinds(
+    loader: &rustclr_core::Loader,
+    assembly: rustclr_core::AssemblyId,
+    instructions: &[Instruction],
+) -> Option<BTreeMap<u32, i64>> {
+    let mut kinds = BTreeMap::new();
+    for ins in instructions {
+        if ins.op != Op::Newarr {
+            continue;
+        }
+        if inside_a_loop(instructions, ins.offset) {
+            return None;
+        }
+        let token = ins.operand.as_token()?;
+        let element = loader.resolve_type_token(loader.assembly(assembly), token)?;
+        let primitive = loader.registry.ty(element).primitive?;
+        let kind = match primitive {
+            rustclr_core::Primitive::Int32 => crate::alloc::ELEMENT_I4,
+            rustclr_core::Primitive::Double => crate::alloc::ELEMENT_R8,
+            rustclr_core::Primitive::Boolean => crate::alloc::ELEMENT_U1,
+            _ => return None,
+        };
+        kinds.insert(ins.offset, kind);
+    }
+    Some(kinds)
+}
+
+/// Whether `offset` lies inside a loop body.
+///
+/// A backward branch at `b` to `t` means everything in `t..=b` runs repeatedly.
+/// Conservative in the safe direction: an offset it calls looped is declined,
+/// and declining compiles nothing rather than compiling something unbounded.
+fn inside_a_loop(instructions: &[Instruction], offset: u32) -> bool {
+    instructions.iter().any(|ins| {
+        match ins.operand.as_target() {
+            Some(target) if target <= ins.offset => target <= offset && offset <= ins.offset,
+            _ => false,
+        }
+    })
+}
+
+/// Whether a method's *signature and locals* could be float-compilable.
+///
+/// The cheap screen, before the body is decoded or inlined. `float_shape` asks
+/// the real question afterwards.
+pub fn float_shape_possible(
+    registry: &rustclr_core::TypeRegistry,
+    method: rustclr_core::MethodId,
+) -> bool {
+    let info = registry.method(method);
+    let rustclr_core::MethodKind::Il(body) = &info.kind else { return false };
+    if !body.exception_clauses.is_empty() || info.signature.has_this {
+        return false;
+    }
+    let ok = |t: &rustclr_metadata::TypeSig| {
+        integer_shaped(t) || crate::floats::is_float_sig(t)
+    };
+    // Some float somewhere, or the integer gate should be handling it.
+    let any_float = crate::floats::is_float_sig(&info.signature.return_type)
+        || info.signature.params.iter().any(crate::floats::is_float_sig)
+        || body.locals.iter().any(crate::floats::is_float_sig);
+    let any_float = any_float
+        || info.signature.params.iter().any(is_double_array)
+        || body.locals.iter().any(is_double_array);
+    let slot_ok = |t: &rustclr_metadata::TypeSig| {
+        ok(t) || is_int_array(t) || is_double_array(t) || is_bool_array(t)
+    };
+    any_float
+        && (ok(&info.signature.return_type) || info.returns_void())
+        && info.signature.params.iter().all(slot_ok)
+        && body.locals.iter().all(slot_ok)
+}
+
+/// The float map for a method, when its shape is compilable with floats.
+///
+/// `None` means "run it interpreted". A method reaches here only if the
+/// integer gate already declined it *because* of floats, so this is the second
+/// question rather than a replacement for the first: are the only reasons it
+/// was declined floating-point ones this backend can emit?
+///
+/// [`crate::floats::infer`] does the deciding, and declines rather than guesses
+/// — an integer `add` emitted for a double gives a number, silently, and the
+/// wrong one.
+pub fn float_shape(
+    registry: &rustclr_core::TypeRegistry,
+    method: rustclr_core::MethodId,
+    instructions: &[Instruction],
+) -> Option<crate::floats::FloatMap> {
+    let info = registry.method(method);
+    let rustclr_core::MethodKind::Il(body) = &info.kind else { return None };
+    if !body.exception_clauses.is_empty() || info.signature.has_this {
+        return None;
+    }
+    // Every argument, local and the result must be an integer *or* a float;
+    // nothing else has a representation in a compiled frame.
+    let ok = |t: &rustclr_metadata::TypeSig| {
+        integer_shaped(t) || crate::floats::is_float_sig(t)
+    };
+    // An array is fine as a parameter *or* a local now. It was locals-excluded
+    // while allocation was declined, because a local declared `int[]` might
+    // hold either a descriptor the tier passed in or the result of a `newarr`
+    // the backend could not emit, and the signature does not say which. Both
+    // are descriptor addresses now, so the distinction stopped mattering.
+    let slot_ok = |t: &rustclr_metadata::TypeSig| {
+        ok(t) || is_int_array(t) || is_double_array(t) || is_bool_array(t)
+    };
+    if !ok(&info.signature.return_type) && !info.returns_void() {
+        return None;
+    }
+    if !info.signature.params.iter().all(slot_ok) || !body.locals.iter().all(slot_ok) {
+        return None;
+    }
+
+    let params: Vec<_> = info.signature.params.iter().map(|p| p.clone()).collect();
+    let map = crate::floats::infer(
+        instructions,
+        &params,
+        &body.locals,
+        &info.signature.return_type,
+    )?;
+    // No floats at all means the integer gate should have taken it, and this
+    // path adds nothing.
+    map.any.then_some(map)
+}
+
 pub fn shape_is_compilable_after_inlining(
     registry: &rustclr_core::TypeRegistry,
     method: rustclr_core::MethodId,
@@ -401,18 +716,26 @@ pub fn shape_is_compilable_after_inlining(
     if !integer_shaped(&info.signature.return_type) && !info.returns_void() {
         return false;
     }
-    let param_ok = |p: &rustclr_metadata::TypeSig| {
-        integer_shaped(p) || (arrays && is_int_array(p))
+    // An array is fine as a parameter *or* a local. Locals were excluded while
+    // allocation was declined, because a local declared `int[]` might hold
+    // either a descriptor the tier passed in or the result of a `newarr` the
+    // backend could not emit, and the signature does not say which. Both are
+    // descriptor addresses now, so the distinction stopped mattering.
+    let slot_ok = |p: &rustclr_metadata::TypeSig| {
+        integer_shaped(p) || (arrays && (is_int_array(p) || is_bool_array(p)))
     };
-    if !info.signature.params.iter().all(param_ok) {
+    if !info.signature.params.iter().all(slot_ok) {
         return false;
     }
-    if !body.locals.iter().all(integer_shaped) {
+    if !body.locals.iter().all(slot_ok) {
         return false;
     }
+    // `call` passes here and is checked properly in `compile`, which is the
+    // only place that can resolve a token and see whether the target is this
+    // method itself. Anything else is declined there.
     instructions
         .iter()
-        .all(|i| is_supported(i.op) || (arrays && is_array_op(i.op)))
+        .all(|i| is_supported(i.op) || (arrays && is_array_op(i.op)) || i.op == Op::Call)
 }
 
 /// Reads evaluation-stack slot `depth` into `dst`.
@@ -448,6 +771,44 @@ pub fn translate<B: Backend>(
     locals: usize,
     returns_value: bool,
 ) -> Result<(), CompileError> {
+    translate_with_plan(b, instructions, analysis, locals, returns_value, &Plan::default())
+}
+
+/// What the walk cannot work out from the instruction stream alone.
+///
+/// Both of these need something the walk does not have: the float map needs
+/// the method's signature, and the element kinds need the loader to resolve a
+/// `newarr` token. They are computed once, before emission starts.
+#[derive(Default, Clone)]
+pub struct Plan {
+    pub floats: FloatMap,
+    /// Element kind for the `newarr` at each IL offset.
+    pub newarr_kinds: BTreeMap<u32, i64>,
+    /// IL offsets whose `call` targets the method being compiled.
+    ///
+    /// Recursion is the one call shape the inliner cannot remove — splicing a
+    /// method into itself does not terminate — so it is the one that needed a
+    /// calling convention of its own.
+    pub self_calls: BTreeSet<u32>,
+    /// Arguments the method being compiled takes, for laying out a self-call.
+    pub arg_count: usize,
+    /// Whether a self-call leaves a value on the stack.
+    pub returns_value: bool,
+}
+
+/// [`translate`], told which instructions are floating-point.
+///
+/// The map comes from [`crate::floats::infer`], because an IL arithmetic
+/// opcode does not say whether its operands are integers or doubles — the
+/// types that reached it do, and only a walk over the stream can recover that.
+pub fn translate_with_plan<B: Backend>(
+    b: &mut B,
+    instructions: &[Instruction],
+    analysis: &MethodAnalysis,
+    locals: usize,
+    returns_value: bool,
+    plan: &Plan,
+) -> Result<(), CompileError> {
     b.prologue(locals, analysis.max_stack_observed as usize);
 
     for ins in instructions {
@@ -458,7 +819,7 @@ pub fn translate<B: Backend>(
                 "negative evaluation-stack depth".into(),
             ));
         }
-        one(b, ins, depth as usize, returns_value)?;
+        one(b, ins, depth as usize, returns_value, plan)?;
     }
 
     // A body that falls off the end without `ret` is invalid IL, but emitting
@@ -473,8 +834,10 @@ fn one<B: Backend>(
     ins: &Instruction,
     depth: usize,
     returns_value: bool,
+    plan: &Plan,
 ) -> Result<(), CompileError> {
     use Op::*;
+    let floats = &plan.floats;
 
     let t0 = b.temp(0);
     let t1 = b.temp(1);
@@ -573,7 +936,11 @@ fn one<B: Backend>(
             };
             read_slot(b, t0, depth - 2);
             read_slot(b, t1, depth - 1);
-            b.binop(op, t0, t0, t1);
+            if floats.is_float_op(ins.offset) {
+                b.float_binop(op, t0, t0, t1);
+            } else {
+                b.binop(op, t0, t0, t1);
+            }
             write_slot(b, depth - 2, t0);
         }
 
@@ -584,12 +951,120 @@ fn one<B: Backend>(
                 _ => UnOp::SignExtend32,
             };
             read_slot(b, t0, depth - 1);
-            b.unop(op, t0, t0);
+            match (ins.op, floats.is_float_op(ins.offset)) {
+                (Neg, true) => b.float_neg(t0, t0),
+                // `conv.i4` on a double is a real conversion followed by the
+                // narrowing. Doing only the narrowing sign-extends the *bit
+                // pattern* — `(int)3.5` came out 0, because the low 32 bits of
+                // 3.5's representation are zero.
+                (ConvI4, true) => {
+                    b.float_to_int(t0, t0);
+                    b.unop(UnOp::SignExtend32, t0, t0);
+                }
+                _ => b.unop(op, t0, t0),
+            }
             write_slot(b, depth - 1, t0);
         }
 
-        // Already 64-bit on the evaluation stack.
-        ConvI8 | ConvI => {}
+        // Already 64-bit on the evaluation stack — unless a double is being
+        // truncated to one, which is a real conversion rather than a no-op.
+        ConvI8 | ConvI => {
+            if floats.is_float_op(ins.offset) {
+                read_slot(b, t0, depth - 1);
+                b.float_to_int(t0, t0);
+                write_slot(b, depth - 1, t0);
+            }
+        }
+
+        // A float constant needs no floating-point instruction: the value is
+        // loaded as its bit pattern, which is exactly how doubles travel
+        // through slots and registers everywhere else here.
+        LdcR4 | LdcR8 => {
+            let Operand::F64(value) = ins.operand else {
+                return Err(CompileError::Unsupported("a float constant with no value".into()));
+            };
+            // `ldc.r4` pushes the value widened to the stack's `F` type, so
+            // rounding through `f32` first is what makes the compiled result
+            // match the interpreted one bit for bit.
+            let widened = if ins.op == LdcR4 { value as f32 as f64 } else { value };
+            b.load_imm(t0, widened.to_bits() as i64);
+            write_slot(b, depth, t0);
+        }
+
+        // A recursive call. The arguments are copied into an outgoing frame the
+        // prologue reserved, and the callee is entered exactly as the tier
+        // enters this method — same argument-array shape, same trap slot.
+        Call if plan.self_calls.contains(&ins.offset) => {
+            let n = plan.arg_count;
+            if depth < n {
+                return Err(CompileError::Unsupported(
+                    "a self-call with fewer arguments on the stack than it takes".into(),
+                ));
+            }
+            for i in 0..n {
+                read_slot(b, t0, depth - n + i);
+                b.outgoing_arg(i, t0);
+            }
+            b.call_self(t0);
+            if plan.returns_value {
+                write_slot(b, depth - n, t0);
+            }
+        }
+
+        // `newarr`. The element type was resolved at compile time, so only the
+        // length is dynamic; a failed allocation takes the same trap path a
+        // failed bounds check does.
+        Newarr => {
+            let Some(kind) = plan.newarr_kinds.get(&ins.offset).copied() else {
+                return Err(CompileError::Unsupported(
+                    "newarr of an element type this backend does not allocate".into(),
+                ));
+            };
+            read_slot(b, t0, depth - 1);
+            b.alloc_array(t0, kind, t0);
+            write_slot(b, depth - 1, t0);
+        }
+
+        // `bool[]` element access — one byte, zero-extended on the way in.
+        LdelemU1 => {
+            read_slot(b, t0, depth - 2);
+            read_slot(b, t1, depth - 1);
+            b.array_load_u8(t0, t0, t1);
+            write_slot(b, depth - 2, t0);
+        }
+
+        StelemI1 => {
+            read_slot(b, t0, depth - 3);
+            read_slot(b, t1, depth - 2);
+            read_slot(b, t2, depth - 1);
+            b.array_store_u8(t0, t1, t2);
+        }
+
+        // `double[]` element access. The index is bounds-checked exactly as the
+        // `int[]` form is; only the element width and the absence of sign
+        // extension differ.
+        LdelemR8 => {
+            read_slot(b, t0, depth - 2);
+            read_slot(b, t1, depth - 1);
+            b.array_load_f64(t0, t0, t1);
+            write_slot(b, depth - 2, t0);
+        }
+
+        StelemR8 => {
+            read_slot(b, t0, depth - 3);
+            read_slot(b, t1, depth - 2);
+            read_slot(b, t2, depth - 1);
+            b.array_store_f64(t0, t1, t2);
+        }
+
+        // `conv.r8` from an integer converts; from a double it is already one.
+        ConvR8 | ConvR4 => {
+            if floats.is_float_op(ins.offset) {
+                read_slot(b, t0, depth - 1);
+                b.int_to_float(t0, t0);
+                write_slot(b, depth - 1, t0);
+            }
+        }
 
         Dup => {
             read_slot(b, t0, depth - 1);
@@ -608,7 +1083,11 @@ fn one<B: Backend>(
             };
             read_slot(b, t0, depth - 2);
             read_slot(b, t1, depth - 1);
-            b.compare(cond, t0, t0, t1);
+            if floats.is_float_op(ins.offset) {
+                b.float_compare(cond, t0, t0, t1);
+            } else {
+                b.compare(cond, t0, t0, t1);
+            }
             write_slot(b, depth - 2, t0);
         }
 
@@ -642,7 +1121,11 @@ fn one<B: Backend>(
             };
             read_slot(b, t0, depth - 2);
             read_slot(b, t1, depth - 1);
-            b.branch_compare(cond, t0, t1, target);
+            if floats.is_float_op(ins.offset) {
+                b.float_branch_compare(cond, t0, t1, target);
+            } else {
+                b.branch_compare(cond, t0, t1, target);
+            }
         }
 
         // -- arrays ---------------------------------------------------

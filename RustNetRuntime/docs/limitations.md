@@ -192,6 +192,32 @@ rather than once per task. Two thousand tasks is a conformance check.
 `var d = Task.Delay(500); Work(); await d;` overlaps. One timer thread serves
 every outstanding delay.
 
+**`Monitor.Wait` and `Pulse` work**, so a producer/consumer queue built on
+`lock`/`Wait`/`Pulse` runs — a conformance check moves 500 items through one.
+`Wait` releases the monitor at whatever depth it was held and retakes it at that
+depth, because a method that locked three deep and then waits must come back
+three deep or its own `finally` blocks release a lock it no longer holds.
+
+`Wait(obj, ms)` honours its timeout and reports whether it was pulsed, and it
+comes back holding the monitor either way — a caller whose `finally` released a
+lock it never retook would corrupt the count for every other thread. A negative
+timeout is `Infinite`, as .NET defines it.
+
+One narrower thing: `Pulse` wakes *every* waiter rather than one. That is a
+weaker promise, and a `Wait` written in the re-check loop the API requires
+already tolerates it — a spurious wake-up is always possible — whereas waking
+one and picking the wrong one would not be.
+
+**The pool grows when its workers block.** A worker that sleeps, waits on a
+lock or joins a thread is a worker the pool has lost for the duration, and if
+that leaves nobody able to take queued work another is started, up to a ceiling.
+Thirty-two tasks that each sleep 400 ms took 1,610 ms before this and 469 ms
+after — four rounds against roughly one.
+
+That fix began as a *collector* bug: `Thread.Sleep` slept without announcing
+itself blocked, so a collection had to wait out the whole sleep for it, and
+several sleeping threads stalled every collection. Announcing it fixed both.
+
 **A thread waiting on a task runs queued work while it waits.** Without that a
 pool deadlocks in the familiar way — every worker blocked on a task whose job is
 still in the queue behind it — and a task that awaits another task is exactly
@@ -283,7 +309,7 @@ locals are then in a state nothing has reasoned about.
 
 ---
 
-## The native code generator only takes leaf integer methods
+## What the native code generator takes
 
 **What happens:** most methods are still interpreted. The x86-64 backend
 compiles a method only when it makes no calls, allocates nothing, has no
@@ -365,6 +391,66 @@ once. In an environment that forbids executable mappings outright, compilation
 fails and everything is interpreted.
 
 This is [Milestone 4](../Plan.md).
+
+
+### Floating point compiles
+
+`double` arithmetic, comparison, negation and conversion all compile:
+`a + b`, `a < b`, `-a`, `(double)n` and `(int)d` on scalars.
+
+**IL's arithmetic opcodes do not say which kind they are.** `add` is `add`
+whether its operands are integers or doubles, and the difference lives in the
+types that reached it. An interpreter can look at the values it holds; a
+compiler cannot. So a pass walks the instruction stream keeping an abstract
+stack of kinds and records, for each arithmetic instruction, which one it is —
+and **declines the method** when it cannot follow the stream, rather than
+picking a kind. An integer `add` emitted for a double produces a number,
+silently, and the wrong one.
+
+**Doubles need no new register class.** A slot is eight bytes and so is a
+`double`, so floats travel through slots and general-purpose registers as bit
+patterns; only the arithmetic moves them into xmm and straight back out. That
+is why this was a type-inference problem rather than a register-allocation one.
+
+**`double[]` compiles too**, when the array arrives as a *parameter* — a dot
+product over 512 elements runs **37× faster** compiled than interpreted, with
+the same answer. An eight-byte element needs no sign extension, so the load is
+a plain 64-bit move where `int[]` has to widen 32 bits to 64; the bounds check
+is the same one, and still throws `IndexOutOfRangeException`.
+
+**A compiled method can allocate.** `new int[n]`, `new double[n]` and
+`new bool[n]` inside a compiled method work, which is what finally makes
+`matrix` and `sieve` compile — **21.5×** and **20.3×** faster, same checksums.
+Both allocate their arrays as locals, and that used to disqualify them outright.
+
+One caveat about those numbers: they are measured with `--jit-threshold 1`.
+`Sieve` and `Matrix` are each called *once* by the benchmark, so at the default
+threshold they never compile at all and the suite still reports the interpreted
+time. The speedup is real and the tiering policy is what decides whether a given
+program sees it.
+
+Three facts make it sound, and it needs all three:
+
+* **`Heap::alloc` does not collect.** It allocates and records pressure; the
+  *interpreter* collects between instructions, and compiled code has no
+  between-instructions. So allocating from compiled code cannot itself trigger
+  a collection, and the existing argument for raw array pointers — that nothing
+  collects during the call — still holds.
+* **A compiled method cannot return a reference.** Its return type must be an
+  integer or a float, so every array it allocates is unreachable the moment the
+  call ends. Nothing needs rooting and nothing is handed back.
+* **Allocation is bounded.** A `newarr` *inside a loop* is declined, because
+  compiled code never collects and an unbounded loop would exhaust the heap
+  where the interpreter would not. A program that runs interpreted and fails
+  compiled is the one difference this runtime will not accept.
+
+When the heap genuinely cannot satisfy a request, compiled code takes the same
+trap path a failed bounds check takes and the tier raises the exception.
+
+**What is still declined:** `float[]`, whose four-byte elements would have to
+widen on every load and round on every store; `rem` on doubles, which is IEEE
+remainder and has had no single x86 instruction since SSE replaced x87's
+`fprem`; `decimal`; and anything else the integer path already declines.
 
 ---
 
@@ -631,7 +717,7 @@ would produce a number that looks like a pointer and is not one.
 
 **C# executes on a microcontroller.** On an ESP32-C3 (RISC-V, 400 KB SRAM,
 no operating system) the loader builds a type registry, RustBCL registers all
-836 of its native bindings, and the interpreter runs `HelloWorld.Main`:
+988 of its native bindings, and the interpreter runs `HelloWorld.Main`:
 
 ```
 -- il interpreter --
@@ -653,7 +739,7 @@ calls            6
 Those three lines are byte-identical to `dotnet HelloWorld.dll` on a desktop,
 CRLF included, and so are the counters: 68 IL instructions and 6 calls on
 x86-64 and on RISC-V alike. That capture is from the last time the board was attached; RustBCL has since
-grown to 836 bindings. The count in the excerpt is what the chip actually
+grown to 988 bindings. The count in the excerpt is what the chip actually
 printed, not what a rebuild would print today.
 
 Full captures of the interpreter running:
@@ -714,7 +800,7 @@ No arrangement of that memory loads the runtime, so the firmware prints the
 shortfall and carries on with the metadata reader and the collector. It also
 does not pay flash for what it cannot use: `Tier::for_budget` is a `const fn`
 over a constant, so LTO proves the `Full` and `Minimal` arms unreachable and
-strips the loader and all 836 bindings — 21 KB of `.text` against the F427VI's
+strips the loader and all 988 bindings — 21 KB of `.text` against the F427VI's
 282 KB from the same source file.
 
 **Two boards reach their tier only by using memory their part does not offer

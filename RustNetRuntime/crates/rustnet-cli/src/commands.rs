@@ -409,12 +409,15 @@ fn describe_decline(interp: &Interpreter, method: rustclr_core::MethodId) -> Str
         .signature
         .params
         .iter()
-        .position(|p| !is_integer_sig(p) && !rustclr_jit::translate::is_int_array(p))
+        .position(|p| !is_integer_sig(p) && !is_supported_array(p))
     {
-        return format!("parameter {i} is neither an integer nor an int[]");
+        return format!("parameter {i} is neither a number nor an array the backend takes");
     }
-    if let Some(i) = body.locals.iter().position(|l| !is_integer_sig(l)) {
-        return format!("local {i} is not an integer");
+    // Arrays are allowed as locals now that compiled code can allocate; this
+    // explanation still said otherwise, and a stale explanation is worse than
+    // none — it sends a reader looking for the wrong thing.
+    if let Some(i) = body.locals.iter().position(|l| !is_integer_sig(l) && !is_supported_array(l)) {
+        return format!("local {i} is neither a number nor an array the backend takes");
     }
     match rustclr_core::opcode::decode_all(&body.il) {
         Ok(instructions) => {
@@ -588,13 +591,42 @@ pub fn capabilities() -> Result<i32> {
     println!("RustCLR runtime capabilities\n");
     println!("Execution");
     println!("  IL interpreter               yes");
-    println!("  native JIT backend           x86-64, INTEGER METHODS AND int[]:");
-    println!("                               integer arithmetic, comparison, branching,");
-    println!("                               arguments, locals, and element access on an");
-    println!("                               int[] that arrives as a PARAMETER. No");
-    println!("                               allocation, so an array created inside the");
-    println!("                               method is declined; no exception handling,");
-    println!("                               floating point or object access.");
+    println!("  native JIT backend           x86-64. SCALAR ARITHMETIC AND int[]:");
+    println!("                               integer AND double arithmetic, comparison,");
+    println!("                               branching, negation, conversion between the");
+    println!("                               two, arguments, locals, and element access");
+    println!("                               on an int[], double[] or bool[] - in a");
+    println!("                               parameter or a local - bounds-checked.");
+    println!("                               IL's `add` is `add` for both kinds, so a");
+    println!("                               pass infers which from the types that reach");
+    println!("                               it and DECLINES the method when it cannot");
+    println!("                               follow the stream - never guesses.");
+    println!("                               ALLOCATION works: new int[n], new double[n]");
+    println!("                               and new bool[n] inside a compiled method,");
+    println!("                               because allocating does not itself collect");
+    println!("                               and a compiled method cannot return a");
+    println!("                               reference - so nothing it allocates");
+    println!("                               outlives the call.");
+    println!("                               DECLINED: newarr INSIDE A LOOP, which would");
+    println!("                               be unbounded since compiled code never");
+    println!("                               collects; float[]; `rem` on doubles;");
+    println!("                               exception handling; and object access.");
+    println!("                               RECURSION compiles: a method that calls");
+    println!("                               ITSELF gets a real calling convention, which");
+    println!("                               the inliner cannot provide - splicing a");
+    println!("                               method into itself does not terminate.");
+    println!("                               A call to ANOTHER method is declined: its");
+    println!("                               address may not exist yet.");
+    println!("                               Compiled recursion runs on the MACHINE");
+    println!("                               stack, so it counts its own depth and");
+    println!("                               refuses past a limit rather than crashing.");
+    println!("                               TIERING: a method whose body LOOPS compiles");
+    println!("                               on its first call; a loop-free one waits for");
+    println!("                               the call count. A single call that runs for");
+    println!("                               seconds never crossed a count, and the body");
+    println!("                               is the only signal available beforehand.");
+    println!("                               Not on-stack replacement: a method already");
+    println!("                               running cannot be swapped.");
     println!("                               Everything else is interpreted, and");
     println!("                               `rustnet jit <assembly>` says which is which.");
     println!("  array bounds                 checked. Compiled code cannot throw, so a");
@@ -729,6 +761,9 @@ Collections and LINQ");
     println!("                               rather than idling, so a task awaiting a");
     println!("                               task cannot deadlock the pool.");
     println!("                               Thread.Start still gets its own thread.");
+    println!("                               The pool GROWS when workers block, up to a");
+    println!("                               ceiling, so queued work is not stuck behind");
+    println!("                               a worker that is only sleeping.");
     println!("  Task, Task<T>, WhenAll       yes");
     println!("  TaskCompletionSource         yes - a real suspend and resume");
     println!("  Task Parallel Library        yes - see Parallel.* below");
@@ -743,6 +778,16 @@ Collections and LINQ");
     println!("                               which is why no lock sits on the path that");
     println!("                               runs every instruction.");
     println!("                               Task.Run and Parallel.* spawn too.");
+    println!("  Monitor.Wait / Pulse         yes - Wait releases the monitor at the");
+    println!("                               depth it was held, waits, and retakes it,");
+    println!("                               so producer/consumer queues work.");
+    println!("                               Pulse wakes EVERY waiter rather than one:");
+    println!("                               a weaker promise, which a Wait written in");
+    println!("                               the required re-check loop already");
+    println!("                               tolerates.");
+    println!("                               Wait(obj, ms) honours its timeout, reports");
+    println!("                               whether it was pulsed, and comes back");
+    println!("                               HOLDING the monitor either way.");
 
     println!("\nMemory and resources");
     println!("  IDisposable, using           yes");
@@ -905,4 +950,11 @@ Collections and LINQ");
 
     println!("\nBuilt by Gravicode Studios, led by Kang Fadhil.");
     Ok(0)
+}
+
+/// Whether the backend takes an array of this type in a slot.
+fn is_supported_array(sig: &rustclr_core::metadata::TypeSig) -> bool {
+    rustclr_jit::translate::is_int_array(sig)
+        || rustclr_jit::translate::is_bool_array(sig)
+        || rustclr_jit::translate::is_double_array(sig)
 }

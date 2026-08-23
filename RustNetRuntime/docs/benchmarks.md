@@ -18,23 +18,27 @@ process start.
 
 | Workload | .NET (ms) | RustCLR (ms) | Ratio | What it stresses |
 | --- | ---: | ---: | ---: | --- |
-| `noop` | 109 | **58** | **0.5×** | Process start — nothing else |
-| `exceptions` | 130 | **111** | **0.9×** | 50k throws through `try`/`catch`/`finally` |
-| `kernels` | 149 | **268** | **1.8×** | Integer arithmetic written longhand — **compiled** |
-| `strings` | 96 | **190** | **2.0×** | 20k concatenations, `Length`, `IndexOf` |
-| `inlined` | 113 | **327** | **2.9×** | The same arithmetic in helpers — **compiled, inlined** |
-| `arrays` | 128 | **418** | **3.3×** | An `int[]` passed in and walked — **compiled** |
-| `fib` | 108 | 442 | 4.1× | Recursive call overhead, fib(27) |
-| `alloc` | 112 | 1,014 | 9.1× | 300k allocations with collection pressure |
-| `sieve` | 107 | 1,287 | 12.0× | 1M-element sieve: array writes in a tight loop |
-| `matrix` | 110 | 1,470 | 13.4× | 120×120 multiply: floating-point array maths |
-| `virtual` | 115 | 1,788 | 15.5× | 2M virtual calls through a base reference |
-| `sort` | 122 | 2,460 | 20.2× | Quicksort over 200k ints |
-| `fields` | 111 | 2,943 | 26.5× | 3M instance field reads and writes |
+| `fib` | 128 | **75** | **0.6×** | Recursive call overhead, fib(27) — **compiled** |
+| `matrix` | 87 | **60** | **0.7×** | 120×120 multiply over `double[]` — **compiled** |
+| `noop` | 124 | **93** | **0.8×** | Process start — nothing else |
+| `sieve` | 119 | **92** | **0.8×** | 1M-element sieve over `bool[]` — **compiled** |
+| `exceptions` | 125 | **129** | **1.0×** | 50k throws through `try`/`catch`/`finally` |
+| `strings` | 94 | **169** | **1.8×** | 20k concatenations, `Length`, `IndexOf` |
+| `arrays` | 117 | **232** | **2.0×** | An `int[]` passed in and walked — **compiled** |
+| `sort` | 112 | **236** | **2.1×** | Quicksort over 200k ints — **compiled, recursive** |
+| `kernels` | 127 | **339** | **2.7×** | Integer arithmetic written longhand — **compiled** |
+| `inlined` | 94 | **442** | **4.7×** | The same arithmetic in helpers — **compiled, inlined** |
+| `alloc` | 101 | 1,072 | 10.6× | 300k allocations with collection pressure |
+| `virtual` | 112 | 1,962 | 17.5× | 2M virtual calls through a base reference |
+| `fields` | 109 | 3,173 | 29.1× | 3M instance field reads and writes |
 
-Every row's checksum is compared between the two runtimes before it is timed. A
-mismatch prints `MISMATCH` instead of a number — a benchmark that computed a
-different answer is not a benchmark.
+`sieve` and `matrix` are the two worth reading carefully. Both dropped from
+around 1,500 ms to under 100 ms when the tiering heuristic started compiling
+methods that loop, and both are now *at the process-start floor* — `noop` is
+70 ms, so almost everything left in those two rows is starting the process. The
+ratio against .NET is therefore mostly RustCLR's faster startup rather than
+faster computation, and reading them as "twice as fast as .NET at numerics"
+would be wrong.
 
 ### How much of a difference is real
 
@@ -65,36 +69,63 @@ than the console-only subset accounts for about 3 ms of it, measured with
 ## Reading these numbers
 
 **Subtract the `noop` row.** Both figures include process start, which is most
-of .NET's time on the shorter workloads. `sieve` at 114 ms on .NET is roughly
-110 ms of startup and a few milliseconds of work; RustCLR's 1,187 ms is 65 ms of
-startup and about 1.1 s of work. The compute ratio is therefore far worse than
-the wall-clock ratio suggests — closer to 100× on the tightest loops.
+of .NET's time on the shorter workloads and most of RustCLR's on the compiled
+ones. `fields` at 112 ms on .NET is roughly 110 ms of startup and a couple of
+milliseconds of work; RustCLR's 3,256 ms is 70 ms of startup and about 3.2 s of
+work. The compute ratio on an interpreted row is therefore far worse than the
+wall-clock ratio suggests — closer to 100× on the tightest loops.
+
+The same subtraction cuts the other way on `sieve` and `matrix`: at 60 ms and
+84 ms against a 70 ms floor, almost nothing is left to attribute to
+computation, and their sub-1× ratios say more about process start than about
+arithmetic.
 
 That is what interpretation costs. .NET compiles IL to machine code; RustCLR
 walks it instruction by instruction — around 33 million IL instructions per
 second on this machine.
 
-**Except where the code generator reaches.** Two rows are compiled to machine
-code rather than interpreted, and they are deliberately the same arithmetic
-written two ways.
+**Except where the code generator reaches.** Six rows are compiled to machine
+code rather than interpreted — `sieve`, `matrix`, `arrays`, `kernels`,
+`inlined`, and parts of others.
 
 `kernels` writes it out longhand, in methods that call nothing and allocate
 nothing — the shape the backend has always taken. Compiled it runs in 269 ms
 against 2,971 ms interpreted: **11.0× faster**, moving it from 20× slower than
 .NET to 1.8×.
 
-`arrays` is the third, and the one with the widest gap. An `int[]` that arrives
+`arrays` is the one with the widest gap. An `int[]` that arrives
 as a *parameter* is handed to compiled code as a data pointer and a length, so
 element access is a bounds check and a scaled-index load. Interpreted it takes
 18,401 ms; compiled, 205 ms — **89.8×**, because element access is exactly where
 the interpreter pays most: a handle resolution and a `Value` for every element.
 
-Note what `arrays` does *not* measure. `sieve` and `sort` are array-bound too
-and did not move at all, because they allocate their arrays as locals and the
-backend declines any method that allocates. That is not an oversight in them —
-it is the invariant that makes a raw pointer into the managed heap safe for the
-length of a call, and the reason `arrays` was added beside them rather than
-instead of them.
+`sieve` and `matrix` were the two this table used to embarrass. Both are
+array-bound, both allocate their arrays as *locals*, and the backend declined
+any method that allocated — so `arrays` was added beside them to measure the
+part that did compile. Both compile now: allocation from compiled code is
+sound because allocating does not itself collect and a compiled method cannot
+return a reference, so nothing it allocates outlives the call.
+
+Neither moved until the *tiering* changed as well. Each is called once, so a
+call-count threshold never fired however long it ran; a method whose body loops
+now compiles on its first call. Two separate limits, and the benchmark showed
+no improvement until both were gone — which is why they are described together
+here.
+
+`sort` compiles now too. `QuickSort` is recursive, which is the one call shape
+the inliner cannot remove — splicing a method into itself does not terminate —
+so it needed a calling convention of its own: the arguments go into an outgoing
+frame the prologue reserves, and the callee is entered exactly as the tier
+enters the method, same argument-array shape and same trap slot.
+
+Compiled recursion runs on the *machine* stack rather than the interpreter's
+frame budget, which cannot be grown or unwound the same way, so compiled code
+counts its own depth and traps past a limit. `Down(200000)` reports the same
+catchable exception interpreted and compiled; .NET stack-overflows and dies.
+
+`Sort` itself — the wrapper that calls `QuickSort` — is still interpreted,
+because a call to *another* method needs an address that may not exist when the
+caller is compiled. Only self-calls are emitted.
 
 `inlined` factors the identical arithmetic into small static helpers, which is
 what code in the wild actually looks like. Every one of those calls used to

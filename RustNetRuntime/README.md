@@ -24,10 +24,10 @@ handling — produces identical output on both runtimes:
 
 ```console
 $ dotnet Conformance.dll
-checks=285 failures=0
+checks=308 failures=0
 
 $ rustnet run Conformance.dll --stats
-checks=285 failures=0
+checks=308 failures=0
 
 ─── execution ──────────────────────────────
   wall clock                  10.505 ms
@@ -49,7 +49,7 @@ divide-by-zero, delegates, and allocation under collection pressure. A second
 suite, `tests/fixtures/ModernSyntax/`, does the same for 35 modern C# features.
 Both are normal C# projects you can read and extend.
 
-`cargo test --workspace` runs 175 tests across the eight crates.
+`cargo test --workspace` runs 192 tests across the eight crates.
 
 ---
 
@@ -389,7 +389,7 @@ The **whole runtime builds without `std`** — `rustclr-metadata`, `rustclr-gc`,
 combinations.
 
 **C# runs on a microcontroller.** On an ESP32-C3 — RISC-V, 400 KB of SRAM, no
-operating system — the loader builds a type registry, RustBCL registers all 836
+operating system — the loader builds a type registry, RustBCL registers all 988
 of its native bindings, and the interpreter executes `HelloWorld.Main`:
 
 ```
@@ -408,7 +408,7 @@ calls            6
 ```
 
 That capture is from the last time the board was attached; RustBCL has since
-grown to 836 bindings. The count in the excerpt is what the chip actually
+grown to 988 bindings. The count in the excerpt is what the chip actually
 printed, not what a rebuild would print today.
 
 Those three lines are byte-identical to what `dotnet HelloWorld.dll` prints on

@@ -172,3 +172,38 @@ fn inlining_does_not_change_the_answer() {
     assert_eq!(plain, inlined, "inlining changed the program's output");
     assert!(inlined.contains("failures=0"), "the fixture reported failures:\n{inlined}");
 }
+
+
+/// A method that loops compiles on its *first* call.
+///
+/// A call count is a proxy for "worth compiling", and it is the wrong proxy for
+/// a method called once that runs for seconds. `Sieve` and `Matrix` are exactly
+/// that shape: before this they stayed interpreted however long they ran, and
+/// the benchmark reported the interpreted time while a 20x speedup sat unused
+/// behind a flag.
+///
+/// This is not on-stack replacement — the decision happens *before* the call,
+/// so a method already running still cannot be swapped.
+#[test]
+fn a_looping_method_compiles_without_waiting_for_a_call_count() {
+    if !std::path::Path::new(FIXTURE).exists() {
+        eprintln!("skipping: conformance fixture not built");
+        return;
+    }
+    let mut interp = Interpreter::with_host(Box::new(CaptureHost::new()));
+    rustclr_bcl::install(&mut interp);
+    // The *default* threshold, which is the point: no flag and no repeated
+    // calls, and it compiles anyway because the bodies loop.
+    let tier = JitTier::new();
+    assert!(tier.threshold > 1, "the default must not be compile-everything");
+    interp.native_tier = Some(Box::new(tier));
+
+    let assembly = interp.loader.load_from_file(FIXTURE).expect("fixture loads");
+    interp.run_entry_point(assembly).expect("fixture runs");
+
+    let (compiled, _) = interp.native_tier.as_ref().expect("a tier").stats();
+    assert!(
+        compiled > 0,
+        "a method with a loop should compile on its first call, not wait for a count"
+    );
+}

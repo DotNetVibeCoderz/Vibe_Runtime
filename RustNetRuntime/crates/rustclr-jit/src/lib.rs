@@ -24,6 +24,8 @@
 //! AArch64 and RISC-V backends do not exist yet. `can_compile` reports what is
 //! actually handled rather than implying more.
 
+pub mod alloc;
+pub mod floats;
 pub mod aarch64;
 pub mod codepage;
 pub mod inline;

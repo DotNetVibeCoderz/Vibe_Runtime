@@ -41,7 +41,7 @@
 //! The result is returned in `rax` by both.
 
 use crate::codepage::{CodePage, CodePageError};
-use crate::translate::{translate, Backend, BinOp, Cond, UnOp};
+use crate::translate::{Backend, BinOp, Cond, UnOp};
 use crate::verify::MethodAnalysis;
 use crate::{analyse, CompileError, CompiledCode, Compiler, Tier};
 use rustclr_core::opcode::{decode_all, Instruction, Op};
@@ -57,10 +57,19 @@ const ARGS: u8 = RBX;
 const RAX: u8 = 0;
 const RCX: u8 = 1;
 const RDX: u8 = 2;
+
+/// Scratch xmm registers. Nothing lives in one between instructions, so two
+/// is enough for every operation the float path emits.
+const XMM0: u8 = 0;
+const XMM1: u8 = 1;
 const RBX: u8 = 3;
 const RSP: u8 = 4;
 const RBP: u8 = 5;
 const RDI: u8 = 7;
+/// Argument registers beyond the first two, for the C calls the allocation
+/// helper needs. System V uses rdi/rsi/rdx; Windows uses rcx/rdx/r8.
+const RSI: u8 = 6;
+const R8: u8 = 8;
 const R14: u8 = 14;
 const R15: u8 = 15;
 
@@ -167,6 +176,15 @@ impl Compiler for X64Backend {
         if !cfg!(target_arch = "x86_64") {
             return false;
         }
+        // A float-shaped signature gets past this screen on the strength of its
+        // types alone; `compile` runs `floats::infer` over the real body and
+        // declines there if the stream cannot be followed. Screening it out
+        // here would mean no float method ever reached the float path — which
+        // is exactly what happened, and made a differential test pass while
+        // compiling nothing.
+        if crate::translate::float_shape_possible(registry, method) {
+            return true;
+        }
         if self.inline {
             // With the inliner on, a `call` is no longer disqualifying on its
             // own. This screen still rejects the wrong signatures and any
@@ -202,32 +220,92 @@ impl Compiler for X64Backend {
 
         // The shape check runs against the *rewritten* body, so an inlined
         // caller is judged on what it actually became.
-        if !crate::translate::shape_is_compilable_after_inlining(
+        //
+        // Two gates, asked in order. The integer one takes everything it can;
+        // a method it declines gets a second question — is it declined only
+        // for floating-point reasons this backend can emit? The float map that
+        // comes back says which instructions are float operations, because the
+        // opcode alone does not: IL's `add` is `add` for both kinds.
+        let floats = if crate::translate::shape_is_compilable_after_inlining(
             &loader.registry,
             method,
             &instructions,
             true,
         ) {
-            return Err(CompileError::Unsupported(
-                "this method's shape is outside the baseline backend".into(),
-            ));
-        }
+            crate::floats::FloatMap::default()
+        } else {
+            match crate::translate::float_shape(&loader.registry, method, &instructions) {
+                Some(map) => map,
+                None => {
+                    return Err(CompileError::Unsupported(
+                        "this method's shape is outside the baseline backend".into(),
+                    ))
+                }
+            }
+        };
 
         let returns_value = !info.returns_void();
         // `max_stack` is the declared figure for the original body; splicing
         // can only add to the depth, so the inlined arguments are allowed for.
         let max_stack = body.max_stack.saturating_add(8);
+        // A `call` moves the stack by however many arguments it takes, less
+        // one if it leaves a result. Treating it as zero made the depth walk
+        // disagree with itself the moment a recursive call appeared — reported
+        // as "reached with stack depth 3, but 0 on another path", which is the
+        // verifier noticing rather than a bug in the method.
+        let arg_count = info.arg_count();
         let analysis = analyse(&instructions, max_stack, &body.exception_clauses, |ins| {
-            if ins.op == Op::Ret && returns_value {
-                -1
-            } else {
-                0
+            match ins.op {
+                Op::Ret if returns_value => -1,
+                Op::Call => {
+                    let popped = arg_count as i32;
+                    let pushed = if returns_value { 1 } else { 0 };
+                    pushed - popped
+                }
+                _ => 0,
             }
         })
         .map_err(CompileError::Invalid)?;
 
         // The trap slot sits one past the real arguments; see `X64Emitter`.
-        let bytes = emit(&instructions, &analysis, locals, returns_value, info.arg_count())?;
+        // The element kind of each `newarr`, and the check that none of them is
+        // inside a loop — see `newarr_kinds` on why unbounded allocation from
+        // compiled code is not acceptable.
+        let assembly = loader.registry.method(method).assembly;
+        let Some(newarr_kinds) =
+            crate::translate::newarr_kinds(loader, assembly, &instructions)
+        else {
+            return Err(CompileError::Unsupported(
+                "this method allocates something the backend cannot, or allocates in a loop"
+                    .into(),
+            ));
+        };
+        // Which calls target this method itself. Anything else is declined:
+        // calling another compiled method needs its address, which may not
+        // exist yet, and the inliner already covers the small-callee case.
+        let Some(self_calls) =
+            crate::translate::self_calls(loader, assembly, method, &instructions)
+        else {
+            return Err(CompileError::Unsupported(
+                "this method calls something other than itself".into(),
+            ));
+        };
+        let plan = crate::translate::Plan {
+            floats,
+            newarr_kinds,
+            self_calls,
+            arg_count: info.arg_count(),
+            returns_value,
+        };
+
+        let bytes = emit(
+            &instructions,
+            &analysis,
+            locals,
+            returns_value,
+            info.arg_count(),
+            &plan,
+        )?;
         self.methods_compiled += 1;
         self.bytes_emitted += bytes.len();
         Ok(CompiledCode { method, tier: Tier::Jit, bytes, analysis })
@@ -283,6 +361,174 @@ impl Assembler {
     /// Always emits REX, needed when addressing spl/bpl/sil/dil as bytes.
     fn rex_forced(&mut self, w: bool, reg: u8, rm: u8) {
         self.byte(0x40 | ((w as u8) << 3) | (((reg >> 3) & 1) << 2) | ((rm >> 3) & 1));
+    }
+
+    // -- SSE2, for `double` ------------------------------------------------
+    //
+    // Every x86-64 processor has SSE2; it is part of the base architecture
+    // rather than an extension to probe for, so these need no feature check.
+    //
+    // Values arrive in general-purpose registers as bit patterns, because a
+    // slot is eight bytes and so is a `double`. Each operation moves the
+    // pattern into an xmm register, works there, and moves the result back —
+    // which costs two moves per operation and keeps floats out of the register
+    // allocator entirely. A method doing float arithmetic in a loop would
+    // rather keep them in xmm across iterations; that is a later optimisation
+    // and not a correctness matter.
+
+    /// `movq xmm, r64` — the bit pattern, not a conversion.
+    fn movq_xmm_from_gp(&mut self, xmm: u8, gp: u8) {
+        self.byte(0x66);
+        self.rex_forced(true, xmm, gp);
+        self.byte(0x0F);
+        self.byte(0x6E);
+        self.modrm(0b11, xmm, gp);
+    }
+
+    /// `movq r64, xmm`.
+    fn movq_gp_from_xmm(&mut self, gp: u8, xmm: u8) {
+        self.byte(0x66);
+        self.rex_forced(true, xmm, gp);
+        self.byte(0x0F);
+        self.byte(0x7E);
+        self.modrm(0b11, xmm, gp);
+    }
+
+    /// A two-operand scalar-double instruction: `<op> xmm1, xmm2`.
+    fn sse_sd(&mut self, opcode: u8, dst: u8, src: u8) {
+        self.byte(0xF2);
+        if dst >= 8 || src >= 8 {
+            self.rex_forced(false, dst, src);
+        }
+        self.byte(0x0F);
+        self.byte(opcode);
+        self.modrm(0b11, dst, src);
+    }
+
+    /// `ucomisd xmm1, xmm2` — sets ZF/PF/CF like an unsigned compare, with PF
+    /// set when either operand is NaN.
+    fn ucomisd(&mut self, lhs: u8, rhs: u8) {
+        self.byte(0x66);
+        if lhs >= 8 || rhs >= 8 {
+            self.rex_forced(false, lhs, rhs);
+        }
+        self.byte(0x0F);
+        self.byte(0x2E);
+        self.modrm(0b11, lhs, rhs);
+    }
+
+    /// `cvtsi2sd xmm, r64` — signed 64-bit integer to double.
+    fn cvtsi2sd(&mut self, xmm: u8, gp: u8) {
+        self.byte(0xF2);
+        self.rex_forced(true, xmm, gp);
+        self.byte(0x0F);
+        self.byte(0x2A);
+        self.modrm(0b11, xmm, gp);
+    }
+
+    /// `cvttsd2si r64, xmm` — double to signed 64-bit, truncating toward zero,
+    /// which is what `conv.i8` from a float means.
+    fn cvttsd2si(&mut self, gp: u8, xmm: u8) {
+        self.byte(0xF2);
+        self.rex_forced(true, gp, xmm);
+        self.byte(0x0F);
+        self.byte(0x2C);
+        self.modrm(0b11, gp, xmm);
+    }
+
+    /// `xorpd xmm1, xmm2`, used to flip a sign bit.
+    fn xorpd(&mut self, dst: u8, src: u8) {
+        self.byte(0x66);
+        if dst >= 8 || src >= 8 {
+            self.rex_forced(false, dst, src);
+        }
+        self.byte(0x0F);
+        self.byte(0x57);
+        self.modrm(0b11, dst, src);
+    }
+
+    /// `sub rsp, imm8` — for the shadow space a call needs.
+    fn sub_rsp(&mut self, bytes: i32) {
+        self.rex(true, 0, RSP);
+        self.byte(0x83);
+        self.modrm(0b11, 5, RSP);
+        self.byte(bytes as u8);
+    }
+
+    /// `add rsp, imm8`.
+    fn add_rsp(&mut self, bytes: i32) {
+        self.rex(true, 0, RSP);
+        self.byte(0x83);
+        self.modrm(0b11, 0, RSP);
+        self.byte(bytes as u8);
+    }
+
+    /// `call reg` — an indirect call through a register.
+    fn call_reg(&mut self, reg: u8) {
+        self.rex(false, 0, reg);
+        self.byte(0xFF);
+        self.modrm(0b11, 2, reg);
+    }
+
+    /// `cmp reg, imm8`.
+    fn cmp_ri(&mut self, reg: u8, value: i32) {
+        self.rex(true, 0, reg);
+        self.byte(0x83);
+        self.modrm(0b11, 7, reg);
+        self.byte(value as u8);
+    }
+
+    /// `movzx dst, byte [base + index*1]` — a one-byte element, zero-extended.
+    fn movzx_r_mem_index_u8(&mut self, dst: u8, base: u8, index: u8) {
+        self.rex_index(true, dst, base, index);
+        self.byte(0x0F);
+        self.byte(0xB6);
+        self.modrm(0b00, dst, RSP);
+        self.byte(((index & 7) << 3) | (base & 7));
+    }
+
+    /// `mov byte [base + index*1], src8`.
+    ///
+    /// REX is forced so the source names the low byte of the register rather
+    /// than `ah`/`ch`/`dh`, which is what the encoding would otherwise mean.
+    fn mov_mem_index_r8(&mut self, base: u8, index: u8, src: u8) {
+        self.rex_index_forced(false, src, base, index);
+        self.byte(0x88);
+        self.modrm(0b00, src, RSP);
+        self.byte(((index & 7) << 3) | (base & 7));
+    }
+
+    /// `lea dst, [base + offset]`.
+    fn lea(&mut self, dst: u8, base: u8, offset: i32) {
+        self.rex(true, dst, base);
+        self.byte(0x8D);
+        self.byte((0b10 << 6) | ((dst & 7) << 3) | (base & 7));
+        self.imm32(offset);
+    }
+
+    /// `inc reg`.
+    fn inc_reg(&mut self, reg: u8) {
+        self.rex(true, 0, reg);
+        self.byte(0xFF);
+        self.modrm(0b11, 0, reg);
+    }
+
+    /// `cmp reg, imm32`.
+    fn cmp_ri32(&mut self, reg: u8, value: i32) {
+        self.rex(true, 0, reg);
+        self.byte(0x81);
+        self.modrm(0b11, 7, reg);
+        self.imm32(value);
+    }
+
+    /// `call rel32` back to the start of the code being emitted.
+    ///
+    /// The target is offset zero — a compiled method's entry is the first byte
+    /// of its own page — so the displacement is known here and needs no fixup.
+    fn call_self_start(&mut self) {
+        self.byte(0xE8);
+        let after = self.code.len() as i64 + 4;
+        self.imm32((-after) as i32);
     }
 
     fn modrm(&mut self, mode: u8, reg: u8, rm: u8) {
@@ -472,6 +718,16 @@ impl Assembler {
     }
 
     /// REX for an instruction with a base *and* an index register.
+    /// [`Self::rex_index`] that always emits, for a byte-register operand.
+    fn rex_index_forced(&mut self, w: bool, reg: u8, base: u8, index: u8) {
+        self.byte(
+            0x40 | ((w as u8) << 3)
+                | (((reg >> 3) & 1) << 2)
+                | (((index >> 3) & 1) << 1)
+                | ((base >> 3) & 1),
+        );
+    }
+
     fn rex_index(&mut self, w: bool, reg: u8, base: u8, index: u8) {
         let byte = 0x40
             | ((w as u8) << 3)
@@ -507,6 +763,15 @@ impl Assembler {
 // Condition codes, as the low nibble of a `jcc` opcode.
 const CC_E: u8 = 0x4;
 const CC_NE: u8 = 0x5;
+
+/// How deep compiled recursion may go before it refuses.
+///
+/// The machine stack is the limit here, not a frame budget the runtime can
+/// grow, so overrunning it is a crash rather than an exception. The
+/// interpreter raises `StackOverflowException` at its own budget; this trap
+/// is the compiled equivalent, and is deliberately far below anything a real
+/// stack would run out at.
+const MAX_COMPILED_DEPTH: i32 = 4096;
 const CC_L: u8 = 0xC;
 const CC_GE: u8 = 0xD;
 const CC_LE: u8 = 0xE;
@@ -539,13 +804,15 @@ pub struct X64Emitter {
     /// behalf. Stores that already happened stay done, which is what .NET does
     /// too: the exception aborts the method, it does not roll it back.
     trap_slot: usize,
+    /// Frame offset of the outgoing argument array a self-call fills in.
+    outgoing: i32,
     /// Frame offset of the scratch word; see [`Self::frame_scratch`].
     scratch: i32,
 }
 
 impl X64Emitter {
     fn new(trap_slot: usize) -> Self {
-        Self { asm: Assembler::new(), locals: 0, frame: 0, trap_slot, scratch: 0 }
+        Self { asm: Assembler::new(), locals: 0, frame: 0, trap_slot, scratch: 0, outgoing: 0 }
     }
 
     /// A frame slot no local or spill uses, for holding a value while every
@@ -628,10 +895,17 @@ impl Backend for X64Emitter {
         self.asm.push(R14);
         self.asm.push(R15);
 
+        // Room for the argument array a recursive call hands its callee:
+        // the arguments, the trap slot, the allocation context, and the depth
+        // counter. Reserved once here rather than pushed per call, so the
+        // stack pointer never moves inside the body.
+        let outgoing_words = self.trap_slot + 3;
+        self.outgoing = self.scratch - 8 * outgoing_words as i32;
+
         // Reserve locals and spill slots, keeping rsp 16-byte aligned. The
         // return address plus `push rbp` and three more pushes leave the stack
         // misaligned by 8, so an odd number of reserved words restores it.
-        let words = locals + max_stack + 2;
+        let words = locals + max_stack + 2 + outgoing_words + 1;
         let words = if words % 2 == 0 { words + 1 } else { words };
         self.frame = (words * 8) as i32;
         // sub rsp, imm32
@@ -805,6 +1079,97 @@ impl Backend for X64Emitter {
         self.asm.label(il_offset);
     }
 
+    // -- floating point ----------------------------------------------------
+    //
+    // Two scratch xmm registers are enough: every operation here loads its
+    // operands, computes, and stores the result straight back to a
+    // general-purpose register, so nothing has to stay in xmm between
+    // instructions.
+
+    fn supports_floats(&self) -> bool {
+        true
+    }
+
+    fn float_binop(&mut self, op: BinOp, dst: u8, lhs: u8, rhs: u8) {
+        debug_assert_eq!(dst, lhs, "x86-64 computes in place");
+        self.asm.movq_xmm_from_gp(XMM0, lhs);
+        self.asm.movq_xmm_from_gp(XMM1, rhs);
+        match op {
+            BinOp::Add => self.asm.sse_sd(0x58, XMM0, XMM1),
+            BinOp::Sub => self.asm.sse_sd(0x5C, XMM0, XMM1),
+            BinOp::Mul => self.asm.sse_sd(0x59, XMM0, XMM1),
+            BinOp::Div => self.asm.sse_sd(0x5E, XMM0, XMM1),
+            // `rem` on doubles is IEEE remainder, and x86 has no single
+            // instruction for it since SSE — `fprem` is x87. The shape checker
+            // declines a float `rem` rather than emitting something close.
+            _ => unreachable!("only add, sub, mul and div reach the float path"),
+        }
+        self.asm.movq_gp_from_xmm(dst, XMM0);
+    }
+
+    fn float_neg(&mut self, dst: u8, src: u8) {
+        // Flip the sign bit rather than subtracting from zero: `0.0 - (-0.0)`
+        // is `0.0`, so subtraction gets negative zero wrong.
+        self.asm.movq_xmm_from_gp(XMM0, src);
+        self.asm.mov_ri(RAX, i64::MIN); // 1 << 63, the sign bit
+        self.asm.movq_xmm_from_gp(XMM1, RAX);
+        self.asm.xorpd(XMM0, XMM1);
+        self.asm.movq_gp_from_xmm(dst, XMM0);
+    }
+
+    fn float_compare(&mut self, cond: Cond, dst: u8, lhs: u8, rhs: u8) {
+        self.asm.movq_xmm_from_gp(XMM0, lhs);
+        self.asm.movq_xmm_from_gp(XMM1, rhs);
+        self.asm.ucomisd(XMM0, XMM1);
+        // `ucomisd` sets the flags an *unsigned* integer compare would, so the
+        // unsigned condition codes are the right ones here whatever the signed
+        // name of the comparison was. NaN sets ZF, PF and CF together, which
+        // makes every ordered comparison false — as IEEE and the CLI require.
+        let code: u8 = match cond {
+            Cond::Equal => 0x4,                            // e
+            Cond::NotEqual => 0x5,                         // ne
+            Cond::Less | Cond::Below => 0x2,               // b
+            Cond::LessOrEqual | Cond::BelowOrEqual => 0x6, // be
+            Cond::Greater | Cond::Above => 0x7,            // a
+            Cond::GreaterOrEqual | Cond::AboveOrEqual => 0x3, // ae
+        };
+        // setcc dst8, then widen — the same shape the integer `compare` uses.
+        self.asm.rex_forced(false, 0, dst);
+        self.asm.byte(0x0F);
+        self.asm.byte(0x90 | code);
+        self.asm.modrm(0b11, 0, dst);
+        self.asm.rex_forced(true, dst, dst);
+        self.asm.byte(0x0F);
+        self.asm.byte(0xB6);
+        self.asm.modrm(0b11, dst, dst);
+    }
+
+    fn float_branch_compare(&mut self, cond: Cond, lhs: u8, rhs: u8, target: u32) {
+        self.asm.movq_xmm_from_gp(XMM0, lhs);
+        self.asm.movq_xmm_from_gp(XMM1, rhs);
+        self.asm.ucomisd(XMM0, XMM1);
+        // Unsigned codes, for the reason given in `float_compare`.
+        let code: u8 = match cond {
+            Cond::Equal => 0x4,
+            Cond::NotEqual => 0x5,
+            Cond::Less | Cond::Below => 0x2,
+            Cond::LessOrEqual | Cond::BelowOrEqual => 0x6,
+            Cond::Greater | Cond::Above => 0x7,
+            Cond::GreaterOrEqual | Cond::AboveOrEqual => 0x3,
+        };
+        self.asm.jcc(code, target);
+    }
+
+    fn int_to_float(&mut self, dst: u8, src: u8) {
+        self.asm.cvtsi2sd(XMM0, src);
+        self.asm.movq_gp_from_xmm(dst, XMM0);
+    }
+
+    fn float_to_int(&mut self, dst: u8, src: u8) {
+        self.asm.movq_xmm_from_gp(XMM0, src);
+        self.asm.cvttsd2si(dst, XMM0);
+    }
+
     fn supports_arrays(&self) -> bool {
         true
     }
@@ -822,6 +1187,157 @@ impl Backend for X64Emitter {
         self.bounds_check(index, limit);
         self.asm.mov_r_mem(descriptor, descriptor, 0);
         self.asm.movsxd_r_mem_index(dst, descriptor, index);
+    }
+
+    fn supports_self_calls(&self) -> bool {
+        true
+    }
+
+    fn outgoing_arg(&mut self, index: usize, src: u8) {
+        self.asm.mov_mem_r(RBP, self.outgoing + 8 * index as i32, src);
+    }
+
+    fn call_self(&mut self, dst: u8) {
+        let trap = self.outgoing + 8 * self.trap_slot as i32;
+        let ctx = trap + 8;
+        let depth = ctx + 8;
+
+        // The callee starts with a clear trap slot, and inherits the
+        // allocation context so it can allocate as this frame can.
+        self.asm.mov_ri(RAX, 0);
+        self.asm.mov_mem_r(RBP, trap, RAX);
+        self.asm.mov_r_mem(RAX, ARGS, ((self.trap_slot + 1) * 8) as i32);
+        self.asm.mov_mem_r(RBP, ctx, RAX);
+
+        // Depth guard. Compiled recursion runs on the *machine* stack, and
+        // overrunning that is a crash rather than an exception — which this
+        // runtime does not accept anywhere else either. One more than the
+        // caller's depth, and a trap if it goes too deep.
+        self.asm.mov_r_mem(RAX, ARGS, ((self.trap_slot + 2) * 8) as i32);
+        self.asm.inc_reg(RAX);
+        self.asm.mov_mem_r(RBP, depth, RAX);
+        self.asm.cmp_ri32(RAX, MAX_COMPILED_DEPTH);
+        let shallow = self.asm.jcc_short_forward(CC_L);
+        self.asm.mov_ri(RAX, 3);
+        self.asm.mov_mem_r(ARGS, (self.trap_slot * 8) as i32, RAX);
+        self.asm.mov_ri(RAX, 0);
+        self.epilogue_inline();
+        self.asm.patch_short(shallow);
+
+        // Enter exactly as the tier enters this method: one pointer to the
+        // argument array, in the register the platform's C ABI uses.
+        let incoming = if cfg!(windows) { RCX } else { RDI };
+        self.asm.lea(incoming, RBP, self.outgoing);
+        self.asm.sub_rsp(32);
+        self.asm.call_self_start();
+        self.asm.add_rsp(32);
+
+        // A trap raised inside the callee has to reach the tier, and the tier
+        // only reads *this* frame's slot. Propagating rather than ignoring is
+        // what keeps a bounds failure deep in a recursion from being lost.
+        if dst != RAX {
+            self.asm.mov_rr(dst, RAX);
+        }
+        self.asm.mov_r_mem(RDX, RBP, trap);
+        self.asm.cmp_ri(RDX, 0);
+        let clean = self.asm.jcc_short_forward(CC_E);
+        self.asm.mov_mem_r(ARGS, (self.trap_slot * 8) as i32, RDX);
+        self.asm.mov_ri(RAX, 0);
+        self.epilogue_inline();
+        self.asm.patch_short(clean);
+    }
+
+    fn supports_allocation(&self) -> bool {
+        true
+    }
+
+    fn alloc_array(&mut self, dst: u8, kind: i64, length: u8) {
+        // The length has to survive being marshalled into an argument
+        // register, and `length` may *be* one of those registers, so it is
+        // parked in the frame first.
+        self.asm.mov_mem_r(RBP, self.frame_scratch(), length);
+
+        // Argument registers. RBX, R14 and R15 — the argument pointer and the
+        // two cached slots — are callee-saved in both ABIs, so a C call
+        // preserves them and nothing else is live across an instruction.
+        let (a0, a1, a2) = if cfg!(windows) {
+            (RCX, RDX, R8)
+        } else {
+            (RDI, RSI, RDX)
+        };
+
+        // The allocation context sits one past the trap slot, written by the
+        // tier alongside the arguments.
+        self.asm.mov_r_mem(a0, ARGS, ((self.trap_slot + 1) * 8) as i32);
+        self.asm.mov_ri(a1, kind);
+        self.asm.mov_r_mem(a2, RBP, self.frame_scratch());
+
+        // 32 bytes of shadow space, which Windows requires and System V
+        // tolerates. The prologue keeps rsp 16-byte aligned and 32 is a
+        // multiple of 16, so the alignment the ABI wants at the `call` holds.
+        self.asm.sub_rsp(32);
+        self.asm.mov_ri(RAX, crate::alloc::alloc_array as usize as i64);
+        self.asm.call_reg(RAX);
+        self.asm.add_rsp(32);
+
+        // Zero means the heap could not satisfy it. Same trap path a failed
+        // bounds check takes: flag it and leave, and the tier raises the
+        // exception where there is a frame to raise it into.
+        self.asm.cmp_ri(RAX, 0);
+        let ok = self.asm.jcc_short_forward(CC_NE);
+        self.asm.mov_ri(RAX, 2);
+        self.asm.mov_mem_r(ARGS, (self.trap_slot * 8) as i32, RAX);
+        self.asm.mov_ri(RAX, 0);
+        self.epilogue_inline();
+        self.asm.patch_short(ok);
+
+        if dst != RAX {
+            self.asm.mov_rr(dst, RAX);
+        }
+    }
+
+    fn array_load_u8(&mut self, dst: u8, descriptor: u8, index: u8) {
+        let limit = if dst == descriptor { RDX } else { dst };
+        self.asm.mov_r_mem(limit, descriptor, 8);
+        self.bounds_check(index, limit);
+        self.asm.mov_r_mem(descriptor, descriptor, 0);
+        // Scale 0 is one byte per element, and `movzx` because `ldelem.u1` is
+        // the unsigned form — a byte of 0xFF is 255, not -1.
+        self.asm.movzx_r_mem_index_u8(dst, descriptor, index);
+    }
+
+    fn array_store_u8(&mut self, descriptor: u8, index: u8, value: u8) {
+        self.asm.mov_mem_r(RBP, self.frame_scratch(), value);
+        let limit = value;
+        self.asm.mov_r_mem(limit, descriptor, 8);
+        self.bounds_check(index, limit);
+        self.asm.mov_r_mem(descriptor, descriptor, 0);
+        self.asm.mov_r_mem(limit, RBP, self.frame_scratch());
+        self.asm.mov_mem_index_r8(descriptor, index, limit);
+    }
+
+    fn array_load_f64(&mut self, dst: u8, descriptor: u8, index: u8) {
+        // Length first, while `descriptor` still holds the descriptor address.
+        let limit = if dst == descriptor { RDX } else { dst };
+        self.asm.mov_r_mem(limit, descriptor, 8);
+        self.bounds_check(index, limit);
+        self.asm.mov_r_mem(descriptor, descriptor, 0);
+        // Scale 3 is eight bytes per element, and a plain 64-bit `mov` because
+        // the bit pattern *is* the value.
+        self.asm.mov_r_mem_index(dst, descriptor, index, 3);
+    }
+
+    fn array_store_f64(&mut self, descriptor: u8, index: u8, value: u8) {
+        // Every scratch register is live — descriptor, index and value — so
+        // the value is parked in the frame while the length is checked, the
+        // same shape `array_store_i32` uses.
+        self.asm.mov_mem_r(RBP, self.frame_scratch(), value);
+        let limit = value;
+        self.asm.mov_r_mem(limit, descriptor, 8);
+        self.bounds_check(index, limit);
+        self.asm.mov_r_mem(descriptor, descriptor, 0);
+        self.asm.mov_r_mem(limit, RBP, self.frame_scratch());
+        self.asm.mov_mem_index_r(descriptor, index, 3, limit);
     }
 
     fn array_store_i32(&mut self, descriptor: u8, index: u8, value: u8) {
@@ -861,9 +1377,17 @@ fn emit(
     locals: usize,
     returns_value: bool,
     trap_slot: usize,
+    plan: &crate::translate::Plan,
 ) -> Result<Vec<u8>, CompileError> {
     let mut e = X64Emitter::new(trap_slot);
-    translate(&mut e, instructions, analysis, locals, returns_value)?;
+    crate::translate::translate_with_plan(
+        &mut e,
+        instructions,
+        analysis,
+        locals,
+        returns_value,
+        plan,
+    )?;
     e.finish()
 }
 
@@ -922,7 +1446,15 @@ mod machine_tests {
         .expect("verify");
         // These helpers compile array-free bodies, so the trap slot is never
         // written; one past the arguments keeps it consistent with the tier.
-        let code = emit(&instructions, &analysis, locals, true, args.len()).expect("emit");
+        let code = emit(
+            &instructions,
+            &analysis,
+            locals,
+            true,
+            args.len(),
+            &crate::translate::Plan::default(),
+        )
+        .expect("emit");
         let page = CodePage::commit(&code).expect("commit");
         // SAFETY: `emit` produced this page and the signature matches.
         let f: extern "C" fn(*const i64) -> i64 =

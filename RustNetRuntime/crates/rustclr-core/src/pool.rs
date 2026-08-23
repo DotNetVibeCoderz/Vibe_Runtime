@@ -46,6 +46,16 @@ struct Inner {
     outstanding: AtomicUsize,
     shutdown: AtomicBool,
     workers: AtomicUsize,
+    /// Workers not currently inside a blocking wait.
+    ///
+    /// A worker that blocks on I/O, a lock or a thread still occupies its slot
+    /// but cannot take the next job. When every slot is occupied that way and
+    /// work is queued, the queue stalls until one comes back — so the pool
+    /// grows instead.
+    running: AtomicUsize,
+    /// Ceiling on growth. Unbounded growth turns a program that blocks a lot
+    /// into a program that runs out of threads.
+    ceiling: usize,
     lock: Mutex<()>,
     work_available: Condvar,
 }
@@ -71,6 +81,8 @@ impl TaskPool {
             outstanding: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
             workers: AtomicUsize::new(0),
+            running: AtomicUsize::new(0),
+            ceiling: (size * 8).max(16),
             lock: Mutex::new(()),
             work_available: Condvar::new(),
         });
@@ -134,6 +146,39 @@ impl TaskPool {
         self.inner.work_available.notify_one();
     }
 
+    /// Called by a worker about to block, and again when it comes back.
+    ///
+    /// While it is away the pool is a worker short, and if that leaves nobody
+    /// able to take queued work another worker is started. `parent` is the
+    /// blocking worker's own interpreter, which is a perfectly good template —
+    /// it has the loader, heap and statics a new one needs.
+    pub fn worker_blocking(&self, parent: &Interpreter) -> Blocking<'_> {
+        let left = self.inner.running.fetch_sub(1, Ordering::AcqRel);
+        // `left` is the value *before* the decrement, so one means this was the
+        // last one running.
+        if left <= 1 && !self.inner.queue.is_empty() {
+            self.grow_from(parent);
+        }
+        Blocking { pool: self }
+    }
+
+    /// Starts one more worker, if the ceiling allows.
+    fn grow_from(&self, parent: &Interpreter) {
+        let workers = self.inner.workers.load(Ordering::Acquire);
+        if workers >= self.inner.ceiling {
+            return;
+        }
+        // A worker built from a blocked one: same heap, same statics, its own
+        // frames and its own copy of the loader.
+        let mut interp = parent.worker(default_host());
+        self.inner.workers.fetch_add(1, Ordering::AcqRel);
+        self.inner.running.fetch_add(1, Ordering::AcqRel);
+        let pool = TaskPool { inner: Arc::clone(&self.inner) };
+        let _ = std::thread::Builder::new()
+            .name(format!("rustclr-task-{workers}"))
+            .spawn(move || pool.run_worker_body(&mut interp));
+    }
+
     /// Runs one queued job on `interp`, if there is one.
     ///
     /// This is what lets a waiting thread help rather than idle, and what keeps
@@ -151,6 +196,12 @@ impl TaskPool {
     }
 
     fn run_worker(&self, interp: &mut Interpreter) {
+        self.inner.running.fetch_add(1, Ordering::AcqRel);
+        self.run_worker_body(interp);
+    }
+
+    fn run_worker_body(&self, interp: &mut Interpreter) {
+        interp.mark_as_pool_worker(self.clone());
         loop {
             if self.inner.shutdown.load(Ordering::Acquire) {
                 return;
@@ -231,5 +282,16 @@ fn run_timers(inner: Arc<Inner>) {
             .timer_wake
             .wait_timeout(guard, wait.min(std::time::Duration::from_millis(50)))
             .expect("the timer list is poisoned");
+    }
+}
+
+/// A worker's absence from the pool, restored when this drops.
+pub struct Blocking<'a> {
+    pool: &'a TaskPool,
+}
+
+impl Drop for Blocking<'_> {
+    fn drop(&mut self) {
+        self.pool.inner.running.fetch_add(1, Ordering::AcqRel);
     }
 }
