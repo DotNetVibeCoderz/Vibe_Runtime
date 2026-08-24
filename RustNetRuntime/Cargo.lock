@@ -44,6 +44,16 @@ name = "rustclr-db"
 version = "0.1.0"
 
 [[package]]
+name = "rustclr-device"
+version = "0.1.0"
+dependencies = [
+ "rustclr-flashfs",
+ "rustclr-hal",
+ "rustclr-hal-host",
+ "rustclr-rndp",
+]
+
+[[package]]
 name = "rustclr-diag"
 version = "0.1.0"
 
@@ -151,6 +161,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustclr-rndp"
+version = "0.1.0"
+
+[[package]]
 name = "rustclr-sched"
 version = "0.1.0"
 
@@ -171,9 +185,14 @@ version = "0.1.0"
 dependencies = [
  "rustclr-bcl",
  "rustclr-core",
+ "rustclr-crypto",
+ "rustclr-device",
+ "rustclr-flashfs",
  "rustclr-gc",
+ "rustclr-hal",
  "rustclr-hal-host",
  "rustclr-interop",
  "rustclr-jit",
  "rustclr-metadata",
+ "rustclr-rndp",
 ]

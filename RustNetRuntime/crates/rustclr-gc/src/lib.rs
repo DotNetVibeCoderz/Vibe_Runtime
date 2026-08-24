@@ -167,6 +167,7 @@ impl Heap {
             live_bytes: self.space.live_bytes(),
             live_count: self.space.live_count(),
             bytes_since_last_collection: self.bytes_since_collection,
+            slot_limit: self.space.limit(),
         })
     }
 
@@ -391,5 +392,71 @@ mod tests {
         assert_eq!(s.total_objects_freed, 10);
         assert_eq!(heap.live_count(), 0);
         assert_eq!(s.peak_live_count, 10);
+    }
+
+    /// A loop of short-lived small objects must not exhaust a bounded heap.
+    ///
+    /// This is the Maix Go failure, reduced. `Showcase` allocates a handful of
+    /// small objects per frame and drops them; after two passes through its
+    /// scene loop the board panicked with `heap exhausted`. Nothing leaked --
+    /// the heap was almost entirely garbage. The slot ceiling was reached
+    /// while live *bytes* stayed under `minimum_heap`, so the byte-based
+    /// policy was never asked to collect.
+    ///
+    /// A `Cell` is 16 bytes and the embedded policy's `minimum_heap` is 8 KB,
+    /// so 512 slots hold at most 8 KB live -- the byte threshold cannot fire
+    /// here even in principle. Without slot pressure in `HeapPressure`, this
+    /// runs out of slots on the 513th allocation.
+    #[test]
+    fn a_bounded_heap_collects_before_it_runs_out_of_slots() {
+        const SLOTS: usize = 512;
+        let mut heap = Heap::embedded(SLOTS);
+
+        // Each iteration allocates one object and never roots it, which is
+        // what a frame's scratch objects amount to.
+        for i in 0..SLOTS * 8 {
+            if heap.should_collect() {
+                heap.collect(&Vec::new());
+            }
+            let cell = Cell { value: i as i32, next: Handle::NULL };
+            assert!(
+                heap.try_alloc(cell).is_some(),
+                "allocation {i} found no slot, on a heap holding nothing reachable.                  The policy is not being asked to collect before the ceiling is hit."
+            );
+        }
+
+        assert!(
+            heap.stats().collections > 0,
+            "a heap driven eight times past its own ceiling never collected"
+        );
+    }
+
+    /// The trigger is about *room*, not about the ceiling being a bad size.
+    ///
+    /// A heap whose live set genuinely fills it must still be able to say so,
+    /// rather than collecting forever and reporting room it cannot deliver.
+    #[test]
+    fn a_bounded_heap_still_refuses_when_everything_is_reachable() {
+        const SLOTS: usize = 64;
+        let mut heap = Heap::embedded(SLOTS);
+
+        let mut live = Vec::new();
+        loop {
+            if heap.should_collect() {
+                heap.collect(&live);
+            }
+            let cell = Cell { value: 0, next: Handle::NULL };
+            match heap.try_alloc(cell) {
+                Some(handle) => live.push(handle),
+                None => break,
+            }
+        }
+
+        assert_eq!(live.len(), SLOTS, "every slot should have been usable");
+        let cell = Cell { value: 0, next: Handle::NULL };
+        assert!(
+            heap.try_alloc(cell).is_none(),
+            "a full heap of reachable objects must refuse rather than pretend"
+        );
     }
 }

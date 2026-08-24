@@ -13,6 +13,10 @@ name = "rustnet"
 path = "src/main.rs"
 
 [dependencies]
+rustclr-flashfs = { path = "../rustclr-flashfs" }
+rustclr-device = { path = "../rustclr-device" }
+rustclr-rndp = { path = "../rustclr-rndp" }
+rustclr-crypto = { path = "../rustclr-crypto" }
 rustclr-core.workspace = true
 rustclr-bcl.workspace = true
 rustclr-gc.workspace = true
@@ -20,4 +24,5 @@ rustclr-metadata.workspace = true
 rustclr-interop.workspace = true
 rustclr-jit.workspace = true
 # The simulated board `run --board host` installs.
+rustclr-hal.workspace = true
 rustclr-hal-host.workspace = true

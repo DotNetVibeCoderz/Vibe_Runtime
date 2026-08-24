@@ -1,0 +1,21 @@
+[package]
+name = "rustclr-device"
+description = "The RNDP device service: what a board answers when the host tools ask"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# The protocol, the flash store, and the trait describing a flash region. No
+# interpreter and no HAL board: what a device *does* with StartApp differs
+# between a firmware and the desktop simulator, so that side is a trait the
+# caller implements rather than a dependency taken here.
+[dependencies]
+rustclr-rndp = { path = "../rustclr-rndp", version = "0.1.0" }
+rustclr-flashfs = { path = "../rustclr-flashfs", version = "0.1.0" }
+rustclr-hal = { path = "../rustclr-hal", version = "0.1.0", default-features = false }
+
+[dev-dependencies]
+rustclr-hal-host = { path = "../rustclr-hal-host", version = "0.1.0" }

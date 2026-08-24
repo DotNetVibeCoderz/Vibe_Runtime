@@ -91,6 +91,14 @@ pub enum ExecutionError {
     CallDepthExceeded(usize),
     /// The interpreter ran more instructions than the configured budget.
     InstructionBudgetExceeded(u64),
+    /// Something outside the program asked it to stop, and it did.
+    ///
+    /// Not a failure of the program. A device is told to stop the application
+    /// it is running, and the interpreter unwinds at its next safe point --
+    /// which is why this is an error rather than a return value: it has to
+    /// travel up through every frame the way an exception does, without any
+    /// of them being able to catch it.
+    Cancelled,
     /// A feature this runtime does not implement yet.
     Unsupported(String),
     /// Failure while reading an assembly.
@@ -172,6 +180,7 @@ impl fmt::Display for ExecutionError {
             Self::InstructionBudgetExceeded(n) => {
                 write!(f, "instruction budget of {n} exceeded")
             }
+            Self::Cancelled => write!(f, "stopped at an external request"),
             Self::Unsupported(m) => write!(f, "unsupported: {m}"),
             Self::Metadata(e) => write!(f, "metadata error: {e}"),
             Self::Decode(e) => write!(f, "{e}"),

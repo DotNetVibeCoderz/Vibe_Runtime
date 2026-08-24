@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>RndpCheck</AssemblyName>
+    <RootNamespace>RndpCheck</RootNamespace>
+  </PropertyGroup>
+
+  <!--
+    The real client, not a copy of it. The whole point of this fixture is that
+    the bytes RustNet.Deploy puts on the wire are the bytes the Rust service
+    expects; a reimplementation here would test nothing.
+  -->
+  <ItemGroup>
+    <ProjectReference Include="../../../tools/RustNet.Deploy/RustNet.Deploy.csproj" />
+  </ItemGroup>
+
+</Project>

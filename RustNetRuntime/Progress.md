@@ -47,6 +47,160 @@ SensorGateway  IDENTICAL   (edited by Jack from a prompt)
 | `rustclr-net` | HTTP, MQTT, Modbus, a small web server | 7 tests; `std`-only — its transport is sockets |
 | `rustnet-cli` | `run` / `info` / `disasm` / `verify` / `build` / `capabilities` / `debug` / `debug --dap` / **`profile`** | Drives every fixture; 5 tests speak DAP to a real process |
 
+### graphics-primitives runs on an M5Stack Tough
+
+An ESP32 draws now. `graphics-primitives` cycles its scenes on a Tough's
+ILI9342C panel out of a 320x240 RGB565 canvas, with the **full** binding tier.
+
+```
+heap budget      4234220 bytes
+bcl tier         full (385070 bytes needed)
+native bindings  1067
+library 0        RustNet.Core
+library 1        RustNet.Graphics
+types registered 253            <- the same number as the desktop and the K210
+```
+
+Three things had to be true at once, and the board found each of them by
+failing differently:
+
+| | |
+| --- | --- |
+| `one-bank` | The 96 KB reclaimed from `dram2_seg` is not entirely free. It corrupts a loaded assembly once RustBCL has its share — on a Tough as an `Image` whose bytes were byte-perfect and whose stored metadata range had been overwritten, on a Core2 as `LoadProhibited` |
+| `psram` | 8 MB registered **behind** internal DRAM. Allocation walks regions in order, so internal is spent first and PSRAM catches the canvas. It is opt-in because `esp-alloc` documents ESP32 atomics as broken in PSRAM; what makes it survivable here is that the `no_std` prelude maps `Arc` to `Rc`, so the refcounts are not atomic — an argument, written down, not a proof |
+| 64 KB arena | Down from 176 KB. **esp-alloc's arena is a `.bss` static and the stack is whatever `dram_seg` has left after it**, so asking for 176 KB of a ~200 KB segment left the stack a sliver and the board died on its stack guard. That read like runaway recursion and was linker arithmetic |
+
+Capture: [docs/logs/m5stack-tough-graphics.log](docs/logs/m5stack-tough-graphics.log).
+
+**The console had to stream, again.** Output was buffered into a `CaptureHost`
+and printed when the entry point returned, and a graphics demo never returns —
+so a board that was drawing correctly looked like one that had failed to boot.
+The same trap the K210 fell into, in a firmware that had not been given the
+same fix.
+
+### The tools reach the hardware
+
+`RustNet.Deploy`'s catalog now drives a real build and flash of the Tough,
+which is the code path `RustNet.Workbench` and CodeGen both call:
+
+```
+BUILD OK  .../xtensa-esp32-none-elf/release/rustclr-esp32-demo (998 KiB)
+-- espflash -> COM5
+App/part. size:    675,968/2,097,152 bytes, 32.23%
+FLASH OK
+```
+
+Four things were wrong and are fixed:
+
+- **Repository detection looked for `runtime/`**, the reference repo's layout.
+  It looks for `crates/` and `embedded/` together now — a lone `Cargo.toml`
+  matches every crate on the way up.
+- **The recipes were stale.** Xtensa is not an upstream Rust target, so the
+  toolchain, the target and `-Z build-std` are part of the recipe rather than
+  assumed; and the M5 entries now carry the three features that actually work.
+- **The partition table was mandatory.** `--partition-table partitions.csv`
+  was passed unconditionally, and a firmware that carries its program in
+  `.rodata` has no such file — the flash failed outright. It is passed when
+  the file is there. `embedded/esp32-demo/partitions.csv` now exists, widened
+  from the reference's 4 MB layout to the 16 MB these boards carry.
+- **`kflash` is invoked with `-s`**, so a K210 boots from SRAM and its own SPI
+  part is left alone.
+
+**A flash through the tools replaced the running demo with `HelloWorld`,** and
+the board sat on the green diagnostic fill with nothing drawn over it. Not a
+graphics fault: `BoardFlasher.Build` ran cargo with no `RUSTCLR_APP`, so the
+image carried the `HelloWorld.dll` checked in beside the firmware crate. The
+flash succeeded, the board booted, and it ran a different program.
+
+`DeviceApp` fixes that — an application and the libraries it references,
+turned into the `RUSTCLR_APP` and `RUSTCLR_LIB1..3` the firmware build reads.
+`FromBuildOutput` takes the `RustNet.*` assemblies the SDK copied beside the
+program, which is already the right list because the device libraries are
+separate assemblies and a project only gets what it references. The build now
+says what it is carrying either way:
+
+```
+  app  Primitives.dll + RustNet.Core.dll, RustNet.Graphics.dll
+BUILD OK  .../rustclr-esp32-demo (1015 KiB)
+FLASH OK
+```
+
+and the board comes up on `assembly Primitives`, `library 0 RustNet.Core`,
+`library 1 RustNet.Graphics`, animating.
+
+**CodeGen keeps a second catalog**, and it had drifted exactly as
+`BoardCatalog`'s own comment warns. Its tier thresholds were the pre-device
+numbers (192,045 / 260,702 against the measured 252,092 / 385,070), which made
+it claim an ESP32-C3 clears the full tier and a WROOM clears it on a memory
+bank that corrupts. Both corrected, the two M5 boards added, and the K210
+marked verified.
+
+### The ESP32's second RAM bank is not entirely ours
+
+An M5Stack Tough (COM5) and an M5Stack Core2 (COM14) both run RustCLR and both
+crash when a program loads a second assembly. The symptoms differ — the Core2
+dies as `LoadProhibited`, the Tough as `MissingHeap("#~")` from the metadata
+reader — and the cause is one thing.
+
+**The bytes were never the problem.** Instrumenting the firmware to print what
+it actually holds:
+
+```
+library 0        4608 bytes, magic 4D5A
+                 owned copy: 4608 bytes, BSJB at Some(620)
+```
+
+Byte-perfect, and `BSJB` at exactly the offset the host file has it. The image
+is intact; `Metadata::parse` succeeds inside `Image::from_bytes` and then fails
+on the *same stored range* one call later. What is being overwritten is the
+`Image`'s own range, not the assembly.
+
+**The decisive test was to stop using the bank.** `embedded/esp32-demo` gives
+the allocator 176 KB of `dram_seg` plus 96 KB reclaimed from `dram2_seg` — the
+memory "past the ROM's data and stacks", where the boundary was inherited from
+the segment size rather than measured. Built with the new `one-bank` feature,
+the same board on the same program says:
+
+```
+heap budget      180224 bytes
+bcl tier         none - SKIPPED
+                 the runtime needs 252092 bytes to load at all
+```
+
+No panic. A clean refusal instead of a corrupted heap. **If a crash goes away
+with one bank, the second bank is the crash** — that is what the feature is for.
+
+The bank is not useless: the Tough ran `HelloWorld` out of it months ago and
+the log is still accurate. It corrupts under *pressure*, once RustBCL has taken
+its share and a program starts loading assemblies of its own. 96 KB is too
+much and what is actually free has not been measured, so this is documented in
+`embedded/esp32-demo/src/main.rs` as a hazard rather than papered over.
+
+**What it means for these boards.** 176 KB of trustworthy DRAM against a
+252,092-byte minimal tier: an ESP32 can read metadata and collect garbage, and
+cannot currently execute IL without the risky bank. Both boards have PSRAM,
+which would settle it — except that `esp-alloc` documents ESP32 atomics as
+broken in PSRAM, and this runtime's collector and safepoints are built on
+atomics. Stating that beats a heap that works until it does not.
+
+### The M5 panel driver covers both boards
+
+`embedded/esp32-demo/src/m5.rs` — AXP192 power sequencing and an ILI9342C over
+SPI2 — ported from the Gravicode reference's ESP-IDF firmware. The register
+sequences carry over unchanged; the plumbing is rewritten against `esp-hal`
+because this firmware is bare-metal.
+
+The two boards differ in exactly one thing, and it is worth the type that
+carries it: **LDO3 is an ordinary rail on a Tough and the vibration motor on a
+Core2**, so a Core2 configured the Tough's way sits there buzzing. `Variant`
+holds that difference; everything else is shared.
+
+The green fill lands on the glass on a Core2, which is what proved the whole
+path — PMIC rails, backlight, SPI, panel — before any managed code ran. It is
+kept for that reason: a panel that is not being written and a framebuffer that
+never reaches `present` look identical on a screen still showing the previous
+firmware's picture.
+
 ### mqtt-dashboard publishes to a real broker, and a stale constant nearly killed a board
 
 The `mqtt-dashboard` template runs, connects to `broker.hivemq.com:1883`,
@@ -2205,3 +2359,91 @@ Two findings from that run were not obvious beforehand:
   units; UTF-8 would make them wrong or O(n).
 - **Collection only happens where every live value is rooted.** Between
   instructions, before an allocation, before a return value is popped.
+
+## The three K210 demos, ported and run on the Maix Go (2026-08-24)
+
+`Samples/Showcase`, `Samples/WifiCheck` and `Samples/Kiosk`, from the
+reference's `firmware-k210/demo`. Two of the three run on the hardware; the
+third is characterised below rather than claimed.
+
+| Sample | Libraries | On the Maix Go |
+| --- | --- | --- |
+| `Showcase` | 3 | **runs indefinitely** — `docs/logs/maixgo-showcase.log` |
+| `WifiCheck` | 3 | **runs** — camera captured, radio reports honestly |
+| `Kiosk` | 8 | loads and executes; **cannot allocate its 320x240 camera frame** |
+
+### What each one exposed
+
+Porting three real programs found five defects, all of which are fixed:
+
+- **A bounded heap could exhaust its slots without ever asking to collect.**
+  `has_room()` bounds by *slots*, `should_collect()` measured only *bytes*, so
+  a loop of small short-lived objects filled 512 slots while live bytes stayed
+  under the 8 KB `minimum_heap` and the allocator panicked on a heap that was
+  almost entirely garbage. `HeapPressure` now carries `slot_limit` and
+  `MarkSweep` collects at three-quarters full. That is what killed `Showcase`
+  after two passes through its scene loop; the regression test fails on
+  allocation 512 without the fix.
+- **A struct or enum parameter could not bind across an assembly reference.**
+  A `ValueType`/`Class` in a signature is a *token*, and `type_sigs_match`
+  compared two of them raw — tokens from different assemblies' tables, which
+  are never equal. So `Camera.Configure(int, int, PixelFormat)` failed to
+  resolve, was synthesised as an internal call, and died at the call site with
+  `no implementation for ...(int,int,#16777256)` despite having a perfectly
+  good IL body. `find_method_on_type_from` resolves each side's tokens in its
+  own assembly first. This affected *any* managed library API taking an enum,
+  not only the camera.
+- **The full BCL tier registered fewer bindings than the minimal one on a
+  board.** `install` guarded networking on `std`; `install_minimal` registered
+  the offline bindings unconditionally. A board with plenty of RAM therefore
+  reported `bcl tier full` and then failed `Wifi.Connect` with "no
+  implementation" — on hardware where the *smaller* tier worked.
+- **The firmware library ceiling was three, and `Kiosk` needs eight.** Widened
+  across all five firmware crates and `RustNet.Deploy`. `RustNet.Media`'s
+  reference to `RustNet.Graphics` also went: it existed only for a doc link,
+  and it made every program that captures an image load a whole extra assembly.
+- **`rustnet profile` could not take `--board`,** so a device program could not
+  be profiled at all — it cannot get past its first `Display` call.
+
+### New capability: the camera
+
+`Board::camera()` (defaulted to `NotSupported`, so boards without a sensor are
+unchanged), `SimCamera` reachable on the host board, `K210Camera` over the
+existing DVP driver, and `RustNet.Media.Camera` bindings. Nine checks in the
+Device fixture, which is now at **73**.
+
+On the Maix Go this captures real frames: `camera: 320x240, 153600 bytes,
+30% lit`. The sensor owns I²C2 exclusively — `Board::i2c` deliberately never
+handed it out — and a capture takes the DVP data pads from the panel and gives
+them back, so a program can capture and then `Present` without knowing.
+
+### What `Kiosk` cannot do, and why
+
+It loads all eight libraries (299 types, 359 methods), runs, reports no
+network honestly, and then fails to allocate 153,600 bytes for its first
+camera frame. The heap is **3 MB, fully free when the program starts** — the
+figure is now printed at boot — so this is the interpreter, the full binding
+table, nine assemblies' metadata and a 150 KB canvas consuming the rest,
+against a linked-list first-fit allocator.
+
+3 MB is what fits: the heap array must not cross the SRAM bank boundary at
+`0x80400000` (a 4 MB one wedged the board silently), and with `Kiosk`'s eight
+libraries compiled in the array starts at `0x800C4210`, leaving 3.23 MB below
+it. A runtime check now prints that refusal instead of going silent.
+
+Two things `Kiosk` also cannot do on this board, stated rather than worked
+around: the Maix Go's radio is an ESP AT module on UART1 and `Board::netif`
+still returns `NotSupported` — `rustclr-espat` is protocol parsing with no
+transport — so MQTT has nothing to reach.
+
+### Ported deliberately differently
+
+`Kiosk`'s three firmware-provided `[InternalCall]` button methods became
+constants plus the ordinary `Gpio` bindings. An internal call has to be
+registered by the firmware, which means a program using one cannot run under
+`--board host` and cannot be tried without flashing; constants run in the
+simulator and on the board from one source, and a different pinout is three
+numbers rather than a firmware build. The values are the reference firmware's.
+
+`Showcase`'s run counter is now optional: a Maix Go booted into SRAM has no
+filesystem bound, and the scenes are the point.

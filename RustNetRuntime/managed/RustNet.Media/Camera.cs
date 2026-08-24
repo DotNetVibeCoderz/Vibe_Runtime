@@ -13,7 +13,10 @@ public enum PixelFormat
 /// Image sensor capture. Chip-gated (v0.8): available where the board has a
 /// camera interface. The virtual device provides a colour-bar test sensor so
 /// apps and pipelines can be developed without optics. A captured RGB565
-/// frame blits straight to the display via <c>Display.DrawImage</c>.
+/// frame blits straight to the display via RustNet.Graphics' Display.DrawImage.
+/// Named rather than referenced: a doc link would make every program that
+/// captures an image also load RustNet.Graphics, and a loaded assembly
+/// registers all of its types whether the program mentions them or not.
 /// </summary>
 public static class Camera
 {

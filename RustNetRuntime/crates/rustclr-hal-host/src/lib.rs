@@ -17,7 +17,7 @@ mod sim_camera;
 pub use board::HostBoard;
 pub use sim_bus::{I2cDevice, SpiDevice};
 pub use sim_camera::SimCamera;
-pub use sim_ext::{OneWireDevice, SimDs18b20};
+pub use sim_ext::{OneWireDevice, SimDs18b20, SimExtMem};
 pub use sim_gpio::SimGpioPin;
 
 #[cfg(test)]

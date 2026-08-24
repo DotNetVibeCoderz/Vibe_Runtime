@@ -26,6 +26,15 @@ pub enum Command {
         /// Which board `RustNet.Hal` talks to. `None` means no hardware, and
         /// a program that reaches for a pin is told so rather than ignored.
         board: Option<String>,
+        /// Write the board's screen to this path as a PNG when the run ends.
+        capture_display: Option<String>,
+    },
+    /// Serve RNDP over TCP as a virtual device.
+    Serve {
+        /// Address to listen on. Defaults to the Workbench's own default spec.
+        address: String,
+        /// Where the simulated flash region is kept between runs.
+        image: Option<String>,
     },
     /// Summarise an assembly's metadata.
     Info { assembly: String, verbose: bool },
@@ -44,6 +53,8 @@ pub enum Command {
         /// Let the code generator compile hot methods. Off by default: the
         /// profiler cannot see inside compiled code.
         jit: bool,
+        /// The board to install, if any. `host` is the simulator.
+        board: Option<String>,
     },
     /// Run under the debugger hooks, tracing every stop.
     Debug { assembly: String, breakpoints: Vec<(String, u32)>, step: bool, dap: bool },
@@ -93,6 +104,7 @@ pub fn parse(argv: &[String]) -> Result<Command, ParseError> {
             let mut inline = true;
             let mut minimal_bcl = false;
             let mut board = None;
+            let mut capture_display = None;
             let mut rest = argv[1..].iter();
 
             while let Some(a) = rest.next() {
@@ -120,6 +132,12 @@ pub fn parse(argv: &[String]) -> Result<Command, ParseError> {
                             ParseError("--board needs a name; `host` is the simulator".into())
                         })?;
                         board = Some(v.to_string());
+                    }
+                    "--capture-display" => {
+                        let v = rest.next().ok_or_else(|| {
+                            ParseError("--capture-display needs a path to write the PNG to".into())
+                        })?;
+                        capture_display = Some(v.to_string());
                     }
                     "--jit-threshold" => {
                         let v = rest.next().ok_or_else(|| {
@@ -159,6 +177,7 @@ pub fn parse(argv: &[String]) -> Result<Command, ParseError> {
                 inline,
                 minimal_bcl,
                 board,
+                capture_display,
             })
         }
 
@@ -167,6 +186,7 @@ pub fn parse(argv: &[String]) -> Result<Command, ParseError> {
             let mut program_args = Vec::new();
             let mut top = 15usize;
             let mut period_us = 1_000u64;
+            let mut board = None;
             let json = argv.iter().any(|a| a == "--json");
             let jit = argv.iter().any(|a| a == "--jit");
             let mut rest = argv[1..].iter().peekable();
@@ -198,6 +218,16 @@ pub fn parse(argv: &[String]) -> Result<Command, ParseError> {
                             ));
                         }
                     }
+                    // A device program is precisely the kind worth profiling
+                    // — it loops forever and its cost is in bindings — and
+                    // without a board it cannot get past its first `Display`
+                    // call to be profiled at all.
+                    "--board" => {
+                        let v = rest.next().ok_or_else(|| {
+                            ParseError("--board needs a name; `host` is the simulator".into())
+                        })?;
+                        board = Some(v.to_string());
+                    }
                     "--json" | "--jit" => {}
                     other if !other.starts_with('-') && assembly.is_none() => {
                         assembly = Some(other.to_string());
@@ -209,7 +239,41 @@ pub fn parse(argv: &[String]) -> Result<Command, ParseError> {
             }
             let assembly = assembly
                 .ok_or_else(|| ParseError("profile needs an assembly path".into()))?;
-            Ok(Command::Profile { assembly, args: program_args, top, period_us, json, jit })
+            Ok(Command::Profile { assembly, args: program_args, top, period_us, json, jit, board })
+        }
+
+        "serve" => {
+            let mut address = None;
+            let mut image = None;
+            let mut rest = argv[1..].iter().peekable();
+            while let Some(arg) = rest.next() {
+                match arg.as_str() {
+                    "--address" | "--listen" => {
+                        address = Some(
+                            rest.next()
+                                .ok_or_else(|| ParseError("--address needs host:port".into()))?
+                                .to_string(),
+                        );
+                    }
+                    "--image" => {
+                        image = Some(
+                            rest.next()
+                                .ok_or_else(|| ParseError("--image needs a path".into()))?
+                                .to_string(),
+                        );
+                    }
+                    other => {
+                        return Err(ParseError(format!("unknown option `{other}` for serve")))
+                    }
+                }
+            }
+            Ok(Command::Serve {
+                // The Workbench's `TransportFactory.DefaultSpec` without its
+                // `tcp:` prefix, so pressing CONNECT with no configuration
+                // reaches a `rustnet serve` started with no arguments.
+                address: address.unwrap_or_else(|| "127.0.0.1:7878".to_string()),
+                image,
+            })
         }
 
         "jit" => {

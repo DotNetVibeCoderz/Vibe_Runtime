@@ -114,6 +114,10 @@ impl Tier {
 /// The rest of the budget is the runtime itself — 127 KB for the loader's 202
 /// pre-registered framework types, and 106 KB for RustBCL's 826 native
 /// bindings. `HelloWorld` uses exactly one slot; the other 511 are headroom.
+pub mod appserver;
+pub mod install;
+pub mod rndp;
+
 pub const EXEC_SLOTS: usize = 512;
 
 /// Slots the managed heap may use. A *ceiling*, not a hint: allocation past it
@@ -337,6 +341,10 @@ fn execute_assembly<W: Write>(
                 return;
             }
         };
+        // The same two bytes again, now that the image owns its own copy and
+        // the BCL has taken its 252 KB. If they differ from the line above,
+        // something wrote over the buffer between here and there — which is a
+        // memory fault, not a parser one, and the two produce the same error.
         match interp.loader.load_image(image) {
             Ok(id) => {
                 let _ = writeln!(
@@ -361,6 +369,11 @@ fn execute_assembly<W: Write>(
     };
     let _ = writeln!(out, "types registered {}", interp.loader.registry.type_count());
     let _ = writeln!(out, "methods          {}", interp.loader.registry.method_count());
+
+    // Before the first instruction, so the board answers host tools *while*
+    // its program runs. A device program loops forever; waiting until it
+    // returns would mean waiting for ever.
+    install::install(out, &mut interp);
 
     let outcome = interp.run_entry_point(id);
 
@@ -394,6 +407,12 @@ fn execute_assembly<W: Write>(
     let _ = writeln!(out, "calls            {}", interp.stats.calls);
     let _ = writeln!(out, "managed allocs   {}", stats.total_allocations);
     let _ = writeln!(out, "peak live bytes  {}", stats.peak_live_bytes);
+
+    // The board stays reachable after the demo, so a host tool can ask it
+    // things and give it applications to run. `serve` returns immediately
+    // on a board whose HAL cannot answer -- see `rndp::Capability` -- so a
+    // firmware that could not do this before behaves exactly as it did.
+    appserver::serve(out, &mut interp, libraries);
 }
 
 /// Allocates, builds a cycle, drops the root and collects.

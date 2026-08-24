@@ -54,16 +54,26 @@ pub fn register(interp: &mut Interpreter) {
                 "a canvas needs a width and a height of at least 1",
             ));
         }
-        // Refused rather than attempted: a 115 KB allocation that fails on a
-        // board takes the whole program with it, and the number that caused it
-        // is more useful than an out-of-memory two frames later.
-        let bytes = width as u64 * height as u64 * 2;
-        if bytes > 8 * 1024 * 1024 {
+        // Asked for before it is taken. `Framebuffer::new` allocates with
+        // `vec!`, and on a board an allocation it cannot serve does not return
+        // an error — it aborts, and the program is gone with no message worth
+        // reading. `try_reserve` is the same question asked so the answer can
+        // be a managed exception naming the size that did not fit.
+        let pixels = width as usize * height as usize;
+        let bytes = pixels as u64 * 2;
+        let mut probe: Vec<u16> = Vec::new();
+        if probe.try_reserve_exact(pixels).is_err() {
             return Err(ExecutionError::exception(
                 rustclr_core::ClrExceptionKind::OutOfMemory,
-                &format!("a {width}x{height} canvas is {bytes} bytes of RGB565"),
+                &format!(
+                    "a {width}x{height} canvas needs {bytes} bytes of RGB565 and this                      board cannot spare them"
+                ),
             ));
         }
+        // Handing the reservation straight to the framebuffer, so the question
+        // asked is the memory used rather than a second allocation that might
+        // answer differently.
+        drop(probe);
         i.canvas = Some(Framebuffer::new(width, height));
         Ok(None)
     });

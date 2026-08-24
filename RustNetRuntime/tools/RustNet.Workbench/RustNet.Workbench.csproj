@@ -11,6 +11,15 @@
     <PackageReference Include="Avalonia" Version="11.3.2" />
     <PackageReference Include="Avalonia.Desktop" Version="11.3.2" />
     <PackageReference Include="Avalonia.Themes.Fluent" Version="11.3.2" />
+    <!--
+      Headless rendering, so the screenshot switch can draw the real windows
+      into PNGs without a display. Pinned to 11.3.2 like the rest: the headless
+      platform and Skia backend are loaded into the running Avalonia, and a
+      different minor version there is a downgrade conflict rather than a
+      graceful fallback.
+    -->
+    <PackageReference Include="Avalonia.Headless" Version="11.3.2" />
+    <PackageReference Include="Avalonia.Skia" Version="11.3.2" />
     <PackageReference Include="Avalonia.Diagnostics" Version="11.3.2" Condition="'$(Configuration)' == 'Debug'" />
   </ItemGroup>
   <ItemGroup>

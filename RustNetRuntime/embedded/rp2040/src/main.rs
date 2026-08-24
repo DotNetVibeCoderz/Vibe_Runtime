@@ -52,10 +52,10 @@ static HELLO_WORLD: &[u8] = include_bytes!(env!("RUSTCLR_APP_PATH"));
 /// Assemblies the embedded program references, in dependency order.
 ///
 /// A board has no filesystem, so what a desktop finds beside the program has
-/// to be compiled in. `RUSTCLR_LIB1_PATH` and `RUSTCLR_LIB2_PATH` name them,
-/// and the build script turns each one that is set into a `cfg`. A program
-/// that references nothing — `HelloWorld` — sets neither and gets an empty
-/// list, which costs nothing.
+/// to be compiled in. `RUSTCLR_LIB1_PATH`..`RUSTCLR_LIB8_PATH` name them, and
+/// the build script turns each one that is set into a `cfg`. A program that
+/// references nothing — `HelloWorld` — sets none and gets an empty list, which
+/// costs nothing.
 static APP_LIBRARIES: &[&[u8]] = &[
     #[cfg(rustclr_lib1)]
     include_bytes!(env!("RUSTCLR_LIB1_PATH")),
@@ -63,6 +63,16 @@ static APP_LIBRARIES: &[&[u8]] = &[
     include_bytes!(env!("RUSTCLR_LIB2_PATH")),
     #[cfg(rustclr_lib3)]
     include_bytes!(env!("RUSTCLR_LIB3_PATH")),
+    #[cfg(rustclr_lib4)]
+    include_bytes!(env!("RUSTCLR_LIB4_PATH")),
+    #[cfg(rustclr_lib5)]
+    include_bytes!(env!("RUSTCLR_LIB5_PATH")),
+    #[cfg(rustclr_lib6)]
+    include_bytes!(env!("RUSTCLR_LIB6_PATH")),
+    #[cfg(rustclr_lib7)]
+    include_bytes!(env!("RUSTCLR_LIB7_PATH")),
+    #[cfg(rustclr_lib8)]
+    include_bytes!(env!("RUSTCLR_LIB8_PATH")),
 ];
 
 

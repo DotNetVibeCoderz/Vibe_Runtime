@@ -6,6 +6,8 @@ mod args;
 mod commands;
 mod dap;
 mod json;
+mod png;
+mod serve;
 
 use args::Command;
 use std::process::ExitCode;
@@ -77,6 +79,7 @@ fn run() -> ExitCode {
             inline,
             minimal_bcl,
             board,
+            capture_display,
         } => commands::run(
             &assembly,
             args,
@@ -88,13 +91,15 @@ fn run() -> ExitCode {
             inline,
             minimal_bcl,
             board.as_deref(),
+            capture_display.as_deref(),
         ),
+        Command::Serve { address, image } => serve::serve(&address, image.as_deref()),
         Command::Info { assembly, verbose } => commands::info(&assembly, verbose),
         Command::Disasm { assembly, filter } => commands::disasm(&assembly, filter.as_deref()),
         Command::Verify { assembly } => commands::verify(&assembly),
         Command::Jit { assembly } => commands::jit(&assembly),
-        Command::Profile { assembly, args, top, period_us, json, jit } => {
-            commands::profile(&assembly, args, top, period_us, json, jit)
+        Command::Profile { assembly, args, top, period_us, json, jit, board } => {
+            commands::profile(&assembly, args, top, period_us, json, jit, board.as_deref())
         }
         Command::Debug { assembly, breakpoints, step, dap } => {
             commands::debug(&assembly, &breakpoints, step, dap)

@@ -187,6 +187,52 @@ public partial class MainWindow : Window
         });
     }
 
+    /// <summary>
+    /// Connect to a device and fill every tab, for the screenshot renderer.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The same handlers the buttons call, in the order somebody would click
+    /// them. Driving the real path rather than assigning to the controls means
+    /// a screenshot cannot show a layout that the live application never
+    /// produces -- which is the entire reason these images are rendered from
+    /// the app instead of drawn by hand.
+    /// </para>
+    /// <para>
+    /// Every one of them does its device I/O on a background thread and posts
+    /// the result back, so the caller has to pump the dispatcher and wait. See
+    /// <c>Screenshots.Populate</c>.
+    /// </para>
+    /// </remarks>
+    public void ConnectAndPopulate(string spec)
+    {
+        TxtDevice.Text = spec;
+        OnConnect(this, new RoutedEventArgs());
+    }
+
+    /// <summary>
+    /// Fill one panel, for the screenshot renderer.
+    /// </summary>
+    /// <remarks>
+    /// One at a time, and the caller waits between them. Each of these opens
+    /// the device transport for itself, and on a serial link only one process
+    /// can hold the port — firing them together left three of the four failing
+    /// while the fourth reported `ok`, which produced screenshots of empty
+    /// panels above a status bar claiming success.
+    /// </remarks>
+    public void RefreshPanel(string which)
+    {
+        var e = new RoutedEventArgs();
+        switch (which)
+        {
+            case "apps": OnRefreshApps(this, e); break;
+            case "logs": OnRefreshLogs(this, e); break;
+            case "perf": OnRefreshPerf(this, e); break;
+            case "display": OnCaptureDisplay(this, e); break;
+            default: throw new ArgumentException($"no panel called `{which}`");
+        }
+    }
+
     private void OnRefreshInfo(object? sender, RoutedEventArgs e)
         => Device(c => c.Info(), info =>
         {
@@ -547,20 +593,17 @@ public partial class MainWindow : Window
 
     // ---- firmware tab ----
 
-    private static string? FindRepoRoot()
-    {
-        var dir = new DirectoryInfo(AppContext.BaseDirectory);
-        while (dir is not null)
-        {
-            if (File.Exists(Path.Combine(dir.FullName, "Cargo.toml"))
-                && Directory.Exists(Path.Combine(dir.FullName, "runtime")))
-            {
-                return dir.FullName;
-            }
-            dir = dir.Parent;
-        }
-        return null;
-    }
+    /// <summary>The repository this binary sits inside, if it does.</summary>
+    /// <remarks>
+    /// Delegated to <see cref="BoardFlasher.FindRepoRoot"/> rather than done
+    /// again here. This had its own copy, and the copy looked for a
+    /// <c>runtime/</c> directory — the *reference* project's layout. RustNet
+    /// keeps its firmware in <c>embedded/</c>, so the search walked to the
+    /// filesystem root every time and the firmware tab reported "repo not
+    /// found above this binary" while sitting four levels inside the repo.
+    /// One copy cannot disagree with itself.
+    /// </remarks>
+    private static string? FindRepoRoot() => BoardFlasher.FindRepoRoot(AppContext.BaseDirectory);
 
     private void OnFwBuild(object? sender, RoutedEventArgs e)
     {

@@ -68,12 +68,17 @@ public sealed class SerialTransport : IDeviceTransport
     public SerialTransport(string portName, int baud = 115200)
     {
         _port = new SerialPort(portName, baud, Parity.None, 8, StopBits.One);
-        _port.Open();
-        // Both lines idle: on the boards that wire them to reset/boot pins,
-        // asserted DTR is what *holds* the device down. A tool that exited
-        // without clearing them would otherwise leave the board unreachable.
+        // Both lines idle, and set *before* opening. On the boards that wire
+        // them to reset/boot pins, asserted DTR is what holds the device down
+        // -- and clearing them after `Open` leaves a window in which the
+        // driver has already asserted them. On a K210 booted into SRAM with
+        // `kflash -s` that window is fatal: the chip resets, the SRAM image
+        // is gone, and it comes back running whatever is on its SPI flash.
+        // The tool then talks to a different program than the one somebody
+        // just flashed, which reads as a protocol fault rather than a reset.
         _port.DtrEnable = false;
         _port.RtsEnable = false;
+        _port.Open();
     }
 
     public bool ResetsDeviceOnOpen => true;

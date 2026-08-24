@@ -14,6 +14,8 @@ members = [
     "crates/rustclr-hal",
     "crates/rustclr-hal-host",
     "crates/rustclr-flashfs",
+    "crates/rustclr-rndp",
+    "crates/rustclr-device",
     "crates/rustclr-crypto",
     "crates/rustclr-db",
     "crates/rustclr-secureboot",

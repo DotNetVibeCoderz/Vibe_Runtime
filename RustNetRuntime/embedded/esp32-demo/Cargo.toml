@@ -12,9 +12,36 @@ publish = false
 [workspace]
 
 [features]
-# The M5Stack Core2's panel: an AXP192 gating its rails and an ILI9342C
-# drawing. Xtensa only — it is an ESP32 board.
-board-m5core2 = ["esp32"]
+# The M5Stack panels: an AXP192 gating the rails and an ILI9342C drawing.
+# Xtensa only — both are ESP32 boards. They share everything but one AXP192
+# register pair, because LDO3 is a rail on a Tough and the vibration motor on
+# a Core2.
+# Main DRAM only, leaving the reclaimed second bank alone. A diagnostic: if a
+# board that crashes with both banks reports a clean "does not fit" with one,
+# the second bank is being shared with something.
+one-bank = []
+# Adds the board's PSRAM to the allocator, **after** internal DRAM.
+#
+# This is what makes a graphics program possible at all on an ESP32: a 320x240
+# RGB565 canvas is 153,600 bytes and the trustworthy internal DRAM is 176 KB,
+# which the base class library has already spent.
+#
+# It carries a real hazard, and the hazard is why this is opt-in rather than
+# on. `esp-alloc` documents that **ESP32 atomic instructions do not work on
+# memory in PSRAM**. Allocation walks regions in registration order, so with
+# PSRAM registered last every allocation takes internal memory while there is
+# any — but once internal is full, the next allocation of *any* kind lands in
+# PSRAM, and nothing stops that one from containing an `Atomic*`.
+#
+# What makes it survivable rather than reckless on this runtime: without `std`
+# the prelude maps `Arc` to `Rc`, so the refcounts that would otherwise be
+# atomics scattered across the heap are not atomic here. That is an argument,
+# not a proof, and it is written down so the next person can check it rather
+# than rediscover it.
+psram = []
+board-m5 = ["esp32"]
+board-m5core2 = ["board-m5"]
+board-m5tough = ["board-m5"]
 # Exactly one chip must be selected; the HAL crates refuse to build otherwise.
 # Two very different cores — Xtensa LX6 and RISC-V — from one source file.
 esp32 = [
@@ -24,12 +51,14 @@ esp32 = [
     "esp-backtrace/esp32",
     "esp-println/esp32",
     "esp-bootloader-esp-idf/esp32",
+    "esp-storage/esp32",
 ]
 esp32c3 = [
     "esp-hal/esp32c3",
     "esp-backtrace/esp32c3",
     "esp-println/esp32c3",
     "esp-bootloader-esp-idf/esp32c3",
+    "esp-storage/esp32c3",
 ]
 
 [dependencies]
@@ -58,6 +87,19 @@ esp-alloc = "0.10.0"
 # refuses to flash an image without one.
 esp-bootloader-esp-idf = { version = "0.5.0", default-features = false }
 
+# Raw flash access, so an application can be stored on the board and survive a
+# power cycle. `embedded-storage` is what both this crate and the partition
+# table speak, which is how a partition becomes a bounded window rather than an
+# offset somebody has to remember not to get wrong.
+# `bytewise-read`: the store reads names and payloads of whatever length a
+# record has, and without this the driver requires every read to be four-byte
+# aligned and four-byte sized. It buffers a word and copies out the part asked
+# for, which is what this module would otherwise have to write itself.
+esp-storage = { version = "0.9.0", default-features = false, features = [
+    "bytewise-read",
+] }
+embedded-storage = "0.3.1"
+
 [profile.release]
 opt-level = "z"
 lto = "fat"
@@ -67,4 +109,15 @@ panic = "abort"
 overflow-checks = false
 
 [profile.dev]
+opt-level = "s"
+
+# esp-storage refuses to build below optimization level `s`, and it is right
+# to: its flash routines run with the instruction cache disabled, and `z` can
+# leave them large enough or laid out badly enough to fault there.
+#
+# Overridden for that one package rather than for the profile. The rest of the
+# firmware stays at `z` because the image has to fit a partition, and lifting
+# everything to `s` to satisfy one dependency would be paying for it
+# everywhere.
+[profile.release.package.esp-storage]
 opt-level = "s"

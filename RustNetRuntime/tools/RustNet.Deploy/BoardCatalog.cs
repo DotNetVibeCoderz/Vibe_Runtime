@@ -148,12 +148,13 @@ public static class BoardCatalog
             Name = "ESP32 DevKit / WROOM",
             Chip = "esp32",
             WorkspaceDir = "embedded/esp32-demo",
-            BuildArgs = "build --release",
-            BinaryName = "rustclr-esp32",
+            BuildArgs = "+esp build --release --no-default-features --features esp32 "
+                      + "--target xtensa-esp32-none-elf -Z build-std=core,alloc",
+            BinaryName = "rustclr-esp32-demo",
             Flash = FlashKind.Espflash,
             Requires = "the `esp` Rust toolchain (espup) and espflash",
-            Note = "Flashed with the custom partition table, or the FAT storage partition does not exist "
-                 + "and apps, provisioning and autostart do not survive a reboot.",
+            Note = "No panel and no PSRAM assumed, so this one takes the minimal binding tier. "
+                 + "`--no-stub` fails at FlashEnd on these parts; the default stub works.",
         },
         new BoardRecipe
         {
@@ -161,12 +162,17 @@ public static class BoardCatalog
             Name = "M5Stack Tough",
             Chip = "esp32",
             WorkspaceDir = "embedded/esp32-demo",
-            BuildArgs = "build --release --features board-m5tough",
-            BinaryName = "rustclr-esp32",
+            BuildArgs = "+esp build --release --no-default-features "
+                      + "--features board-m5tough,psram,one-bank "
+                      + "--target xtensa-esp32-none-elf -Z build-std=core,alloc",
+            BinaryName = "rustclr-esp32-demo",
             Flash = FlashKind.Espflash,
             Requires = "the `esp` Rust toolchain (espup) and espflash",
-            Note = "AXP192 powers the LCD rails before the ILI9342C panel is driven; the 320x240 "
-                 + "framebuffer is 150 KB and needs PSRAM.",
+            Note = "Three features, each found the hard way: `psram` because a 320x240 RGB565 "
+                 + "canvas is 150 KB and internal DRAM is already spent; `one-bank` because the "
+                 + "96 KB reclaimed from dram2_seg corrupts a loaded assembly; and a 64 KB "
+                 + "internal arena, because esp-alloc's arena is a .bss static and the stack is "
+                 + "whatever dram_seg has left after it.",
         },
         new BoardRecipe
         {
@@ -174,8 +180,10 @@ public static class BoardCatalog
             Name = "M5Stack Core2",
             Chip = "esp32",
             WorkspaceDir = "embedded/esp32-demo",
-            BuildArgs = "build --release --features board-m5core2",
-            BinaryName = "rustclr-esp32",
+            BuildArgs = "+esp build --release --no-default-features "
+                      + "--features board-m5core2,psram,one-bank "
+                      + "--target xtensa-esp32-none-elf -Z build-std=core,alloc",
+            BinaryName = "rustclr-esp32-demo",
             Flash = FlashKind.Espflash,
             Requires = "the `esp` Rust toolchain (espup) and espflash",
             Note = "Same ILI9342C panel and AXP192 as the Tough, but LDO3 drives the vibration "
@@ -187,14 +195,13 @@ public static class BoardCatalog
             Name = "ESP32-C3 (Seeed XIAO and similar)",
             Chip = "esp32c3",
             WorkspaceDir = "embedded/esp32-demo",
-            BuildArgs = "build --release --no-default-features --features chip-esp32c3 "
-                      + "--target riscv32imc-esp-espidf",
-            BinaryName = "rustclr-esp32",
+            BuildArgs = "build --release --no-default-features --features esp32c3 "
+                      + "--target riscv32imc-unknown-none-elf",
+            BinaryName = "rustclr-esp32-demo",
             Flash = FlashKind.Espflash,
-            Env = new Dictionary<string, string> { ["MCU"] = "esp32c3" },
-            Requires = "the `esp` Rust toolchain and espflash",
-            Note = "RNDP runs over the SoC's own USB Serial/JTAG, not UART0 — these boards wire "
-                 + "the USB socket straight to the controller inside the chip.",
+            Requires = "espflash. RISC-V is an upstream target, so stable Rust builds this one.",
+            Note = "The one ESP32 here that needs no forked toolchain — and the one with enough "
+                 + "internal DRAM (288 KB) not to need PSRAM.",
         },
         new BoardRecipe
         {
@@ -206,8 +213,9 @@ public static class BoardCatalog
             BinaryName = "rustclr-k210",
             Flash = FlashKind.Kflash,
             Requires = "cargo-binutils (rust-objcopy) and kflash",
-            Note = "kflash wants a raw binary, so the ELF is objcopy'd first. The openec bridge "
-                 + "asserts reset whenever DTR and RTS are both set.",
+            Note = "kflash wants a raw binary, so the ELF is objcopy'd first. Boot it with "
+                 + "`-s` (SRAM only, flash untouched) and watch the console with DTR and RTS "
+                 + "cleared — either one resets the chip and discards the image.",
         },
         new BoardRecipe
         {
@@ -401,13 +409,18 @@ public static class BoardCatalog
                 break;
 
             case FlashKind.Espflash:
-                // The partition table is not optional: without it there is no
-                // FAT storage partition, and everything the device is supposed
-                // to remember is lost on the next power cycle.
+                // The partition table is passed when the port has one. A
+                // firmware that keeps state in a FAT partition needs it or
+                // everything it remembers is lost at the next power cycle; a
+                // bare-metal firmware that carries its program in `.rodata`
+                // has no partitions.csv, and naming a file that is not there
+                // fails the flash outright — which is what it did.
+                string partitions = Path.Combine(ws, "partitions.csv");
+                string table = File.Exists(partitions) ? " --partition-table partitions.csv" : "";
                 steps.Add(new RunStep(
                     $"espflash -> {port}",
                     "espflash",
-                    $"flash \"{elf}\" --partition-table partitions.csv --port {port}",
+                    $"flash \"{elf}\"{table} --port {port}",
                     ws));
                 break;
 
@@ -417,10 +430,14 @@ public static class BoardCatalog
                     "rust-objcopy",
                     $"-O binary \"{elf}\" fw.bin",
                     ws));
+                // `-s` boots from SRAM and never touches the SPI flash. The
+                // K210 has no internal flash, so on a commercial module that
+                // part holds the product's own firmware — and a power cycle
+                // brings it back.
                 steps.Add(new RunStep(
                     $"kflash -> {port}",
                     "kflash",
-                    $"-p {port} -b 1500000 fw.bin",
+                    $"-p {port} -b 1500000 -s fw.bin",
                     ws));
                 break;
 

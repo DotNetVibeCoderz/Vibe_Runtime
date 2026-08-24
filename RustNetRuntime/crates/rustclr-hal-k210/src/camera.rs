@@ -524,3 +524,167 @@ mod tests {
         assert_eq!(identify(0xFFFF), None);
     }
 }
+
+// ── the HAL trait, over the driver above ────────────────────────────────────
+
+/// The Maix Go's OV2640 as a [`rustclr_hal::camera::Camera`].
+///
+/// # It owns its own I²C master, and that is not an accident
+///
+/// The sensor's control lines are I²C2, which is why `Board::i2c` deliberately
+/// does not hand it out — see the note there. Owning it here means a capture
+/// cannot be interrupted half-way by a program reconfiguring the same
+/// controller for a different device, and it keeps the borrow honest: a
+/// `&mut dyn Camera` handed out by `Board::camera` needs the bus at capture
+/// time, and a bus that lived on the board could not be borrowed at once.
+///
+/// # A capture takes the display's pins away and gives them back
+///
+/// The eight DVP data pads are the eight the panel is driven through. Capture
+/// switches the routing, and switches it back before returning — so a program
+/// can capture and then `Present` without knowing any of this. The cost is
+/// that a capture and a blit cannot overlap, which on a single-threaded board
+/// they never do.
+pub struct K210Camera {
+    dvp: Dvp,
+    bus: crate::i2c::K210I2c,
+    delay: CycleDelay,
+    address: u8,
+    config: rustclr_hal::camera::CameraConfig,
+    /// The DVP's destination, which is also the buffer handed back.
+    ///
+    /// The obvious shape is a `Vec<u16>` to DMA into and a `Vec<u8>` to
+    /// return, but that means the frame exists twice at once — 300 KB for one
+    /// 320x240 capture, on a heap where the managed `byte[]` is then a third
+    /// copy. The board ran out at the third. The block writes straight into
+    /// what gets returned, and [`Camera::capture`] moves it out rather than
+    /// cloning it, so only one of these is ever live.
+    ///
+    /// Empty between captures, therefore.
+    frame: alloc::vec::Vec<u8>,
+    /// Whether [`Self::configure`] has run since the geometry last changed.
+    /// The sensor keeps its own state, and reconfiguring it per frame would
+    /// cost a soft reset and 40 ms for nothing.
+    armed: bool,
+}
+
+impl K210Camera {
+    /// Bring up the DVP block and probe for a sensor.
+    ///
+    /// `None` when nothing answers, which is the case for a Maix Go with no
+    /// camera ribbon attached — a board that reports a camera it does not have
+    /// would return frames of whatever the DVP left in memory.
+    pub fn probe_maix(cpu_hz: u32, apb0_hz: u32) -> Option<Self> {
+        let mut dvp = Dvp::new(MAIX_CAMERA, cpu_hz);
+        // The sensor's logic runs off XCLK, which this starts — so the block
+        // has to be up before a probe means anything. See the module note.
+        dvp.init();
+
+        let mut bus = crate::i2c::K210I2c::new(crate::i2c::I2C2, apb0_hz);
+        let (address, _id) = probe(&mut bus)?;
+
+        Some(Self {
+            dvp,
+            bus,
+            delay: CycleDelay::new(cpu_hz),
+            address,
+            config: rustclr_hal::camera::CameraConfig::default(),
+            frame: alloc::vec::Vec::new(),
+            armed: false,
+        })
+    }
+}
+
+impl rustclr_hal::camera::Camera for K210Camera {
+    fn configure(&mut self, config: rustclr_hal::camera::CameraConfig) -> HalResult<()> {
+        if config.width == 0 || config.height == 0 {
+            return Err(rustclr_hal::HalError::InvalidArgument(
+                "camera dimensions must be non-zero",
+            ));
+        }
+        // The OV2640's output scaler holds both sizes divided by four, so a
+        // size that is not a multiple of four cannot be expressed and would be
+        // silently truncated into a frame of the wrong stride. Refused, with
+        // the reason, rather than rounded.
+        if config.width % 4 != 0 || config.height % 4 != 0 {
+            return Err(rustclr_hal::HalError::InvalidArgument(
+                "the OV2640 stores its output size divided by four, so both must be multiples of 4",
+            ));
+        }
+        // The DVP counts a burst as eight pixels, so a width that is not a
+        // multiple of eight would leave the last burst short and the frame
+        // skewed by a few pixels per row.
+        if config.width % 8 != 0 {
+            return Err(rustclr_hal::HalError::InvalidArgument(
+                "the DVP transfers eight pixels a burst, so the width must be a multiple of 8",
+            ));
+        }
+        self.config = config;
+        self.armed = false;
+        Ok(())
+    }
+
+    fn capture(&mut self) -> HalResult<alloc::vec::Vec<u8>> {
+        let (w, h) = (self.config.width, self.config.height);
+        let pixels = (w as usize) * (h as usize);
+
+        if !self.armed {
+            configure(&mut self.bus, self.address, w as u16, h as u16, &mut self.delay)?;
+            self.armed = true;
+        }
+        // Reallocated per capture, deliberately. Keeping the buffer between
+        // frames would save an allocation and cost a second copy of it: the
+        // trait hands the frame back by value, so a retained buffer has to be
+        // cloned, and at 320x240 that is 150 KB extra live at exactly the
+        // moment the managed `byte[]` is also being built. The board ran out
+        // there. One buffer, moved out, is the smaller peak.
+        let bytes = pixels * 2;
+        if self.frame.len() != bytes {
+            self.frame.clear();
+            self.frame.try_reserve_exact(bytes).map_err(|_| rustclr_hal::HalError::Busy)?;
+            self.frame.resize(bytes, 0);
+        }
+
+        // The DVP is an AXI master writing eight-byte bursts, so its
+        // destination has to be eight-byte aligned. A `Vec<u8>` promises only
+        // one. Checked rather than assumed: a misaligned burst does not fault,
+        // it writes the frame somewhere slightly wrong, and a picture that is
+        // subtly torn is far harder to diagnose than a refusal that names the
+        // reason.
+        let start = self.frame.as_ptr() as usize;
+        if start % 8 != 0 {
+            return Err(rustclr_hal::HalError::Bus(
+                "the frame buffer is not eight-byte aligned, which the DVP's AXI burst requires",
+            ));
+        }
+        let address = uncached(start as u32);
+        // The AI planes are not used, so all three are pointed at the same
+        // place as the RGB output rather than at address zero — the block
+        // writes them regardless of `CFG_AI_OUTPUT`.
+        self.dvp.configure(w as u16, h as u16, address, [address, address, address]);
+
+        // The panel and the sensor share eight pads; whichever was set last
+        // owns them. Taken and given back around the capture so a caller can
+        // capture and then `Present` without knowing that.
+        release_pins_from_panel();
+        let result = self.dvp.capture();
+        return_pins_to_panel();
+        result?;
+
+        // The block writes native-endian `u16` per pixel and the trait promises
+        // little-endian bytes; on this chip those are the same byte order, so
+        // the buffer is already what the caller asked for. Stated here because
+        // it is an assumption about the target, not about the driver: a
+        // big-endian RISC-V port would have to swap each pair.
+        #[cfg(target_endian = "big")]
+        compile_error!("the DVP's frame is native-endian u16; a big-endian target must swap it");
+
+        // Moved, not copied: the caller gets this buffer and the next capture
+        // allocates a fresh one.
+        Ok(core::mem::take(&mut self.frame))
+    }
+
+    fn config(&self) -> rustclr_hal::camera::CameraConfig {
+        self.config
+    }
+}

@@ -47,7 +47,7 @@ fn an_object_one_thread_makes_is_visible_to_another() {
     let mut main = Interpreter::new();
     let handle = main.alloc_string("written on the main thread");
 
-    let mut w = main.worker(Box::new(SystemHost::new()));
+    let w = main.worker(Box::new(SystemHost::new()));
     let seen = thread::spawn(move || w.string_value(handle))
         .join()
         .expect("worker panicked");

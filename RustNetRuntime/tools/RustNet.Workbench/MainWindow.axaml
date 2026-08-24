@@ -108,9 +108,9 @@
                 <StackPanel Spacing="10">
                   <TextBlock Classes="legend" Text="FLASH"/>
                   <TextBlock Classes="note"
-                             Text="A .dll is compiled to RNX and signed on the way through. Pick the chip the image is for — a device rejects an image built for another."/>
+                             Text="The .dll goes to the device exactly as the SDK built it — RustCLR reads PE/ECMA-335, so there is no repackaging step. Pick the chip the image is for; a device rejects an image built for another."/>
                   <StackPanel Orientation="Horizontal" Spacing="8">
-                    <TextBox x:Name="TxtAppPath" Width="300" Watermark="app .dll or .rnx"/>
+                    <TextBox x:Name="TxtAppPath" Width="300" Watermark="app .dll"/>
                     <TextBox x:Name="TxtAppName" Width="130" Watermark="name on device"/>
                     <ComboBox x:Name="CmbChip" Width="120" SelectedIndex="0">
                       <ComboBoxItem>host-sim</ComboBoxItem>

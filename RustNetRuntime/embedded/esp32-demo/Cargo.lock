@@ -635,6 +635,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "esp-storage"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cf2b3f00c9f94b27c62a4f5296b19470c3a083c687c8146e554a459f9bee596"
+dependencies = [
+ "document-features",
+ "embedded-storage",
+ "esp-hal",
+ "esp-hal-procmacros",
+ "esp-metadata-generated 0.4.0",
+ "esp-rom-sys",
+ "esp-sync",
+]
+
+[[package]]
 name = "esp-sync"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1138,9 +1153,20 @@ version = "0.1.0"
 dependencies = [
  "rustclr-bcl",
  "rustclr-core",
+ "rustclr-device",
  "rustclr-gc",
  "rustclr-hal",
  "rustclr-metadata",
+ "rustclr-rndp",
+]
+
+[[package]]
+name = "rustclr-device"
+version = "0.1.0"
+dependencies = [
+ "rustclr-flashfs",
+ "rustclr-hal",
+ "rustclr-rndp",
 ]
 
 [[package]]
@@ -1148,11 +1174,13 @@ name = "rustclr-esp32-demo"
 version = "0.1.0"
 dependencies = [
  "embedded-hal 1.0.0",
+ "embedded-storage",
  "esp-alloc",
  "esp-backtrace",
  "esp-bootloader-esp-idf",
  "esp-hal",
  "esp-println",
+ "esp-storage",
  "rustclr-demo-common",
  "rustclr-hal",
  "rustclr-hal-esp32c3",
@@ -1189,6 +1217,10 @@ dependencies = [
 
 [[package]]
 name = "rustclr-metadata"
+version = "0.1.0"
+
+[[package]]
+name = "rustclr-rndp"
 version = "0.1.0"
 
 [[package]]

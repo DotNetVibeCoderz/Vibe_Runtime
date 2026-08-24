@@ -96,7 +96,7 @@ pub use host::{CaptureHost, Host};
 #[cfg(feature = "std")]
 pub use host::SystemHost;
 pub use interp::{
-    CompiledMethod, ExecutionStats, Frame, Interpreter, Limits, NativeFn, NativeTier,
+    CompiledMethod, DevicePoll, ExecutionStats, Frame, Interpreter, Limits, NativeFn, NativeTier,
 };
 pub use loader::{
     CoreTypes, CustomAttribute, LoadedAssembly, Loader, DEFAULT_COMPARER_FIELD,

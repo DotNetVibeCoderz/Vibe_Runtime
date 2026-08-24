@@ -1,0 +1,20 @@
+# RustCLR ESP32 partition layout.
+#
+# Copied from the Gravicode RustNet reference firmware and widened: that one
+# targets 4 MB parts, and the M5Stack Tough and Core2 both carry 16 MB.
+#
+# `factory` is 2 MB against a firmware that is currently ~700 KB. The slack is
+# deliberate — the image grows with every binding, and a `factory` partition
+# that has to move is a partition that invalidates everything after it.
+#
+# `storage` is FAT because that is what `RustNet.IO.FileSystem` will want when
+# it reaches this chip. Nothing writes it yet; it exists so that the day
+# something does, the layout does not change underneath a board already in
+# somebody's hands.
+#
+# Offsets must stay 4 KB aligned, and an `app` partition 64 KB aligned.
+# Name,     Type, SubType, Offset,   Size
+nvs,        data, nvs,     0x9000,   0x6000
+phy_init,   data, phy,     0xf000,   0x1000
+factory,    app,  factory, 0x10000,  0x200000
+storage,    data, fat,     0x210000, 0xDF0000

@@ -4,8 +4,4 @@
     <Description>Audio, camera, video and a VNC server</Description>
   </PropertyGroup>
 
-  <ItemGroup>
-    <ProjectReference Include="../RustNet.Graphics/RustNet.Graphics.csproj" />
-  </ItemGroup>
-
 </Project>

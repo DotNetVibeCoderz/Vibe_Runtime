@@ -118,6 +118,7 @@ pub(crate) mod fmath {
 
 pub mod collections;
 pub mod graphics;
+pub mod media;
 pub mod net;
 pub mod hal;
 pub mod security;
@@ -160,8 +161,16 @@ pub fn install(interp: &mut Interpreter) {
     storage::register(interp);
     security::register(interp);
     graphics::register(interp);
+    media::register(interp);
     #[cfg(feature = "std")]
     net::register(interp);
+    // On a board there are no sockets, but there may well be a radio, and
+    // `register_offline` is what binds `Wifi` to the HAL's network interface.
+    // Without this line the *full* tier had no networking at all while the
+    // minimal tier did — a bigger binding set with fewer bindings in it, which
+    // is how a Maix Go running `WifiCheck` died on `Wifi.Connect`.
+    #[cfg(not(feature = "std"))]
+    net::register_offline(interp);
 }
 
 /// Registers the bindings a console program needs, and no more.

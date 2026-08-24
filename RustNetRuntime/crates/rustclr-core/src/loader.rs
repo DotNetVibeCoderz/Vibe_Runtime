@@ -305,6 +305,17 @@ impl Loader {
         &self.assemblies[id.index()]
     }
 
+    /// The assembly a method or type came from, when it came from one at all.
+    ///
+    /// The loader pre-registers the framework types natively, and those carry
+    /// an `AssemblyId` that indexes no loaded assembly — there are no metadata
+    /// tables behind `System.Object`. Anything that wants an assembly in order
+    /// to resolve a *token* has to cope with that, because a native method has
+    /// no tokens to resolve.
+    pub fn assembly_opt(&self, id: AssemblyId) -> Option<&LoadedAssembly> {
+        self.assemblies.get(id.index())
+    }
+
     pub fn find_assembly(&self, name: &str) -> Option<AssemblyId> {
         self.by_name.get(name).copied()
     }
@@ -1847,7 +1858,10 @@ impl Loader {
             }
 
             let Ok(sig) = SignatureParser::new(mr.signature).parse_method() else { continue };
-            let resolved = self.find_method_on_type(parent, mr.name, &sig);
+            // `&assembly`, not the definition's: this signature was written in
+            // *this* assembly's tables, so its type tokens only mean anything
+            // here. See [`Self::find_method_on_type_from`].
+            let resolved = self.find_method_on_type_from(parent, mr.name, &sig, &assembly);
             match resolved {
                 Some(m) => {
                     assembly.member_ref_by_row.insert(row, m);
@@ -2150,6 +2164,111 @@ impl Loader {
             }
         }
         None
+    }
+
+    /// The same search, for a signature written in another assembly's tables.
+    ///
+    /// A `ValueType`/`Class` in a signature is a *token*, and a token means
+    /// nothing outside the assembly whose tables it indexes. Comparing two
+    /// raw tokens therefore says "different" for a parameter that is the same
+    /// type — which is every struct or enum parameter on a method called
+    /// across an assembly reference. The method then fails to resolve, gets
+    /// synthesised as an internal call, and the program dies at the call site
+    /// with `no implementation for ...(int,int,#16777256)` even though the
+    /// method has a perfectly good IL body.
+    ///
+    /// So each side's tokens are resolved in *its own* assembly first, and the
+    /// resulting [`TypeId`]s are compared. Primitives need none of this and
+    /// take the same path as before.
+    pub fn find_method_on_type_from(
+        &self,
+        ty: TypeId,
+        name: &str,
+        sig: &MethodSig,
+        from: &LoadedAssembly,
+    ) -> Option<MethodId> {
+        for id in self.registry.base_chain(ty) {
+            for m in &self.registry.ty(id).methods {
+                let info = self.registry.method(*m);
+                if info.name != name {
+                    continue;
+                }
+                // A natively-registered framework method has no tables, so
+                // there is nothing to resolve its signature against and the
+                // structural comparison is already the right one.
+                let matched = match self.assembly_opt(info.assembly) {
+                    Some(defined_in) => {
+                        self.signatures_match_across(&info.signature, defined_in, sig, from)
+                    }
+                    None => signatures_match(&info.signature, sig),
+                };
+                if matched {
+                    return Some(*m);
+                }
+            }
+        }
+        None
+    }
+
+    /// [`signatures_match`], with each side's type tokens resolved first.
+    fn signatures_match_across(
+        &self,
+        a: &MethodSig,
+        a_from: &LoadedAssembly,
+        b: &MethodSig,
+        b_from: &LoadedAssembly,
+    ) -> bool {
+        if a.params.len() != b.params.len() || a.has_this != b.has_this {
+            return false;
+        }
+        a.params.iter().zip(&b.params).all(|(x, y)| {
+            self.type_sigs_match_across(
+                x.unwrap_modifiers(),
+                a_from,
+                y.unwrap_modifiers(),
+                b_from,
+            )
+        })
+    }
+
+    fn type_sigs_match_across(
+        &self,
+        a: &TypeSig,
+        a_from: &LoadedAssembly,
+        b: &TypeSig,
+        b_from: &LoadedAssembly,
+    ) -> bool {
+        use TypeSig::*;
+        match (a, b) {
+            // A named type on either side: resolve both and compare identity.
+            // When either side does not resolve — a type this build does not
+            // load — there is nothing to compare, so fall through to the raw
+            // token comparison. That is what this did before resolution was
+            // added, and keeping it means the change can only ever match
+            // *more* than it used to.
+            (ValueType(_) | Class(_), _) | (_, ValueType(_) | Class(_)) => {
+                match (self.named_type(a, a_from), self.named_type(b, b_from)) {
+                    (Some(x), Some(y)) => x == y,
+                    _ => type_sigs_match(a, b),
+                }
+            }
+            (SzArray(x), SzArray(y)) | (ByRef(x), ByRef(y)) | (Ptr(x), Ptr(y)) => self
+                .type_sigs_match_across(
+                    x.unwrap_modifiers(),
+                    a_from,
+                    y.unwrap_modifiers(),
+                    b_from,
+                ),
+            _ => type_sigs_match(a, b),
+        }
+    }
+
+    /// The runtime type a `ValueType`/`Class` signature names, if it is one.
+    fn named_type(&self, sig: &TypeSig, from: &LoadedAssembly) -> Option<TypeId> {
+        match sig {
+            TypeSig::ValueType(t) | TypeSig::Class(t) => self.resolve_type_token(from, *t),
+            _ => None,
+        }
     }
 
     /// Resolves a `TypeDefOrRef`-shaped token within an assembly.

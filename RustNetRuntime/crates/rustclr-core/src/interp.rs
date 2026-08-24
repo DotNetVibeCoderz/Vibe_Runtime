@@ -305,6 +305,34 @@ pub struct Interpreter {
     /// the breakpoint set is not consulted — so a program run without one pays
     /// essentially nothing for the hook existing.
     pub debugger: Option<crate::debug::BoxedDebugger>,
+
+    /// A device service polled while a program runs.
+    ///
+    /// A board that answers a host tool has to do it *during* the program, not
+    /// between programs: the questions worth asking — what is on the screen,
+    /// what has it logged, stop it — are only interesting about something that
+    /// is running. There is no second thread on these chips to ask from, so
+    /// the service is polled from the instruction loop like the profiler.
+    ///
+    /// See [`DevicePoll`] for why it is handed the whole interpreter.
+    pub device: Option<alloc::boxed::Box<dyn DevicePoll>>,
+
+    /// Set from outside to ask the running program to stop.
+    ///
+    /// Checked once per instruction at the safe point in [`Self::run_until`].
+    /// `None` — the default — costs one null check.
+    ///
+    /// # Why a `&'static` rather than an `Arc`
+    ///
+    /// `alloc::sync::Arc` does not exist on `thumbv6m` or `riscv32imc`: both
+    /// lack compare-and-swap, and a reference count needs it. `AtomicBool`
+    /// survives on those targets because plain `load` and `store` do not, and
+    /// those are the only two operations this ever needs — it is set once and
+    /// read many times, never exchanged.
+    ///
+    /// A `&'static` is also the shape a firmware wants: the flag is a `static`
+    /// in the firmware image, not something allocated per run.
+    pub cancel: Option<&'static core::sync::atomic::AtomicBool>,
     /// Where the program should stop.
     pub breakpoints: crate::debug::Breakpoints,
     /// What the interpreter is stepping towards, between stops.
@@ -418,6 +446,8 @@ impl Interpreter {
             #[cfg(feature = "std")]
             host_factory: None,
             debugger: None,
+            cancel: None,
+            device: None,
             breakpoints: crate::debug::Breakpoints::new(),
             stepping: None,
             announced_entry: false,
@@ -455,6 +485,14 @@ impl Interpreter {
 
     pub fn has_native(&self, key: &str) -> bool {
         self.natives.contains_key(key)
+    }
+
+    /// Every binding key currently registered.
+    ///
+    /// For comparing one binding set against another — which is how the
+    /// full and minimal tiers are kept in a subset relationship.
+    pub fn native_binding_keys(&self) -> Vec<String> {
+        self.natives.keys().cloned().collect()
     }
 
     pub fn exit_code(&self) -> Option<i32> {
@@ -1709,6 +1747,26 @@ impl Interpreter {
     }
 
     /// Attaches a debugger. The program stops before its first instruction.
+    /// Lets the device service look at the running program.
+    ///
+    /// Cold and never inlined, for the reason the debug and profile hooks are:
+    /// without it the branch and its registers get hoisted into the loop that
+    /// runs every instruction and cost something even when nothing is
+    /// attached.
+    ///
+    /// The service is **taken out and put back** rather than borrowed, because
+    /// it needs `&mut Interpreter` — the canvas, the board, the statistics —
+    /// and it cannot borrow the interpreter while living inside it. Taking it
+    /// also means a service that somehow re-entered here would find nothing to
+    /// call rather than recursing.
+    #[cold]
+    #[inline(never)]
+    fn device_poll(&mut self) {
+        let Some(mut service) = self.device.take() else { return };
+        service.poll(self);
+        self.device = Some(service);
+    }
+
     pub fn attach_debugger(&mut self, debugger: crate::debug::BoxedDebugger) {
         self.debugger = Some(debugger);
         self.announced_entry = false;
@@ -1722,6 +1780,16 @@ impl Interpreter {
             if let Some(budget) = self.limits.max_instructions {
                 if self.stats.instructions_executed >= budget {
                     return Err(ExecutionError::InstructionBudgetExceeded(budget));
+                }
+            }
+
+            // Between instructions, where every live value is rooted and no
+            // frame is mid-update -- the same property that makes this a safe
+            // point for collection makes it the only safe place to abandon a
+            // program from outside it.
+            if let Some(cancel) = self.cancel.as_ref() {
+                if cancel.load(core::sync::atomic::Ordering::Relaxed) {
+                    return Err(ExecutionError::Cancelled);
                 }
             }
 
@@ -1770,6 +1838,12 @@ impl Interpreter {
         // only read when that says an interval has passed.
         if self.profiler.is_some() {
             self.profile_poll();
+        }
+        // The device service is polled on the same principle: a check that
+        // costs a branch when nothing is attached, and a cold call when
+        // something is.
+        if self.device.is_some() {
+            self.device_poll();
         }
 
         self.stats.instructions_executed += 1;
@@ -1859,3 +1933,29 @@ impl Interpreter {
 mod arith;
 mod eh;
 mod exec;
+
+/// A service polled from the interpreter's instruction loop.
+///
+/// Given the whole [`Interpreter`] because everything it is asked about lives
+/// there: the framebuffer for a screenshot, the statistics for a performance
+/// reading, the board for the UART it answers on and the flash it stores
+/// applications in.
+///
+/// It runs *between* instructions, where every live value is rooted and no
+/// frame is mid-update — the same property that makes that point safe for a
+/// collection. It must not block: on these chips this is the same thread the
+/// program runs on, so time spent here is time the program is not running.
+pub trait DevicePoll: Send {
+    fn poll(&mut self, interp: &mut Interpreter);
+
+    /// The service as its own type again.
+    ///
+    /// A firmware hands its service to the interpreter for the duration of one
+    /// program and wants it back afterwards -- the log, the uptime and the
+    /// application list belong to the *board*, and starting the next program
+    /// must not look like a reboot to whoever is watching. The same
+    /// `as_any`-shaped escape hatch [`rustclr_gc::GcObject`] uses, for the
+    /// same reason: this trait is deliberately narrow, and downcasting is
+    /// cheaper than widening it with methods only one implementor wants.
+    fn into_any(self: alloc::boxed::Box<Self>) -> alloc::boxed::Box<dyn core::any::Any>;
+}

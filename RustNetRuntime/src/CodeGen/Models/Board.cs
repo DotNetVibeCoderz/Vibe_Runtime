@@ -9,6 +9,13 @@ public enum FlashTool
     /// <summary>`probe-rs`, over SWD. Needs a debug probe.</summary>
     ProbeRs,
 
+    /// <summary>
+    /// `kflash`, over UART. The K210 has no internal flash, so this is how an
+    /// image reaches it — and with `-s` it goes to SRAM and leaves the board's
+    /// own SPI part alone.
+    /// </summary>
+    KFlash,
+
     /// <summary>`dfu-util`, over USB DFU. No probe, but the board must be in DFU mode.</summary>
     DfuUtil,
 
@@ -120,7 +127,7 @@ public static class BoardCatalog
     /// source of truth. Shown in the UI so a board's tier reads as arithmetic
     /// rather than as an opinion.
     /// </summary>
-    public static (int Minimal, int Full) TierBytes => (192_045, 260_702);
+    public static (int Minimal, int Full) TierBytes => (252_092, 385_070);
 
     public static IReadOnlyList<Board> All { get; } =
     [
@@ -137,7 +144,9 @@ public static class BoardCatalog
             ProbeChip = "esp32c3",
             RamBytes = 400 * 1024,
             HeapBytes = 288 * 1024,
-            Tier = BclTier.Full,
+            // 288 KB clears the minimal tier's 252,092 and not the full set's
+            // 385,070. It used to clear both, before the device bindings.
+            Tier = BclTier.Minimal,
             VerifiedOnHardware = true,
             Console = "USB-serial bridge, 115200 baud",
         },
@@ -155,10 +164,54 @@ public static class BoardCatalog
             Flash = FlashTool.EspFlash,
             ProbeChip = "esp32",
             RamBytes = 520 * 1024,
-            // 176 KB of dram_seg plus 96 KB of the reclaimed second bank.
-            HeapBytes = 272 * 1024,
-            Tier = BclTier.Full,
+            // `dram_seg` alone. The 96 KB reclaimed from `dram2_seg` used to
+            // be counted here and is not trustworthy: it corrupts a loaded
+            // assembly once RustBCL has its share. Build with `one-bank` and
+            // this is what is left, which clears no tier at all.
+            HeapBytes = 176 * 1024,
+            Tier = BclTier.None,
             Console = "UART0 via USB-serial bridge, 115200 baud",
+        },
+        new()
+        {
+            Id = "m5tough",
+            Name = "M5Stack Tough",
+            Chip = "ESP32",
+            Core = "Xtensa LX6",
+            Target = "xtensa-esp32-none-elf",
+            FirmwareDirectory = "esp32-demo",
+            CargoFeature = "board-m5tough,psram,one-bank",
+            Toolchain = "+esp",
+            ExtraCargoArgs = ["-Z", "build-std=core,alloc"],
+            Flash = FlashTool.EspFlash,
+            ProbeChip = "esp32",
+            RamBytes = 520 * 1024,
+            // PSRAM, behind a 64 KB internal arena. The arena is small on
+            // purpose: esp-alloc's is a `.bss` static and the stack is what
+            // `dram_seg` has left after it.
+            HeapBytes = 4 * 1024 * 1024,
+            Tier = BclTier.Full,
+            VerifiedOnHardware = true,
+            Console = "UART0 via CH9102, 115200 baud",
+        },
+        new()
+        {
+            Id = "m5core2",
+            Name = "M5Stack Core2",
+            Chip = "ESP32",
+            Core = "Xtensa LX6",
+            Target = "xtensa-esp32-none-elf",
+            FirmwareDirectory = "esp32-demo",
+            CargoFeature = "board-m5core2,psram,one-bank",
+            Toolchain = "+esp",
+            ExtraCargoArgs = ["-Z", "build-std=core,alloc"],
+            Flash = FlashTool.EspFlash,
+            ProbeChip = "esp32",
+            RamBytes = 520 * 1024,
+            HeapBytes = 4 * 1024 * 1024,
+            Tier = BclTier.Full,
+            VerifiedOnHardware = true,
+            Console = "UART0 via CH9102, 115200 baud",
         },
         new()
         {
@@ -182,10 +235,13 @@ public static class BoardCatalog
             Core = "RISC-V 64",
             Target = "riscv64gc-unknown-none-elf",
             FirmwareDirectory = "k210",
-            Flash = FlashTool.ProbeRs,
+            Flash = FlashTool.KFlash,
             RamBytes = 6 * 1024 * 1024,
-            HeapBytes = 1024 * 1024,
+            // 2 MB, kept inside the first SRAM bank. 4 MB spans the boundary
+            // between the two and the board goes silent.
+            HeapBytes = 2 * 1024 * 1024,
             Tier = BclTier.Full,
+            VerifiedOnHardware = true,
             Console = "UARTHS, 115200 baud",
         },
         new()

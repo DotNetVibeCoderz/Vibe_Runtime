@@ -55,6 +55,26 @@ fn runtime_with_bcl(args: Vec<String>, minimal: bool) -> Interpreter {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Write the canvas to `path` as a PNG, or say why there is nothing to write.
+///
+/// The *canvas*, not the board's panel. Drawing needs no board — that is how a
+/// device UI is developed headlessly — so this captures what the program drew
+/// whether or not a panel was ever attached, which is exactly what a
+/// documentation screenshot wants.
+fn write_display_png(interp: &Interpreter, path: &str) -> Result<(u32, u32)> {
+    let Some(canvas) = interp.canvas.as_ref() else {
+        // Not an error the run fails on, but not silence either: a screenshot
+        // that did not happen should say so rather than leave a stale file
+        // from a previous run looking current.
+        return Err(
+            "the program never opened a display, so there is no screen to capture".into(),
+        );
+    };
+    let png = crate::png::rgb565_to_png(&canvas.pixels, canvas.width, canvas.height);
+    std::fs::write(path, png).map_err(|e| format!("could not write {path}: {e}"))?;
+    Ok((canvas.width, canvas.height))
+}
+
 pub fn run(
     assembly: &str,
     args: Vec<String>,
@@ -66,6 +86,7 @@ pub fn run(
     inline: bool,
     minimal_bcl: bool,
     board: Option<&str>,
+    capture_display: Option<&str>,
 ) -> Result<i32> {
     let mut interp = runtime_with_bcl(args, minimal_bcl);
     if let Some(name) = board {
@@ -111,6 +132,18 @@ pub fn run(
     let started = std::time::Instant::now();
     let outcome = interp.run_entry_point(id);
     let elapsed = started.elapsed();
+
+    // Before the outcome is examined, deliberately: a program that ended with
+    // an exception has still drawn something, and what was on screen when it
+    // failed is usually the most useful thing about it. Paired with
+    // `--max-instructions`, this is also how a program that loops forever —
+    // which is most device programs — gets photographed at all.
+    if let Some(path) = capture_display {
+        match write_display_png(&interp, path) {
+            Ok((w, h)) => eprintln!("[rustnet] wrote {path} ({w}x{h})"),
+            Err(e) => eprintln!("[rustnet] --capture-display: {e}"),
+        }
+    }
 
     let exit_code = match outcome {
         Ok(code) => code,
@@ -593,7 +626,7 @@ pub fn build(project: &str, configuration: &str, then_run: bool) -> Result<i32> 
         .ok_or("build succeeded but no output assembly was found under bin/")?;
 
     println!("Running {} on RustCLR…\n", assembly.display());
-    run(&assembly.to_string_lossy(), Vec::new(), false, false, None, true, None, true, false, None)
+    run(&assembly.to_string_lossy(), Vec::new(), false, false, None, true, None, true, false, None, None)
 }
 
 /// Finds the first `.dll` under a build output directory.
@@ -831,6 +864,13 @@ pub fn capabilities() -> Result<i32> {
     println!("                               headlessly. ONE canvas: 240x240 is 115 KB,");
     println!("                               and on most of these boards that is the");
     println!("                               whole heap.");
+    println!("  camera                       yes - `RustNet.Media.Camera` over the board");
+    println!("                               seam: a colour-bar test sensor on `--board");
+    println!("                               host`, and a Maix Go's OV2640 through the");
+    println!("                               K210's DVP. A board with no sensor THROWS");
+    println!("                               rather than returning a blank frame, which");
+    println!("                               a covered lens is indistinguishable from.");
+    println!("                               NO exposure, gain or white-balance control.");
     println!("  signed images                yes - `RCSB` containers verified before a");
     println!("                               byte of payload runs, with the chip family");
     println!("                               checked so an ESP32 image cannot brick an");
@@ -1478,8 +1518,12 @@ pub fn profile(
     period_us: u64,
     json: bool,
     jit: bool,
+    board: Option<&str>,
 ) -> Result<i32> {
     let mut interp = runtime(args);
+    if let Some(name) = board {
+        install_board(&mut interp, name)?;
+    }
     if jit {
         // Said plainly rather than left in the report's footnotes: a profile
         // taken this way attributes compiled time to the wrong method.

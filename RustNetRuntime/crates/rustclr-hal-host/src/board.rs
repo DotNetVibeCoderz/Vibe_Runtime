@@ -37,6 +37,7 @@ pub struct HostBoard {
     extmem: Vec<SimExtMem>,
     netifs: Vec<SimNetIf>,
     signals: Vec<SimSignal>,
+    camera: crate::SimCamera,
 }
 
 impl Default for HostBoard {
@@ -77,6 +78,7 @@ impl HostBoard {
                 SimNetIf::new(NetIfKind::Cellular),
             ],
             signals: (0..PIN_COUNT).map(|_| SimSignal::new()).collect(),
+            camera: crate::SimCamera::new(),
         }
     }
 
@@ -275,5 +277,14 @@ impl Board for HostBoard {
             .get_mut(pin as usize)
             .map(|s| s as &mut dyn rustclr_hal::signal::SignalControl)
             .ok_or(HalError::InvalidArgument("pin out of range"))
+    }
+
+    /// The colour-bar test sensor.
+    ///
+    /// A synthetic frame rather than no camera at all, so a capture pipeline
+    /// can be written and pixel-checked on a desktop. It is deliberately a
+    /// pattern nobody would mistake for optics.
+    fn camera(&mut self) -> HalResult<&mut dyn rustclr_hal::camera::Camera> {
+        Ok(&mut self.camera)
     }
 }

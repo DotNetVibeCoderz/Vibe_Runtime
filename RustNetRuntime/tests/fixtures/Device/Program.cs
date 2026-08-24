@@ -3,6 +3,7 @@ using RustNet.Hal;
 using RustNet.IO;
 using RustNet.Security;
 using RustNet.Graphics;
+using RustNet.Media;
 
 namespace Device;
 
@@ -304,6 +305,39 @@ public static class Program
         Check("the frame reaches the board", true);
         Display.Close();
         Check("the canvas closes", !Display.IsOpen());
+
+        // -- Camera --------------------------------------------------------
+        //
+        // The host board's sensor is a colour-bar generator, so every pixel is
+        // predictable and a wrong binding produces a wrong number rather than
+        // a plausible-looking image. A board with no sensor throws instead,
+        // which is checked on the boards themselves rather than here.
+
+        Camera.Configure(16, 4);
+        CheckEq("the camera takes the width it was configured with", Camera.Width(), 16);
+        CheckEq("and the height", Camera.Height(), 4);
+
+        byte[] frame = Camera.Capture();
+        // RGB565 is two bytes a pixel, and the frame is the whole raster.
+        CheckEq("an RGB565 frame is two bytes per pixel", frame.Length, 16 * 4 * 2);
+
+        // Eight bars across sixteen pixels: two pixels each, first is white
+        // (0xFFFF) and last is black (0x0000). Read little-endian, which is
+        // what the format promises.
+        CheckEq("the first pixel is the white bar", frame[0] | (frame[1] << 8), 0xFFFF);
+        CheckEq("the last pixel is the black bar",
+            frame[frame.Length - 2] | (frame[frame.Length - 1] << 8), 0x0000);
+        // Bar 5 is red (0xF800): pixels 10 and 11 of each row.
+        CheckEq("a middle pixel is the bar its column falls in",
+            frame[10 * 2] | (frame[10 * 2 + 1] << 8), 0xF800);
+
+        // Grayscale is one byte a pixel, so a binding that ignored the format
+        // would return twice as many bytes.
+        Camera.Configure(16, 4, PixelFormat.Grayscale);
+        CheckEq("a grayscale frame is one byte per pixel", Camera.Capture().Length, 16 * 4);
+
+        CheckThrows("a zero-sized frame is refused", () => Camera.Configure(0, 4));
+        CheckThrows("and a negative one", () => Camera.Configure(16, -1));
 
         Console.WriteLine("device checks=" + checks + " failures=" + failures);
         return failures == 0 ? 0 : 1;

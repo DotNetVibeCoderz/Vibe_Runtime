@@ -486,9 +486,20 @@ version = "0.1.0"
 dependencies = [
  "rustclr-bcl",
  "rustclr-core",
+ "rustclr-device",
  "rustclr-gc",
  "rustclr-hal",
  "rustclr-metadata",
+ "rustclr-rndp",
+]
+
+[[package]]
+name = "rustclr-device"
+version = "0.1.0"
+dependencies = [
+ "rustclr-flashfs",
+ "rustclr-hal",
+ "rustclr-rndp",
 ]
 
 [[package]]
@@ -522,6 +533,10 @@ dependencies = [
 
 [[package]]
 name = "rustclr-metadata"
+version = "0.1.0"
+
+[[package]]
+name = "rustclr-rndp"
 version = "0.1.0"
 
 [[package]]

@@ -19,6 +19,7 @@
     <ProjectReference Include="../../../managed/RustNet.IO/RustNet.IO.csproj" />
     <ProjectReference Include="../../../managed/RustNet.Security/RustNet.Security.csproj" />
     <ProjectReference Include="../../../managed/RustNet.Graphics/RustNet.Graphics.csproj" />
+    <ProjectReference Include="../../../managed/RustNet.Media/RustNet.Media.csproj" />
   </ItemGroup>
 
 </Project>

@@ -231,6 +231,7 @@ pub struct K210Board {
     storage: Option<SpiFlash>,
     files: Option<SpiFlash>,
     panel: Option<lcd::St7789>,
+    camera: Option<camera::K210Camera>,
 }
 
 impl K210Board {
@@ -260,6 +261,7 @@ impl K210Board {
             storage: None,
             files: None,
             panel: None,
+            camera: None,
         }
     }
 
@@ -306,6 +308,22 @@ impl K210Board {
 
     pub fn panel_mut(&mut self) -> Option<&mut lcd::St7789> {
         self.panel.as_mut()
+    }
+
+    /// Bring up the DVP block and attach a sensor if one answers.
+    ///
+    /// Returns what was found, so a firmware can report it. Attaching nothing
+    /// is the normal outcome for a board with no camera ribbon, and leaves
+    /// `Board::camera` refusing — which is what a program should hear rather
+    /// than a frame of whatever the DVP left in memory.
+    ///
+    /// Not done in [`Self::init`]: the bring-up spends 400 ms in resets and
+    /// holds, and a firmware that is not going to look at a camera should not
+    /// pay it.
+    pub fn attach_camera(&mut self) -> Option<&'static str> {
+        let cam = camera::K210Camera::probe_maix(self.clocks.cpu_hz, self.clocks.apb0_hz)?;
+        self.camera = Some(cam);
+        Some("OV2640")
     }
 
     /// Route `pad` to a specific GPIOHS `channel`.
@@ -419,6 +437,14 @@ impl Board for K210Board {
             // readable over the wire, so this is not an error.
             None => Ok(()),
         }
+    }
+
+    /// The DVP sensor, once [`K210Board::attach_camera`] has found one.
+    fn camera(&mut self) -> HalResult<&mut dyn rustclr_hal::camera::Camera> {
+        self.camera
+            .as_mut()
+            .map(|c| c as &mut dyn rustclr_hal::camera::Camera)
+            .ok_or(HalError::NotSupported)
     }
 
     fn i2c(&mut self, bus: u8) -> HalResult<&mut dyn rustclr_hal::i2c::I2cBus> {

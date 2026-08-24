@@ -21,6 +21,20 @@ public partial class App : Application
             return;
         }
 
+        // Renders the window to PNGs for the documentation. Not headless in
+        // the way the modes below are — WPF has no headless platform, so the
+        // window really is shown, far off the left edge of the screen.
+        if (e.Args.Length >= 1 && Array.IndexOf(e.Args, "--screenshot") >= 0)
+        {
+            int index = Array.IndexOf(e.Args, "--screenshot");
+            string directory = index + 1 < e.Args.Length && !e.Args[index + 1].StartsWith("--")
+                ? e.Args[index + 1]
+                : System.IO.Path.Combine(AppContext.BaseDirectory, "screenshots");
+            int code = Screenshots.Capture(directory);
+            Shutdown(code);
+            return;
+        }
+
         // Headless: one assistant turn on stdout, so the model path can be
         // exercised (and scripted) without the window.
         if (e.Args.Length >= 1 && Array.IndexOf(e.Args, "--ask") >= 0)

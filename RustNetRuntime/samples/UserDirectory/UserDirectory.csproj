@@ -1,10 +1,17 @@
 <Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    A plain console project, on purpose. It exists to be run on both runtimes
+    and diffed byte for byte, so it references nothing that only one of them
+    has — see the note at the top of Program.cs.
+  -->
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net10.0</TargetFramework>
-    <Nullable>disable</Nullable>
+    <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <RootNamespace>UserDirectory</RootNamespace>
     <AssemblyName>UserDirectory</AssemblyName>
+    <RootNamespace>UserDirectory</RootNamespace>
   </PropertyGroup>
+
 </Project>

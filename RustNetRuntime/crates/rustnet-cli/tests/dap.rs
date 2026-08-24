@@ -292,8 +292,13 @@ fn the_whole_conformance_fixture_runs_under_the_adapter() {
         };
         printed.push_str(&message);
         if message.contains(r#""event":"terminated""#) {
+            // `failures=0`, not an exact check count. What this test is for is
+            // that the fixture ran *over the protocol* and its output survived
+            // framing; how many checks the fixture holds is the conformance
+            // test's business, and pinning the number here meant every new
+            // check broke a test about the debug adapter.
             assert!(
-                printed.contains("checks=345 failures=0"),
+                printed.contains("failures=0"),
                 "the fixture did not report a clean run:\n{printed}"
             );
             return;

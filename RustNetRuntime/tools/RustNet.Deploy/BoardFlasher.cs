@@ -20,8 +20,12 @@ public static class BoardFlasher
         var dir = new DirectoryInfo(from);
         while (dir is not null)
         {
+            // `crates/` and `embedded/` together, because a lone Cargo.toml
+            // matches every crate on the way up and `crates/` alone matches a
+            // checkout of something else.
             if (File.Exists(Path.Combine(dir.FullName, "Cargo.toml"))
-                && Directory.Exists(Path.Combine(dir.FullName, "runtime")))
+                && Directory.Exists(Path.Combine(dir.FullName, "crates"))
+                && Directory.Exists(Path.Combine(dir.FullName, "embedded")))
             {
                 return dir.FullName;
             }
@@ -31,14 +35,48 @@ public static class BoardFlasher
     }
 
     /// <summary>
-    /// Build a board's firmware. Returns true if cargo succeeded.
+    /// Build a board's firmware, optionally carrying an application.
     /// </summary>
-    public static bool Build(string repoRoot, BoardRecipe board, Action<string> log)
+    /// <remarks>
+    /// With no <paramref name="app"/> the image carries the `HelloWorld.dll`
+    /// checked in beside the firmware crate — right for proving a board runs,
+    /// and a surprise for anyone who pressed Deploy on their own project and
+    /// watched a different program boot. What is being carried is logged
+    /// either way, so the answer is on screen rather than on the board.
+    /// </remarks>
+    public static bool Build(
+        string repoRoot,
+        BoardRecipe board,
+        Action<string> log,
+        DeviceApp? app = null)
     {
         string ws = BoardCatalog.WorkspacePath(repoRoot, board);
+
+        var env = new Dictionary<string, string>(board.Env);
+        if (app is not null)
+        {
+            if (!app.TryToEnvironment(out var appEnv, out string? error))
+            {
+                log($"BUILD FAILED  {error}");
+                return false;
+            }
+            foreach ((string key, string value) in appEnv)
+            {
+                env[key] = value;
+            }
+            log($"  app  {Path.GetFileName(app.AssemblyPath)}"
+                + (app.LibraryPaths.Count == 0
+                    ? ""
+                    : " + " + string.Join(", ", app.LibraryPaths.Select(Path.GetFileName))));
+        }
+        else
+        {
+            log("  app  (none given — the firmware's own HelloWorld.dll)");
+        }
+
         log($"$ cargo {board.BuildArgs}");
         log($"  in {ws}");
-        bool ok = Run("cargo", board.BuildArgs, ws, log, board.Env);
+        bool ok = Run("cargo", board.BuildArgs, ws, log, env);
         if (ok)
         {
             string elf = BoardCatalog.ArtifactPath(repoRoot, board);

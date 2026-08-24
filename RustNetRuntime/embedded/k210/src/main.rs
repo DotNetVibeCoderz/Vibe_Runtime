@@ -40,10 +40,10 @@ static HELLO_WORLD: &[u8] = include_bytes!(env!("RUSTCLR_APP_PATH"));
 /// Assemblies the embedded program references, in dependency order.
 ///
 /// A board has no filesystem, so what a desktop finds beside the program has
-/// to be compiled in. `RUSTCLR_LIB1_PATH` and `RUSTCLR_LIB2_PATH` name them,
-/// and the build script turns each one that is set into a `cfg`. A program
-/// that references nothing — `HelloWorld` — sets neither and gets an empty
-/// list, which costs nothing.
+/// to be compiled in. `RUSTCLR_LIB1_PATH`..`RUSTCLR_LIB8_PATH` name them, and
+/// the build script turns each one that is set into a `cfg`. A program that
+/// references nothing — `HelloWorld` — sets none and gets an empty list, which
+/// costs nothing.
 static APP_LIBRARIES: &[&[u8]] = &[
     #[cfg(rustclr_lib1)]
     include_bytes!(env!("RUSTCLR_LIB1_PATH")),
@@ -51,6 +51,16 @@ static APP_LIBRARIES: &[&[u8]] = &[
     include_bytes!(env!("RUSTCLR_LIB2_PATH")),
     #[cfg(rustclr_lib3)]
     include_bytes!(env!("RUSTCLR_LIB3_PATH")),
+    #[cfg(rustclr_lib4)]
+    include_bytes!(env!("RUSTCLR_LIB4_PATH")),
+    #[cfg(rustclr_lib5)]
+    include_bytes!(env!("RUSTCLR_LIB5_PATH")),
+    #[cfg(rustclr_lib6)]
+    include_bytes!(env!("RUSTCLR_LIB6_PATH")),
+    #[cfg(rustclr_lib7)]
+    include_bytes!(env!("RUSTCLR_LIB7_PATH")),
+    #[cfg(rustclr_lib8)]
+    include_bytes!(env!("RUSTCLR_LIB8_PATH")),
 ];
 
 
@@ -70,14 +80,29 @@ const BAUD: u32 = 115_200;
 // The K210 is the one board with room to answer that — 6 MB of SRAM, of which
 // the firmware image and stack use well under one — so the budget is 4 MB.
 //
-// **2 MB, not 4.** The K210's general-purpose SRAM is two banks — 4 MB at
-// 0x80000000 and 2 MB at 0x80400000 — and `memory.x` describes them as one
-// region. A 4 MB heap puts this array across the boundary between them, and
-// the board went silent: it booted and never printed a character. 2 MB keeps
-// the whole array inside the first bank, with the firmware image below it and
-// the stack above, and it prints. The four-megabyte case is recorded in the
-// crate README rather than left as a number somebody will try again.
-const HEAP_BYTES: usize = 2 * 1024 * 1024;
+// **The array must not cross the bank boundary.** The K210's general-purpose
+// SRAM is two banks — 4 MB at 0x80000000 and 2 MB at 0x80400000 — and
+// `memory.x` describes them as one region. A 4 MB heap puts this array across
+// the boundary between them, and the board went silent: it booted and never
+// printed a character.
+//
+// 3 MB, measured rather than guessed. The array follows the firmware image, so
+// where it starts depends on how big that is; with the `Kiosk` sample and its
+// eight libraries compiled in it begins at 0x800C41E8, leaving 3.23 MB below
+// the boundary. 3 MB fits with a quarter of a megabyte to spare, and
+// [`BANK_BOUNDARY`] turns the failure into a printed refusal instead of a
+// silent board if a future image ever eats that margin.
+//
+// 2 MB was not enough: `Camera.Capture()` at 320x240 needs the frame three
+// times over — the DVP's destination, the bytes handed back, and the managed
+// `byte[]` — on top of a full BCL, eight assemblies and a 150 KB canvas.
+const HEAP_BYTES: usize = 3 * 1024 * 1024;
+
+/// Where the K210's second SRAM bank starts.
+///
+/// The banks are contiguous and the linker treats them as one region, so
+/// nothing stops an array being placed across the join — nothing except this.
+const BANK_BOUNDARY: usize = 0x8040_0000;
 
 #[global_allocator]
 static ALLOCATOR: LlffHeap = LlffHeap::empty();
@@ -253,12 +278,37 @@ impl rustclr_demo_common::Host for ConsoleHost {
 fn main() -> ! {
     // SAFETY: called once, before anything allocates. Only hart 0 gets here;
     // riscv-rt parks the second in `wfi`.
+    let heap_start = core::ptr::addr_of_mut!(HEAP_MEMORY) as usize;
     unsafe {
-        ALLOCATOR.init(core::ptr::addr_of_mut!(HEAP_MEMORY) as usize, HEAP_BYTES);
+        ALLOCATOR.init(heap_start, HEAP_BYTES);
     }
 
     let clock = cpu_hz();
     let mut console = Uarths::init(clock);
+
+    // Checked after the console exists, so it can be said rather than only
+    // suffered. A heap that straddles the bank boundary is the failure that
+    // produced a board which booted and printed nothing at all; printing this
+    // and stopping is strictly better than that, and the number to change is
+    // named.
+    if heap_start + HEAP_BYTES > BANK_BOUNDARY {
+        let _ = writeln!(
+            console,
+            "rustclr: the heap runs from {heap_start:#x} to {:#x}, past the SRAM bank",
+            heap_start + HEAP_BYTES
+        );
+        let _ = writeln!(
+            console,
+            "rustclr: boundary at {BANK_BOUNDARY:#x}. That layout has wedged this board before."
+        );
+        let _ = writeln!(
+            console,
+            "rustclr: lower HEAP_BYTES (currently {HEAP_BYTES}) or shrink the image."
+        );
+        loop {
+            riscv::asm::wfi();
+        }
+    }
 
     let mut detail = Detail::new();
     let _ = write!(
@@ -355,6 +405,32 @@ fn main() -> ! {
                 let _ = writeln!(console, "panel            rustclr: not brought up: {e}");
             }
         }
+        // The camera, after the panel: both bring-ups touch the same eight
+        // pads and the sensor probe leaves them routed to the DVP, so a panel
+        // brought up second would find its data lines gone.
+        match hardware.attach_camera() {
+            Some(sensor) => {
+                let _ = writeln!(console, "camera           rustclr: {sensor} on I2C2, DVP up");
+            }
+            // Not an error. A Maix Go with no ribbon attached is a normal
+            // board, and `Camera.Capture()` will say so in the program's own
+            // terms rather than here.
+            None => {
+                let _ = writeln!(console, "camera           rustclr: none found on I2C2");
+            }
+        }
+
+        // What is actually left, not what was budgeted. The two diverge by
+        // however much the boot self-tests and the panel's canvas took, and
+        // "the heap is 3 MB" is no help at all when a 150 KB frame will not
+        // fit.
+        let _ = writeln!(
+            console,
+            "heap free        {} bytes of {HEAP_BYTES} ({} used)",
+            ALLOCATOR.free(),
+            ALLOCATOR.used()
+        );
+
         rustclr_demo_common::run(
             &mut console,
             BOARD,

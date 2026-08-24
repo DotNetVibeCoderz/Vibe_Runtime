@@ -11,6 +11,10 @@ rustclr-metadata = { path = "../../crates/rustclr-metadata", default-features = 
 rustclr-gc = { path = "../../crates/rustclr-gc", default-features = false }
 # The board the firmware installs, so the demo can report what is underneath.
 rustclr-hal = { path = "../../crates/rustclr-hal", default-features = false }
+# The device protocol and the service that answers it, so a host tool can reach
+# a board while a program is running on it.
+rustclr-rndp = { path = "../../crates/rustclr-rndp" }
+rustclr-device = { path = "../../crates/rustclr-device" }
 rustclr-core = { path = "../../crates/rustclr-core", default-features = false }
 rustclr-bcl = { path = "../../crates/rustclr-bcl", default-features = false, features = [
     "libm-math",

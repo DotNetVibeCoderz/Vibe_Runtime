@@ -68,6 +68,12 @@ static ALLOCATOR: Counting = Counting;
 /// — including another test's. Cargo runs the tests in one binary on several
 /// threads by default, and two measurements at once produce a peak that
 /// belongs to neither.
+///
+/// **Every test in this file holds it, not only the ones that measure.** A
+/// test that merely builds an interpreter is still allocating, and if it does
+/// so inside another test's measured window its bytes land in that other
+/// test's number. The subset test below built two interpreters without this
+/// and made the full tier read 709,234 bytes instead of 385,070.
 static MEASURING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Peak live bytes while `build` runs. Call with [`MEASURING`] held.
@@ -172,5 +178,49 @@ fn the_minimal_tier_is_smaller_than_the_full_one() {
     assert!(
         minimal < full,
         "the minimal tier costs {minimal} against the full tier's {full}"
+    );
+}
+
+/// The full tier must offer everything the minimal tier does.
+///
+/// "Minimal" names a *subset*, and a board choosing the full tier because it
+/// has the memory for it must not thereby lose a binding. That inverted once:
+/// `install` guarded the networking bindings on `std` while `install_minimal`
+/// registered the offline ones unconditionally, so a board with plenty of RAM
+/// reported `bcl tier full` and then failed `Wifi.Connect` with "no
+/// implementation" — on the same hardware where the smaller tier worked.
+///
+/// Comparing the key sets rather than the counts, because a count can match
+/// while the contents differ.
+///
+/// **This runs under `std`, so it does not itself catch the `no_std`
+/// inversion described above** — the two tiers' networking is behind opposite
+/// `cfg`s, and a host test only ever sees the `std` side. What proved that one
+/// was a Maix Go. This guards the same invariant on the side a host can see.
+#[test]
+fn the_full_tier_offers_everything_the_minimal_tier_does() {
+    // Held for the same reason the measurements hold it: this allocates two
+    // whole interpreters, and the counter is global.
+    let _serialised = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut full = rustclr_core::Interpreter::with_host(Box::new(rustclr_core::CaptureHost::new()));
+    rustclr_bcl::install(&mut full);
+    let mut minimal =
+        rustclr_core::Interpreter::with_host(Box::new(rustclr_core::CaptureHost::new()));
+    rustclr_bcl::install_minimal(&mut minimal);
+
+    let full_keys = full.native_binding_keys();
+    let minimal_keys = minimal.native_binding_keys();
+    let missing: Vec<&str> = minimal_keys
+        .iter()
+        .filter(|k| !full_keys.contains(*k))
+        .map(|k| k.as_str())
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "the minimal tier binds {} things the full tier does not, so a board \
+         with more memory would lose them:\n  {}",
+        missing.len(),
+        missing.join("\n  ")
     );
 }

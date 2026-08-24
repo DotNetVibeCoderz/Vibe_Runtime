@@ -105,6 +105,19 @@ pub trait Board: Send {
     fn netif(&mut self, kind: netif::NetIfKind) -> HalResult<&mut dyn netif::NetInterface>;
     fn signal(&mut self, pin: u32) -> HalResult<&mut dyn signal::SignalControl>;
 
+    /// The board's image sensor, if it has one.
+    ///
+    /// Defaulted rather than required, because a camera is the one peripheral
+    /// here that most boards genuinely do not have: an STM32 Nucleo has no
+    /// sensor interface at all, and making every board write a stub that
+    /// returns `NotSupported` would be four copies of the same refusal. The
+    /// default *is* that refusal, so a board with a camera overrides it and a
+    /// board without one says `not supported` — which is what a program
+    /// calling `Camera.Capture()` needs to hear, rather than a made-up frame.
+    fn camera(&mut self) -> HalResult<&mut dyn camera::Camera> {
+        Err(HalError::NotSupported)
+    }
+
     /// Push a fully-rendered RGB565 framebuffer (row-major, `width`×`height`,
     /// native `u16` per pixel) to the board's physical panel, if it has one.
     /// Called on `Display.Present()`. Boards without a wired panel (the virtual

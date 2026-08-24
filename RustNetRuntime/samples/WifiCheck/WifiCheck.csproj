@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>WifiCheck</AssemblyName>
+    <RootNamespace>WifiCheck</RootNamespace>
+    <RustNetSdk Condition="'$(RustNetSdk)' == ''">$(MSBuildThisFileDirectory)../..</RustNetSdk>
+  </PropertyGroup>
+
+  <!--
+    Only the libraries this program uses, derived from what its source names.
+    A board registers every type in every assembly it loads, so a reference to
+    a library you do not call is metadata you pay for on a chip with kilobytes.
+  -->
+  <ItemGroup>
+    <ProjectReference Include="$(RustNetSdk)/managed/RustNet.Core/RustNet.Core.csproj" />
+    <ProjectReference Include="$(RustNetSdk)/managed/RustNet.Media/RustNet.Media.csproj" />
+    <ProjectReference Include="$(RustNetSdk)/managed/RustNet.Net/RustNet.Net.csproj" />
+  </ItemGroup>
+
+</Project>

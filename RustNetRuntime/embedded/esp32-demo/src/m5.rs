@@ -1,5 +1,5 @@
-//! The M5Stack Core2's panel: an AXP192 that gates its power, and an ILI9342C
-//! that draws.
+//! The M5Stack panel: an AXP192 that gates its power, and an ILI9342C that
+//! draws. Shared by the **Core2** and the **Tough**.
 //!
 //! Ported from the Gravicode RustNet ESP-IDF firmware, which drives this board
 //! through `esp-idf-svc`. The *register sequences* are the valuable part and
@@ -23,6 +23,14 @@
 //! ILI9342C SPI2, SCLK 18 / MOSI 23 / CS 5 / DC 15, 320x240 RGB565
 //! ```
 //!
+//! # Two boards, one difference
+//!
+//! The panel and its wiring are identical. The PMIC is not: **LDO3 is a rail
+//! on a Tough and the vibration motor on a Core2**, so a Core2 configured the
+//! Tough's way sits there buzzing. That single difference is what
+//! [`Variant`] carries, and it is why this is a runtime value rather than a
+//! `cfg` — one firmware image can be told which board it is on.
+//!
 //! # Differences from the reference worth stating
 //!
 //! The reference streams frames by DMA out of a bounce buffer, because its
@@ -41,6 +49,48 @@ use rustclr_hal::{HalError, HalResult};
 /// The PMIC's address on I2C0.
 const AXP192_ADDR: u8 = 0x34;
 
+/// Which M5 board this is.
+///
+/// Only the AXP192 differs, and only in what LDO3 drives.
+// One image is built for one board, so the other variant is always unused in
+// any given build. That is the point of the type, not a sign it is dead.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Variant {
+    /// LDO3 is the vibration motor. It is set to its lowest value and never
+    /// enabled — a Core2 powered the Tough's way buzzes continuously.
+    Core2,
+    /// LDO3 is an ordinary 3.0 V rail and is enabled with the rest.
+    Tough,
+}
+
+impl Variant {
+    fn name(self) -> &'static str {
+        match self {
+            Variant::Core2 => "M5Stack Core2",
+            Variant::Tough => "M5Stack Tough",
+        }
+    }
+
+    /// Register 0x28 — LDO2 in the upper nibble (the LCD rail, 3.3 V on both),
+    /// LDO3 in the lower.
+    fn ldo_voltages(self) -> u8 {
+        match self {
+            Variant::Core2 => 0xF0,
+            Variant::Tough => 0xFC,
+        }
+    }
+
+    /// Bits to OR into register 0x12: DCDC3 (backlight), LDO2 (LCD), EXTEN,
+    /// and LDO3 on a Tough only.
+    fn power_enable(self) -> u8 {
+        match self {
+            Variant::Core2 => 0x46,
+            Variant::Tough => 0x4E,
+        }
+    }
+}
+
 pub const PANEL_WIDTH: u32 = 320;
 pub const PANEL_HEIGHT: u32 = 240;
 
@@ -55,7 +105,11 @@ const BAND_ROWS: usize = 40;
 /// Every write here is read-modify-write where the datasheet says other bits in
 /// the register matter — `DCDC1` in particular carries the ESP32's own supply,
 /// and clearing it turns the board off mid-configuration.
-fn axp192_init<'a>(i2c: &mut I2c<'a, esp_hal::Blocking>, delay: &Delay) -> HalResult<()> {
+fn axp192_init<'a>(
+    i2c: &mut I2c<'a, esp_hal::Blocking>,
+    delay: &Delay,
+    variant: Variant,
+) -> HalResult<()> {
     let read = |i2c: &mut I2c<'a, esp_hal::Blocking>, reg: u8| -> HalResult<u8> {
         let mut byte = [0u8; 1];
         i2c.write_read(AXP192_ADDR, &[reg], &mut byte)
@@ -74,10 +128,8 @@ fn axp192_init<'a>(i2c: &mut I2c<'a, esp_hal::Blocking>, delay: &Delay) -> HalRe
     let v = read(i2c, 0x35)?;
     write(i2c, 0x35, (v & 0x1C) | 0xA2)?;
     write(i2c, 0x82, 0xFF)?;
-    // LDO2 = 3.3 V (the LCD rail) in the upper nibble. LDO3 is the Core2's
-    // vibration motor, so it gets the lowest setting and is never enabled
-    // below — a Core2 that powers LDO3 the way a Tough does sits there buzzing.
-    write(i2c, 0x28, 0xF0)?;
+    // LDO2 = 3.3 V (the LCD rail). LDO3 depends on the board — see `Variant`.
+    write(i2c, 0x28, variant.ldo_voltages())?;
     // DCDC3 = 3.0 V, which is where this unit routes the backlight.
     let v = read(i2c, 0x27)?;
     write(i2c, 0x27, (v & 0x80) | 0x5C)?;
@@ -90,10 +142,11 @@ fn axp192_init<'a>(i2c: &mut I2c<'a, esp_hal::Blocking>, delay: &Delay) -> HalRe
     let v = read(i2c, 0x95)?;
     write(i2c, 0x95, (v & 0x72) | 0x84)?;
     // Power-output enable: DCDC3 (bit 1, backlight), LDO2 (bit 2, LCD),
-    // EXTEN (bit 6). `DCDC1` (bit 0) is preserved because it is the ESP32's
-    // own supply.
+    // EXTEN (bit 6), and LDO3 (bit 3) on a Tough. `DCDC1` (bit 0) is preserved
+    // because it is the ESP32's own supply — clearing it turns the board off
+    // half way through its own configuration.
     let v = read(i2c, 0x12)?;
-    write(i2c, 0x12, v | 0x46)?;
+    write(i2c, 0x12, v | variant.power_enable())?;
     // Reset pulse on the PMIC's GPIO3/GPIO4: low, wait, high. Both bits,
     // because which one gates reset differs between M5 revisions.
     write(i2c, 0x96, 0x00)?;
@@ -104,7 +157,7 @@ fn axp192_init<'a>(i2c: &mut I2c<'a, esp_hal::Blocking>, delay: &Delay) -> HalRe
 }
 
 /// The panel.
-pub struct M5Core2Panel<'a> {
+pub struct M5Panel<'a> {
     spi: Spi<'a, esp_hal::Blocking>,
     dc: Output<'a>,
     cs: Output<'a>,
@@ -113,7 +166,7 @@ pub struct M5Core2Panel<'a> {
     band: alloc::vec::Vec<u8>,
 }
 
-impl<'a> M5Core2Panel<'a> {
+impl<'a> M5Panel<'a> {
     /// Powers the panel through the PMIC and initialises the controller.
     ///
     /// The I2C bus is consumed: the AXP192 is the only thing on it that this
@@ -123,9 +176,10 @@ impl<'a> M5Core2Panel<'a> {
         spi: Spi<'a, esp_hal::Blocking>,
         dc: Output<'a>,
         cs: Output<'a>,
+        variant: Variant,
     ) -> HalResult<Self> {
         let delay = Delay::new();
-        axp192_init(&mut i2c, &delay)?;
+        axp192_init(&mut i2c, &delay, variant)?;
 
         let mut panel = Self {
             spi,
@@ -364,18 +418,34 @@ impl rustclr_hal::rtc::Rtc for NoRtc {
 /// but this driver does not drive answers `NotSupported`, which is what the
 /// HAL report prints — a board that claimed a bus it cannot use would be worse
 /// than one that says no.
-pub struct M5Core2Board<'a> {
-    panel: Option<M5Core2Panel<'a>>,
+pub struct M5Board<'a> {
+    panel: Option<M5Panel<'a>>,
+    /// UART0, shared with the console. `None` when the firmware could not
+    /// take it, in which case the board honestly has no serial port.
+    uart: Option<crate::uart::Esp32Uart>,
+    /// The `storage` partition, when the firmware could find it. `None`
+    /// leaves the board honestly without storage rather than writing to a
+    /// guessed offset.
+    flash: Option<crate::flash::EspFlash>,
+    variant: Variant,
     delay: CoreDelay,
     watchdog: NoWatchdog,
     power: NoPower,
     rtc: NoRtc,
 }
 
-impl<'a> M5Core2Board<'a> {
-    pub fn new(panel: Option<M5Core2Panel<'a>>) -> Self {
+impl<'a> M5Board<'a> {
+    pub fn new(
+        panel: Option<M5Panel<'a>>,
+        variant: Variant,
+        uart: Option<crate::uart::Esp32Uart>,
+        flash: Option<crate::flash::EspFlash>,
+    ) -> Self {
         Self {
             panel,
+            uart,
+            flash,
+            variant,
             delay: CoreDelay(Delay::new()),
             watchdog: NoWatchdog,
             power: NoPower,
@@ -392,9 +462,9 @@ macro_rules! unsupported {
     };
 }
 
-impl rustclr_hal::Board for M5Core2Board<'_> {
+impl rustclr_hal::Board for M5Board<'_> {
     fn name(&self) -> &str {
-        "M5Stack Core2"
+        self.variant.name()
     }
 
     fn gpio(&mut self, _pin: u32) -> HalResult<&mut dyn rustclr_hal::gpio::GpioPin> {
@@ -405,13 +475,40 @@ impl rustclr_hal::Board for M5Core2Board<'_> {
 
     unsupported!(i2c, dyn rustclr_hal::i2c::I2cBus);
     unsupported!(spi, dyn rustclr_hal::spi::SpiBus);
-    unsupported!(uart, dyn rustclr_hal::uart::Uart);
+    /// Port 0 is UART0, which is also the console -- see [`crate::uart`].
+    /// There is no port 1 or 2 here: those pins are not broken out on these
+    /// boards, so offering them would be offering something unreachable.
+    fn uart(&mut self, port: u8) -> HalResult<&mut dyn rustclr_hal::uart::Uart> {
+        if port != 0 {
+            return Err(HalError::InvalidArgument("this board exposes UART0 only"));
+        }
+        self.uart
+            .as_mut()
+            .map(|u| u as &mut dyn rustclr_hal::uart::Uart)
+            .ok_or(HalError::NotSupported)
+    }
     unsupported!(i2s, dyn rustclr_hal::i2s::I2sBus);
     unsupported!(pwm, dyn rustclr_hal::pwm::PwmChannel);
     unsupported!(adc, dyn rustclr_hal::adc::AdcChannel);
     unsupported!(can, dyn rustclr_hal::can::CanBus);
     unsupported!(onewire, dyn rustclr_hal::onewire::OneWireBus);
-    unsupported!(extmem, dyn rustclr_hal::extmem::ExtMemory);
+    /// Window 1 is the `storage` partition -- see [`crate::flash`].
+    ///
+    /// Window 0 is deliberately absent. On the K210 it is the firmware's own
+    /// record store, kept separate so a filesystem that fills up and compacts
+    /// cannot erase the records; this board has no such store, and offering
+    /// the same region under two numbers would let one erase the other.
+    fn extmem(&mut self, index: u8) -> HalResult<&mut dyn rustclr_hal::extmem::ExtMemory> {
+        if index != 1 {
+            return Err(HalError::InvalidArgument(
+                "this board has one flash window, index 1 (the storage partition)",
+            ));
+        }
+        self.flash
+            .as_mut()
+            .map(|f| f as &mut dyn rustclr_hal::extmem::ExtMemory)
+            .ok_or(HalError::NotSupported)
+    }
 
     fn power(&mut self) -> &mut dyn rustclr_hal::power::PowerManager {
         &mut self.power

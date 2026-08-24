@@ -2,6 +2,16 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
+/// How many referenced assemblies a firmware image can carry.
+///
+/// `include_bytes!` needs a literal path per file, so each slot is a written-out
+/// line in `main.rs` rather than a loop — which is why this is a small fixed
+/// number and not "as many as you like". Eight is what the `Kiosk` sample needs
+/// (Core, Graphics, Hal, IO, Media, Net, Serialization, UI); a program wanting
+/// more is refused here, at build time, rather than failing to resolve a token
+/// on a board with no debugger attached.
+const MAX_LIBRARIES: usize = 8;
+
 fn main() {
     // cortex-m-rt's link.x takes MEMORY from a memory.x on the link search
     // path, so it has to be copied where the linker will find it.
@@ -41,14 +51,14 @@ fn main() {
     //
     //     RUSTCLR_APP=MyApp.dll     //     RUSTCLR_LIB1=RustNet.Core.dll     //     RUSTCLR_LIB2=RustNet.Graphics.dll cargo build --release
     //
-    // Three is the current ceiling because `include_bytes!` needs one literal
-    // per file and the list has to be written out. `mqtt-dashboard` uses all
-    // three; a program needing more says so at build time rather than failing
-    // to resolve a token on the board.
-    println!("cargo::rustc-check-cfg=cfg(rustclr_lib1)");
-    println!("cargo::rustc-check-cfg=cfg(rustclr_lib2)");
-    println!("cargo::rustc-check-cfg=cfg(rustclr_lib3)");
-    for (n, var) in [(1, "RUSTCLR_LIB1"), (2, "RUSTCLR_LIB2"), (3, "RUSTCLR_LIB3")] {
+    // The ceiling is [`MAX_LIBRARIES`], and a program needing more says so at
+    // build time rather than failing to resolve a token on the board.
+    for n in 1..=MAX_LIBRARIES {
+        println!("cargo::rustc-check-cfg=cfg(rustclr_lib{n})");
+    }
+    for n in 1..=MAX_LIBRARIES {
+        let var = format!("RUSTCLR_LIB{n}");
+        let var = var.as_str();
         println!("cargo:rerun-if-env-changed={var}");
         if let Some(path) = env::var_os(var) {
             let path = PathBuf::from(path);

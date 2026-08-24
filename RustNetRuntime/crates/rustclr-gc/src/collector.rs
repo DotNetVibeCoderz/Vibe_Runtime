@@ -45,6 +45,33 @@ pub struct HeapPressure {
     pub live_bytes: usize,
     pub live_count: usize,
     pub bytes_since_last_collection: usize,
+    /// Slots the heap may ever hold, on a heap that is bounded by slots.
+    ///
+    /// A bounded heap can run out two ways, and for a long time a policy could
+    /// only see one of them. Bytes are what a desktop runs out of; a board
+    /// hits the **slot ceiling** first, because the ceiling is paid for up
+    /// front and sized to fit the RAM rather than to fit the program. A loop
+    /// allocating short-lived 12-byte objects fills 512 slots while live bytes
+    /// stay under any sane byte threshold, so a byte-only policy is never
+    /// asked, the ceiling is reached, and the allocation fails on a heap that
+    /// was almost entirely garbage.
+    ///
+    /// That is not hypothetical: it killed `Showcase` on a Maix Go after two
+    /// passes through its scene loop.
+    pub slot_limit: Option<usize>,
+}
+
+impl HeapPressure {
+    /// How full the slot table is, from 0.0 to 1.0, on a bounded heap.
+    ///
+    /// `None` on an unbounded one — there is no ceiling to be near.
+    pub fn slot_occupancy(&self) -> Option<f32> {
+        let limit = self.slot_limit?;
+        if limit == 0 {
+            return Some(1.0);
+        }
+        Some(self.live_count as f32 / limit as f32)
+    }
 }
 
 /// A collection policy.
@@ -84,6 +111,16 @@ impl Default for MarkSweep {
 }
 
 impl MarkSweep {
+    /// How full a bounded slot table gets before a collection is asked for.
+    ///
+    /// Three quarters, not the last slot. Collecting at the ceiling means the
+    /// allocation that triggered it has nowhere to go if the collection frees
+    /// nothing, and leaves no headroom for the collector's own bookkeeping.
+    /// Three quarters of 512 slots is 128 slots of room, which is more than a
+    /// mark phase needs and enough that a program whose live set genuinely is
+    /// that large still gets a straight answer instead of thrashing.
+    pub const SLOT_TRIGGER: f32 = 0.75;
+
     /// A configuration tuned for memory-constrained targets.
     pub fn embedded() -> Self {
         Self {
@@ -100,6 +137,14 @@ impl Collector for MarkSweep {
     }
 
     fn should_collect(&self, pressure: &HeapPressure) -> bool {
+        // Running low on slots is pressure on its own, and it deliberately
+        // ignores `minimum_heap`: that threshold exists to stop a tiny heap
+        // thrashing, and a heap this close to its ceiling is not a heap with
+        // room to spare. See [`HeapPressure::slot_limit`] for what goes wrong
+        // without this.
+        if pressure.slot_occupancy().is_some_and(|used| used >= Self::SLOT_TRIGGER) {
+            return true;
+        }
         pressure.live_bytes > self.minimum_heap
             && pressure.bytes_since_last_collection >= self.allocation_trigger
     }

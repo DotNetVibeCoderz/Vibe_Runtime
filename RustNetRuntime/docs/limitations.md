@@ -1114,7 +1114,7 @@ entitled to ask.
 
 | | |
 | --- | --- |
-| Only the peripherals listed above are bound | The trait crate also describes I2S, CAN, 1-Wire, RTC, external memory, network interfaces, timed signals and cameras. They have no managed bindings yet, so a C# program cannot reach them |
+| Only the peripherals listed above are bound | The trait crate also describes I2S, CAN, 1-Wire, RTC, external memory, timed signals and network interfaces. They have no managed bindings yet, so a C# program cannot reach them. Cameras *are* bound — `RustNet.Media.Camera` — on the host simulator and the Maix Go's OV2640 |
 | One board per interpreter | A worker thread's interpreter does not carry the board across, so a `Task.Run` that touches a pin throws. The same rule as the debugger and the profiler |
 | The simulator is not a chip | Timings are not real, an ADC reads what was written to it, and an I2C bus with nothing attached NACKs. It catches "this program calls a peripheral this board does not have" and it does not catch a race with a sensor's conversion time |
 
@@ -1151,6 +1151,43 @@ vendoring step.
 | A (key, counter) pair must never be reused | Reusing one XORs two plaintexts together and both are recoverable. Nothing here can check that — it does not know what came before — so it is stated rather than implied away |
 | Not hardened against physical attack | The AES here is straightforward and table-free. It is not written to resist power analysis by somebody holding the board |
 | Keys are 16 or 32 bytes | A key of another length is refused, not padded. A five-byte password stretched into a 128-bit key is a five-byte password |
+
+### The ESP32's second RAM bank
+
+`embedded/esp32-demo` gives the allocator 176 KB of `dram_seg` plus 96 KB
+reclaimed from `dram2_seg`. **That second bank is not entirely free**, and the
+boundary was inherited from the segment size rather than measured.
+
+It holds for a small program — an M5Stack Tough ran `HelloWorld` from it — and
+corrupts once RustBCL has taken its share and a program loads assemblies of its
+own. On a Tough that surfaced as an `Image` whose bytes were byte-perfect and
+whose stored metadata range had been overwritten between two calls; on a Core2
+as `LoadProhibited`. Building with `--features one-bank` leaves the bank alone,
+and the same board then reports `bcl tier none - SKIPPED` and keeps running.
+
+So an ESP32 today reads metadata and collects garbage, and cannot execute IL
+without a bank that is unsafe under load. Both M5 boards have PSRAM, which
+would settle it — except `esp-alloc` documents ESP32 atomics as broken in
+PSRAM, and the collector and safepoints are built on atomics.
+
+### Deploying from the tools
+
+`RustNet.Deploy`'s catalog builds and flashes every board this repository has
+firmware for, and the Workbench and CodeGen both go through it. What it does
+**not** do is put an application on a running device: the reference's tools
+deploy over RNDP, a serial protocol, and this runtime's firmware does not
+speak it. An application reaches a board by being compiled into the firmware
+image and reflashed. `DeviceApp` is how a tool says which one; a build given
+none carries the `HelloWorld.dll` beside the firmware crate, and says so.
+
+**Three libraries at most.** `include_bytes!` needs one literal per file and
+the list is written out in each firmware's `main.rs`, so a fourth is a change
+to the firmware rather than a bigger number — and it is refused at build time
+rather than failing to resolve a token on the board.
+
+CodeGen keeps its own copy of the board list for its UI. Two tables drift, and
+this one had: its tier thresholds were the pre-device numbers until the M5
+boards were added. They are checked against each other by hand today.
 
 ### Secure boot and OTA
 
@@ -1218,6 +1255,35 @@ answer here as there. Invalid UTF-8 decodes lossily to U+FFFD, as
 offered rather than being offered and quietly behaving like the lossy one.
 
 ---
+
+## The device protocol on a board
+
+`rustnet serve` is a full RNDP endpoint and the host tools talk to it
+completely. A **board** is more limited, and differently limited per chip.
+
+| Limitation | Why |
+| --- | --- |
+| On a **K210**, a program that spends its time inside native calls misses requests | The service is polled from the interpreter's instruction loop, and instructions differ by four orders of magnitude: `add` is nanoseconds, `Display.Present()` is one IL `call` costing tens of milliseconds inside a binding. Whatever arrives meanwhile has to survive in hardware until the next poll, and the K210's UARTHS FIFO is **eight bytes** — less than the nine-byte minimum frame — so a request is *truncated* rather than delayed. Measured on a Maix Go: `HelloWorld` answers every command, `Showcase` answers none, and tightening the poll interval from 4096 instructions to 256 changed nothing, which confirms the FIFO rather than the cadence. The ESP32's FIFO is 128 bytes and an M5Stack answers the same program fine. The K210 fix is interrupt-driven receive into a ring buffer, which is not written |
+| `GET_LOGS` shows nothing from a program that never returns | A stored application runs against a `CaptureHost`, which buffers: the board's console belongs to the firmware, and handing it to an application would put two owners on one UART that also carries this protocol. Its output is folded into the log when it *returns*, so a program that loops forever contributes only the firmware's own start/exit events |
+| An ESP32 board needs its partition table flashed | The `storage` partition is found by type in the table at `0x8000`, not assumed at an offset. A board flashed without `--partition-table partitions.csv` has no such partition, and says so rather than writing to a guessed address — the failure mode of a wrong flash offset is a firmware that overwrites itself |
+| The Raspberry Pi Pico can answer but cannot store applications | Its HAL has a UART and no `extmem` window. `FLASH_APP` and `LIST_APPS` refuse by name; everything else works |
+| The Maix Go can answer but has no storage window attached | `K210Board::attach_files` exists and the firmware does not call it. Attaching it means writing the board's SPI flash, which on a development board holds whatever firmware was there before — a decision for whoever owns the board, not a default |
+| OTA, the debugger commands and the config store are refused by name | They need a second flash slot, a running-program hook and a settings format. An unimplemented command answering `OK` would make the Workbench show a feature that is not there |
+| Opening a serial port resets a K210 booted into SRAM | `kflash -s` leaves the image in RAM only, and the FTDI bridge asserts DTR when the port opens whatever the host asks for. `SerialTransport` now clears both lines *before* opening, which is necessary but on this bridge not sufficient — so the C# client still cannot reach a Maix Go running an SRAM image |
+
+## Cameras
+
+`RustNet.Media.Camera` reaches an image sensor through `Board::camera()`. Two
+boards implement it: the host simulator's colour-bar test sensor, and the Maix
+Go's OV2640 over the K210's DVP block.
+
+| Limitation | Why |
+| --- | --- |
+| A board without a sensor throws rather than returning a blank frame | Every pixel black is a *plausible* frame — a covered lens looks like that — so a bring-up check would pass on hardware with no sensor attached. `Board::camera` defaults to `NotSupported` and the binding says which board |
+| The OV2640's geometry must be a multiple of 8 | The sensor's output scaler stores both sizes divided by four, and the DVP transfers eight pixels a burst. A size it cannot express would be silently truncated into a frame of the wrong stride, so it is refused with the reason |
+| A capture and a display blit cannot overlap on the K210 | The eight DVP data pads are the eight the panel is driven through; whichever was routed last owns them. `capture` takes them and gives them back, so a program can capture then `Present` — but not stream both |
+| A 320x240 capture needs 300 KB live at its peak | The DVP's destination buffer, and the managed `byte[]` built from it. On a Maix Go with a full BCL, eight assemblies and a 150 KB canvas, that does not fit in the 3 MB heap — `Samples/Kiosk` reaches exactly this |
+| No exposure, gain, white balance or frame rate control | The bring-up tables set the sensor once. The registers exist; nothing is bound to them |
 
 ## Profiling
 
