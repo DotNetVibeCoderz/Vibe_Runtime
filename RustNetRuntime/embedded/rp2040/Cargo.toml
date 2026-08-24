@@ -12,6 +12,8 @@ publish = false
 
 [dependencies]
 rustclr-demo-common = { path = "../demo-common" }
+# Real RP2040 peripherals.
+rustclr-hal-rp2040 = { path = "../../crates/rustclr-hal-rp2040", default-features = false }
 
 cortex-m = "0.7"
 cortex-m-rt = "0.7"

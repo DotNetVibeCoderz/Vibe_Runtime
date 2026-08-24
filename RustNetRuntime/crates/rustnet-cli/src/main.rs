@@ -4,6 +4,8 @@
 
 mod args;
 mod commands;
+mod dap;
+mod json;
 
 use args::Command;
 use std::process::ExitCode;
@@ -74,6 +76,7 @@ fn run() -> ExitCode {
             jit_threshold,
             inline,
             minimal_bcl,
+            board,
         } => commands::run(
             &assembly,
             args,
@@ -84,13 +87,17 @@ fn run() -> ExitCode {
             jit_threshold,
             inline,
             minimal_bcl,
+            board.as_deref(),
         ),
         Command::Info { assembly, verbose } => commands::info(&assembly, verbose),
         Command::Disasm { assembly, filter } => commands::disasm(&assembly, filter.as_deref()),
         Command::Verify { assembly } => commands::verify(&assembly),
         Command::Jit { assembly } => commands::jit(&assembly),
-        Command::Debug { assembly, breakpoints, step } => {
-            commands::debug(&assembly, &breakpoints, step)
+        Command::Profile { assembly, args, top, period_us, json, jit } => {
+            commands::profile(&assembly, args, top, period_us, json, jit)
+        }
+        Command::Debug { assembly, breakpoints, step, dap } => {
+            commands::debug(&assembly, &breakpoints, step, dap)
         }
         Command::Build { project, configuration, run } => {
             commands::build(&project, &configuration, run)

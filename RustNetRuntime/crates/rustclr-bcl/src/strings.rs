@@ -1,13 +1,14 @@
 //! `System.String`, `System.Char` and `System.Text.StringBuilder`.
 
 use crate::support::*;
-use rustclr_core::{ClrObject, ClrString, ExecResult, Interpreter, Value};
+use rustclr_core::{ClrObject, ClrString, ExecResult, ExecutionError, Interpreter, Value};
 use rustclr_gc::Handle;
 
 #[allow(unused_imports)]
 use crate::prelude::*;
 
 pub fn register(interp: &mut Interpreter) {
+    register_encoding(interp);
     // -- String --------------------------------------------------------------
     interp.register_native("System.String::get_Length()", |i, a| {
         let s = arg_string_or_empty(i, a, 0)?;
@@ -67,6 +68,44 @@ pub fn register(interp: &mut Interpreter) {
         }
         Ok(Some(string_value(i, &out)))
     });
+    // `string.Concat(a, b, c, d, e)` on .NET 9 and later.
+    //
+    // The `params string[]` overload is gone from the ref assembly: Roslyn now
+    // binds to `params ReadOnlySpan<string>`, builds the arguments into an
+    // inline-array buffer and passes a span over it. The declaring type of
+    // that parameter is a `TypeSpec` this loader renders as a raw token, so
+    // the qualified-name key cannot be written down — the arity key can, and
+    // it is tried second for exactly this kind of case.
+    //
+    // Registered *after* the two typed one-argument overloads above, which are
+    // matched first by qualified name, so this only sees the span form.
+    interp.register_native("System.String::Concat/1", |i, a| {
+        let value = arg(i, a, 0)?;
+        // Three shapes reach here, and only the first is new: a
+        // `ReadOnlySpan<string>` window (.NET 9 and later), a `string[]`, or a
+        // single value. A span is a window rather than an array, so it is read
+        // through `spans`, which owns that layout.
+        let parts = crate::spans::window_values(i, value.clone())
+            .or_else(|| match &value {
+                Value::Obj(h) if !h.is_null() => {
+                    let values = array_values(i, *h);
+                    if values.is_empty() { None } else { Some(values) }
+                }
+                _ => None,
+            });
+        let out = match parts {
+            Some(values) => {
+                let mut out = String::new();
+                for part in values {
+                    out.push_str(&display(i, &part));
+                }
+                out
+            }
+            None => display(i, &value),
+        };
+        Ok(Some(string_value(i, &out)))
+    });
+
     interp.register_native("System.String::Concat(object[])", |i, a| {
         let array = arg_handle(i, a, 0)?;
         let parts = array_values(i, array);
@@ -791,4 +830,112 @@ fn read_span(interp: &mut Interpreter, value: Value) -> String {
             _ => String::new(),
         },
     }
+}
+
+/// `System.Text.Encoding`, for the two encodings a device actually uses.
+///
+/// UTF-8 and ASCII, and nothing else. Every wire format an embedded program
+/// meets — an MQTT payload, an HTTP body, a JSON document, a sensor's serial
+/// protocol — is one of those two, and the rest of .NET's encoding table is
+/// several hundred kilobytes of code-page data that would not fit on the
+/// boards this targets.
+///
+/// The instance carries its code page in field 0, so `Encoding.ASCII` and
+/// `Encoding.UTF8` are genuinely different objects rather than one object that
+/// behaves like whichever was asked for last.
+fn register_encoding(interp: &mut Interpreter) {
+    /// Code pages, matching .NET's own numbers so a program that prints
+    /// `Encoding.UTF8.CodePage` sees what it would elsewhere.
+    const UTF8: i32 = 65001;
+    const ASCII: i32 = 20127;
+
+    fn encoding_instance(interp: &mut Interpreter, code_page: i32) -> ExecResult<Value> {
+        let ty = interp
+            .loader
+            .registry
+            .find_type_by_name("System.Text.Encoding")
+            .ok_or_else(|| {
+                ExecutionError::exception(
+                    rustclr_core::ClrExceptionKind::TypeLoad,
+                    "System.Text.Encoding is not registered",
+                )
+            })?;
+        let handle = interp.alloc_object(ty);
+        interp.heap.with_mut::<ClrObject, _>(handle, |o| {
+            if o.fields.is_empty() {
+                o.fields.push(Value::I32(code_page));
+            } else {
+                o.fields[0] = Value::I32(code_page);
+            }
+        });
+        Ok(Value::Obj(handle))
+    }
+
+    /// The code page of the receiver, defaulting to UTF-8.
+    ///
+    /// A receiver whose field was never set reads as UTF-8 rather than as
+    /// zero-and-therefore-nothing: that is the encoding every other default in
+    /// .NET picks, so it is the one that cannot surprise anybody.
+    fn code_page_of(interp: &mut Interpreter, args: &[Value]) -> i32 {
+        let handle = args.first().and_then(|v| v.as_handle()).unwrap_or_default();
+        interp
+            .heap
+            .with::<ClrObject, _>(handle, |o| {
+                o.fields.first().and_then(|v| v.as_i32()).unwrap_or(UTF8)
+            })
+            .unwrap_or(UTF8)
+    }
+
+    interp.register_native("System.Text.Encoding::get_UTF8()", |i, _a| {
+        Ok(Some(encoding_instance(i, UTF8)?))
+    });
+    interp.register_native("System.Text.Encoding::get_ASCII()", |i, _a| {
+        Ok(Some(encoding_instance(i, ASCII)?))
+    });
+    interp.register_native("System.Text.Encoding::get_CodePage()", |i, a| {
+        Ok(Some(Value::I32(code_page_of(i, a))))
+    });
+
+    interp.register_native("System.Text.Encoding::GetBytes(string)", |i, a| {
+        let text = arg_string_or_empty(i, a, 1)?;
+        let bytes: Vec<u8> = if code_page_of(i, a) == ASCII {
+            // .NET's ASCII encoder substitutes `?` for anything above U+007F
+            // rather than failing. Matching that matters: a program that
+            // round-trips through ASCII gets the same result here as there.
+            text.chars()
+                .map(|c| if (c as u32) < 0x80 { c as u8 } else { b'?' })
+                .collect()
+        } else {
+            text.into_bytes()
+        };
+        let array = byte_array(i, &bytes);
+        Ok(Some(Value::Obj(array)))
+    });
+
+    interp.register_native("System.Text.Encoding::GetString(byte[])", |i, a| {
+        let bytes = arg_bytes(i, a, 1)?;
+        let text = if code_page_of(i, a) == ASCII {
+            bytes
+                .iter()
+                .map(|b| if *b < 0x80 { *b as char } else { '?' })
+                .collect::<String>()
+        } else {
+            // Lossy, as .NET's UTF8Encoding is by default: an invalid sequence
+            // becomes U+FFFD rather than throwing. `Encoding.UTF8` with
+            // `throwOnInvalidBytes` is the strict one, and it is not offered
+            // here rather than being offered and quietly behaving like this.
+            String::from_utf8_lossy(&bytes).into_owned()
+        };
+        Ok(Some(string_value(i, &text)))
+    });
+
+    interp.register_native("System.Text.Encoding::GetByteCount(string)", |i, a| {
+        let text = arg_string_or_empty(i, a, 1)?;
+        let count = if code_page_of(i, a) == ASCII {
+            text.chars().count()
+        } else {
+            text.len()
+        };
+        Ok(Some(Value::I32(count as i32)))
+    });
 }

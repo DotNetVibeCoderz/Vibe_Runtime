@@ -1,0 +1,7 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>Pins, buses and the board underneath</Description>
+  </PropertyGroup>
+
+</Project>

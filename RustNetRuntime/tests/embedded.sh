@@ -24,7 +24,14 @@ cd "$ROOT" || exit 1
 #
 # `rustnet-cli` and `rustclr-jit` are not here and are not meant to be: one is
 # a command-line program and the other maps executable pages.
-CRATES="${CRATES:-rustclr-metadata rustclr-gc rustclr-core rustclr-bcl}"
+# The device layers are here too, and for the same reason the runtime is: a
+# crate that only builds on a desktop is a crate a board cannot use, and the
+# way that gets noticed is a firmware build failing weeks later.
+#
+# `rustclr-net` is deliberately absent: its transport is `std::net` sockets and
+# `std::thread`, which a board does not have. The codec a board needs — MQTT —
+# is `rustclr-mqtt`, a separate crate precisely so it builds here.
+CRATES="${CRATES:-rustclr-metadata rustclr-gc rustclr-core rustclr-bcl rustclr-hal rustclr-flashfs rustclr-crypto rustclr-diag rustclr-mqtt rustclr-usb rustclr-db rustclr-secureboot rustclr-ota rustclr-gfx}"
 
 TARGETS="${TARGETS:-thumbv7em-none-eabihf thumbv6m-none-eabi riscv32imc-unknown-none-elf riscv64gc-unknown-none-elf}"
 

@@ -1,0 +1,20 @@
+[package]
+name = "rustclr-gfx"
+description = "RGB565 framebuffer graphics, primitives, an 8x8 font, and panel drivers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rustclr-hal = { path = "../rustclr-hal", version = "0.1.0", default-features = false }
+
+[features]
+default = ["std"]
+std = ["rustclr-hal/std"]
+
+[dev-dependencies]
+# The simulated board the driver tests push pixels at.
+rustclr-hal-host = { path = "../rustclr-hal-host", version = "0.1.0" }

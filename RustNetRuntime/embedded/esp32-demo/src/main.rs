@@ -33,12 +33,32 @@ extern crate alloc;
 use esp_backtrace as _;
 use esp_hal::main;
 
+#[cfg(feature = "board-m5core2")]
+mod m5core2;
+
 
 /// The assembly to read, compiled by Roslyn for `net10.0` and linked into
 /// flash. `HelloWorld.dll` by default — 4,608 bytes, small enough that the
 /// whole image sits in the binary — or whatever `RUSTCLR_APP` named at
 /// build time. See `build.rs`.
 static HELLO_WORLD: &[u8] = include_bytes!(env!("RUSTCLR_APP_PATH"));
+
+/// Assemblies the embedded program references, in dependency order.
+///
+/// A board has no filesystem, so what a desktop finds beside the program has
+/// to be compiled in. `RUSTCLR_LIB1_PATH` and `RUSTCLR_LIB2_PATH` name them,
+/// and the build script turns each one that is set into a `cfg`. A program
+/// that references nothing — `HelloWorld` — sets neither and gets an empty
+/// list, which costs nothing.
+static APP_LIBRARIES: &[&[u8]] = &[
+    #[cfg(rustclr_lib1)]
+    include_bytes!(env!("RUSTCLR_LIB1_PATH")),
+    #[cfg(rustclr_lib2)]
+    include_bytes!(env!("RUSTCLR_LIB2_PATH")),
+    #[cfg(rustclr_lib3)]
+    include_bytes!(env!("RUSTCLR_LIB3_PATH")),
+];
+
 
 // The ESP-IDF second-stage bootloader reads a descriptor out of the image
 // header — version, project name, build time — and refuses an image without
@@ -117,7 +137,58 @@ fn main() -> ! {
     #[cfg(feature = "esp32")]
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: RECLAIMED_BYTES);
 
-    rustclr_demo_common::run(&mut Console, BOARD, "", HELLO_WORLD, TOTAL_HEAP);
+    #[cfg(feature = "esp32c3")]
+    let board: Option<alloc::boxed::Box<dyn rustclr_hal::Board>> =
+        Some(alloc::boxed::Box::new(rustclr_hal_esp32c3::Esp32C3Board::new()));
+
+    // The Core2's panel. Nothing here works until the AXP192 has been told to
+    // power the LCD rail, the backlight rail and the panel's reset — a board
+    // whose SPI writes are perfect and whose PMIC was never configured keeps
+    // whatever was in the panel's RAM from whatever ran before it.
+    #[cfg(feature = "board-m5core2")]
+    let board: Option<alloc::boxed::Box<dyn rustclr_hal::Board>> = {
+        use esp_hal::gpio::{Level, Output, OutputConfig};
+        let i2c = esp_hal::i2c::master::I2c::new(
+            _peripherals.I2C0,
+            esp_hal::i2c::master::Config::default(),
+        )
+        .map(|bus| bus.with_sda(_peripherals.GPIO21).with_scl(_peripherals.GPIO22));
+        let spi = esp_hal::spi::master::Spi::new(
+            _peripherals.SPI2,
+            esp_hal::spi::master::Config::default()
+                .with_frequency(esp_hal::time::Rate::from_mhz(40))
+                .with_mode(esp_hal::spi::Mode::_0),
+        )
+        .map(|bus| bus.with_sck(_peripherals.GPIO18).with_mosi(_peripherals.GPIO23));
+
+        let panel = match (i2c, spi) {
+            (Ok(i2c), Ok(spi)) => {
+                let dc = Output::new(_peripherals.GPIO15, Level::High, OutputConfig::default());
+                let cs = Output::new(_peripherals.GPIO5, Level::High, OutputConfig::default());
+                match m5core2::M5Core2Panel::new(i2c, spi, dc, cs) {
+                    Ok(mut panel) => {
+                        // Green, before any managed code runs. It separates
+                        // "the bus is dead" from "the framebuffer never
+                        // reached present", and those look identical on a
+                        // screen showing a previous firmware's picture.
+                        let _ = panel.fill(0x07E0);
+                        Some(panel)
+                    }
+                    Err(_) => None,
+                }
+            }
+            _ => None,
+        };
+        Some(alloc::boxed::Box::new(m5core2::M5Core2Board::new(panel)))
+    };
+
+    // Every other Xtensa build: the ESP32's peripherals are a different set of
+    // registers from the C3's and no crate drives them, so it reports no board
+    // rather than one it cannot reach.
+    #[cfg(not(any(feature = "esp32c3", feature = "board-m5core2")))]
+    let board: Option<alloc::boxed::Box<dyn rustclr_hal::Board>> = None;
+
+    rustclr_demo_common::run(&mut Console, BOARD, "", HELLO_WORLD, TOTAL_HEAP, board, None, APP_LIBRARIES);
 
     loop {
         // Nothing left to do; the demonstration is the output above.

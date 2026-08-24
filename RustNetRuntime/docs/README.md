@@ -19,6 +19,7 @@
 - [The runtime in depth](runtime.md) — metadata, the collector, values, calls,
   exceptions, and the behaviour that is easy to get subtly wrong
 - [Toolchain reference](cli.md) — every `rustnet` command
+- [Writing device code](device.md) — pins, storage and crypto from C#
 - [Benchmarks](benchmarks.md) — RustCLR against .NET, workload by workload
 - [Advanced C# features](advanced-features.md) — the measured support matrix
 - [Limitations](limitations.md) — what does not work yet, and why

@@ -1,0 +1,17 @@
+[package]
+name = "rustclr-hal"
+description = "Hardware abstraction layer traits: the seam between RustCLR and a board"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# Nothing. A trait crate that reached for a dependency would drag it onto every
+# board that implements the traits.
+[dependencies]
+
+[features]
+default = ["std"]
+std = []

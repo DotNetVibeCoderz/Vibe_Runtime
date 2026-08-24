@@ -1,0 +1,18 @@
+<Project>
+
+  <!--
+    Shared by the host tools. The reference repo set these in its own
+    `Directory.Build.props`, which did not come across with the projects.
+  -->
+  <PropertyGroup>
+    <TargetFramework Condition="'$(TargetFramework)' == '' AND '$(TargetFrameworks)' == ''">net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyVersion>0.1.0</AssemblyVersion>
+    <Version>0.1.0</Version>
+    <Authors>Gravicode Studios</Authors>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+  </PropertyGroup>
+
+</Project>

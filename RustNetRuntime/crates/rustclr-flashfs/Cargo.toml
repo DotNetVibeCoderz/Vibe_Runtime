@@ -1,0 +1,15 @@
+[package]
+name = "rustclr-flashfs"
+description = "A filesystem for raw NOR flash: named blobs in a log, newest wins"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# One dependency, on the trait that describes a flash region. That is what
+# keeps this crate in the workspace and its tests running while it also builds
+# for a bare-metal target.
+[dependencies]
+rustclr-hal = { path = "../rustclr-hal", version = "0.1.0", default-features = false }

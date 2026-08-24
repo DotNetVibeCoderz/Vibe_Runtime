@@ -1,0 +1,253 @@
+<Application xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="RustNet.Workbench.App"
+             RequestedThemeVariant="Dark">
+
+  <!--
+    The Workbench is a bench instrument, and it is dressed as one.
+
+    Its job is not to render forms; it is to make a board on the end of a USB
+    cable feel present and controllable. So the visual language comes from the
+    equipment that already sits on that desk — a Fluke meter, a bench supply, a
+    logic analyser — rather than from software chrome: a warm graphite
+    enclosure, recessed panels, silkscreened legends in a DIN-derived face, one
+    high-visibility amber for anything that acts, and small indicator lamps that
+    are the only saturated colour on screen.
+
+    Fonts are chosen from what Windows ships, because a tool that has to run
+    from a repo checkout cannot depend on downloads. Bahnschrift is Microsoft's
+    DIN — the typeface of engineering drawings and instrument front panels — and
+    it carries every legend. Cascadia Mono is the readout glass: logs, JSON,
+    counters. Segoe UI does the quiet work in between. Each has one job.
+  -->
+
+  <Application.Resources>
+    <ResourceDictionary>
+
+      <!-- Enclosure, front panel, readout glass: three depths, warm rather
+           than neutral so the amber sits on something instead of floating. -->
+      <Color x:Key="CaseColor">#26262A</Color>
+      <Color x:Key="PanelColor">#1C1C20</Color>
+      <Color x:Key="ReadoutColor">#0E0E12</Color>
+      <Color x:Key="EdgeColor">#33333A</Color>
+
+      <SolidColorBrush x:Key="Case" Color="{StaticResource CaseColor}"/>
+      <SolidColorBrush x:Key="Panel" Color="{StaticResource PanelColor}"/>
+      <SolidColorBrush x:Key="Readout" Color="{StaticResource ReadoutColor}"/>
+      <SolidColorBrush x:Key="Edge" Color="{StaticResource EdgeColor}"/>
+
+      <!-- Silkscreen: the printed legends on a panel are never pure white. -->
+      <SolidColorBrush x:Key="Legend" Color="#C9CAD0"/>
+      <SolidColorBrush x:Key="LegendDim" Color="#7C7D86"/>
+
+      <!-- The instrument's one accent. Everything that acts is amber;
+           everything that merely reports is not. -->
+      <SolidColorBrush x:Key="Amber" Color="#F2A900"/>
+      <SolidColorBrush x:Key="AmberDim" Color="#8A6206"/>
+
+      <!-- Indicator lamps. Saturated colour appears nowhere else, so a lamp
+           reads as a lamp at a glance rather than as decoration. -->
+      <SolidColorBrush x:Key="LampOn" Color="#46D07A"/>
+      <SolidColorBrush x:Key="LampFault" Color="#FF6B5B"/>
+      <SolidColorBrush x:Key="LampOff" Color="#3C3C44"/>
+
+      <FontFamily x:Key="LegendFace">Bahnschrift,Segoe UI Semibold,Segoe UI,sans-serif</FontFamily>
+      <FontFamily x:Key="BodyFace">Segoe UI Variable Text,Segoe UI,sans-serif</FontFamily>
+      <FontFamily x:Key="DataFace">Cascadia Mono,Consolas,Courier New,monospace</FontFamily>
+    </ResourceDictionary>
+  </Application.Resources>
+
+  <Application.Styles>
+    <FluentTheme />
+
+    <Style Selector="Window">
+      <Setter Property="Background" Value="{StaticResource Case}"/>
+      <Setter Property="FontFamily" Value="{StaticResource BodyFace}"/>
+      <Setter Property="FontSize" Value="13"/>
+    </Style>
+
+    <!-- Panel legends: uppercase, letterspaced, small. Engineering drawings
+         label things this way because it stays legible when it is tiny, which
+         is exactly what a dense tool needs. -->
+    <Style Selector="TextBlock.legend">
+      <Setter Property="FontFamily" Value="{StaticResource LegendFace}"/>
+      <Setter Property="FontSize" Value="11"/>
+      <Setter Property="LetterSpacing" Value="1.4"/>
+      <Setter Property="Foreground" Value="{StaticResource LegendDim}"/>
+    </Style>
+
+    <Style Selector="TextBlock.section">
+      <Setter Property="FontFamily" Value="{StaticResource LegendFace}"/>
+      <Setter Property="FontSize" Value="15"/>
+      <Setter Property="LetterSpacing" Value="0.6"/>
+      <Setter Property="Foreground" Value="{StaticResource Legend}"/>
+    </Style>
+
+    <Style Selector="TextBlock.note">
+      <Setter Property="Foreground" Value="{StaticResource LegendDim}"/>
+      <Setter Property="FontSize" Value="12"/>
+      <Setter Property="TextWrapping" Value="Wrap"/>
+    </Style>
+
+    <Style Selector="TextBlock.readout">
+      <Setter Property="FontFamily" Value="{StaticResource DataFace}"/>
+      <Setter Property="FontSize" Value="12"/>
+      <Setter Property="Foreground" Value="{StaticResource Amber}"/>
+    </Style>
+
+    <!-- Hard edges. Instruments are milled, not moulded; 2px is as round as
+         this gets. -->
+    <Style Selector="Button">
+      <Setter Property="Background" Value="#2E2E34"/>
+      <Setter Property="Foreground" Value="{StaticResource Legend}"/>
+      <Setter Property="BorderBrush" Value="{StaticResource Edge}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="CornerRadius" Value="2"/>
+      <Setter Property="Padding" Value="14 7"/>
+      <Setter Property="FontFamily" Value="{StaticResource LegendFace}"/>
+      <Setter Property="FontSize" Value="12"/>
+    </Style>
+    <!-- Letterspacing is a TextBlock property, so it is set on the text the
+         button's template generates rather than on the button. -->
+    <Style Selector="Button TextBlock">
+      <Setter Property="LetterSpacing" Value="0.4"/>
+    </Style>
+    <Style Selector="Button:pointerover /template/ ContentPresenter">
+      <Setter Property="Background" Value="#3A3A42"/>
+      <Setter Property="BorderBrush" Value="#4A4A54"/>
+      <Setter Property="TextBlock.Foreground" Value="#FFFFFF"/>
+    </Style>
+    <Style Selector="Button:pressed /template/ ContentPresenter">
+      <Setter Property="Background" Value="#242429"/>
+    </Style>
+    <Style Selector="Button:disabled /template/ ContentPresenter">
+      <Setter Property="TextBlock.Foreground" Value="#5A5A62"/>
+    </Style>
+
+    <!-- One amber button per panel: the thing that panel is for. -->
+    <Style Selector="Button.primary">
+      <Setter Property="Background" Value="{StaticResource Amber}"/>
+      <Setter Property="Foreground" Value="#1A1400"/>
+      <Setter Property="BorderBrush" Value="#FFC53D"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+    </Style>
+    <Style Selector="Button.primary:pointerover /template/ ContentPresenter">
+      <Setter Property="Background" Value="#FFC53D"/>
+      <Setter Property="TextBlock.Foreground" Value="#1A1400"/>
+    </Style>
+
+    <!-- Destructive actions get no colour at all, only a warmer edge. A red
+         button invites the click it is warning about. -->
+    <Style Selector="Button.danger">
+      <Setter Property="BorderBrush" Value="#6E3A34"/>
+      <Setter Property="Foreground" Value="#E8A99F"/>
+    </Style>
+    <Style Selector="Button.danger:pointerover /template/ ContentPresenter">
+      <Setter Property="Background" Value="#3A2422"/>
+      <Setter Property="TextBlock.Foreground" Value="#FFB4A6"/>
+    </Style>
+
+    <Style Selector="TextBox">
+      <Setter Property="Background" Value="{StaticResource Readout}"/>
+      <Setter Property="Foreground" Value="{StaticResource Legend}"/>
+      <Setter Property="BorderBrush" Value="{StaticResource Edge}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="CornerRadius" Value="2"/>
+      <Setter Property="Padding" Value="8 6"/>
+      <Setter Property="SelectionBrush" Value="{StaticResource AmberDim}"/>
+      <Setter Property="CaretBrush" Value="{StaticResource Amber}"/>
+    </Style>
+    <Style Selector="TextBox:focus /template/ Border#PART_BorderElement">
+      <Setter Property="BorderBrush" Value="{StaticResource Amber}"/>
+    </Style>
+
+    <!-- Readout glass: anything the device says, in the data face. -->
+    <Style Selector="TextBox.data">
+      <Setter Property="FontFamily" Value="{StaticResource DataFace}"/>
+      <Setter Property="FontSize" Value="12"/>
+      <Setter Property="Foreground" Value="#A8DCC0"/>
+      <Setter Property="Background" Value="{StaticResource Readout}"/>
+    </Style>
+
+    <Style Selector="ComboBox">
+      <Setter Property="Background" Value="#2E2E34"/>
+      <Setter Property="Foreground" Value="{StaticResource Legend}"/>
+      <Setter Property="BorderBrush" Value="{StaticResource Edge}"/>
+      <Setter Property="CornerRadius" Value="2"/>
+      <Setter Property="FontFamily" Value="{StaticResource DataFace}"/>
+      <Setter Property="FontSize" Value="12"/>
+    </Style>
+
+    <Style Selector="ListBox">
+      <Setter Property="Background" Value="{StaticResource Readout}"/>
+      <Setter Property="BorderBrush" Value="{StaticResource Edge}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="CornerRadius" Value="2"/>
+      <Setter Property="FontFamily" Value="{StaticResource DataFace}"/>
+      <Setter Property="FontSize" Value="12"/>
+    </Style>
+    <Style Selector="ListBoxItem">
+      <Setter Property="Foreground" Value="{StaticResource Legend}"/>
+      <Setter Property="Padding" Value="10 6"/>
+      <Setter Property="CornerRadius" Value="0"/>
+    </Style>
+    <Style Selector="ListBoxItem:selected /template/ ContentPresenter">
+      <Setter Property="Background" Value="#2A2A31"/>
+      <Setter Property="TextBlock.Foreground" Value="{StaticResource Amber}"/>
+    </Style>
+
+    <Style Selector="CheckBox">
+      <Setter Property="Foreground" Value="{StaticResource LegendDim}"/>
+      <Setter Property="FontSize" Value="12"/>
+    </Style>
+
+    <Style Selector="ProgressBar">
+      <Setter Property="Foreground" Value="{StaticResource Amber}"/>
+      <Setter Property="Background" Value="{StaticResource Readout}"/>
+      <Setter Property="CornerRadius" Value="0"/>
+      <Setter Property="MinHeight" Value="4"/>
+    </Style>
+
+    <!-- The mode rail. A function selector down the side, not a tab strip:
+         the panel you are on is a mode the instrument is in, and the strip
+         above stays visible whichever one you pick. -->
+    <Style Selector="TabControl">
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="Padding" Value="0"/>
+    </Style>
+    <Style Selector="TabItem">
+      <Setter Property="FontFamily" Value="{StaticResource LegendFace}"/>
+      <Setter Property="FontSize" Value="12"/>
+      <Setter Property="Foreground" Value="{StaticResource LegendDim}"/>
+      <Setter Property="Padding" Value="18 10"/>
+      <Setter Property="MinHeight" Value="0"/>
+      <Setter Property="MinWidth" Value="150"/>
+      <Setter Property="HorizontalContentAlignment" Value="Left"/>
+      <Setter Property="Background" Value="Transparent"/>
+    </Style>
+    <Style Selector="TabItem TextBlock">
+      <Setter Property="LetterSpacing" Value="1.2"/>
+    </Style>
+    <Style Selector="TabItem:selected">
+      <Setter Property="Foreground" Value="{StaticResource Amber}"/>
+    </Style>
+    <Style Selector="TabItem:selected /template/ ContentPresenter">
+      <Setter Property="Background" Value="{StaticResource Case}"/>
+    </Style>
+    <Style Selector="TabItem:selected /template/ Border#PART_SelectedPipe">
+      <Setter Property="Background" Value="{StaticResource Amber}"/>
+    </Style>
+    <Style Selector="TabItem:pointerover /template/ ContentPresenter">
+      <Setter Property="TextBlock.Foreground" Value="{StaticResource Legend}"/>
+    </Style>
+
+    <!-- A group of controls that belong to one action. -->
+    <Style Selector="Border.group">
+      <Setter Property="Background" Value="{StaticResource Panel}"/>
+      <Setter Property="BorderBrush" Value="{StaticResource Edge}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="CornerRadius" Value="2"/>
+      <Setter Property="Padding" Value="16"/>
+    </Style>
+  </Application.Styles>
+</Application>

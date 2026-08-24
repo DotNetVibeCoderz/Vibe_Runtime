@@ -28,6 +28,8 @@ use crate::value::Value;
 use alloc::boxed::Box;
 use alloc::collections::BTreeSet;
 use alloc::string::String;
+// Only the std-side scripted debugger keeps a log.
+#[cfg(feature = "std")]
 use alloc::vec::Vec;
 
 /// Somewhere a program can be stopped: an instruction of a method.

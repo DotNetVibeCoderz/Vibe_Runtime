@@ -19,3 +19,5 @@ rustclr-gc.workspace = true
 rustclr-metadata.workspace = true
 rustclr-interop.workspace = true
 rustclr-jit.workspace = true
+# The simulated board `run --board host` installs.
+rustclr-hal-host.workspace = true

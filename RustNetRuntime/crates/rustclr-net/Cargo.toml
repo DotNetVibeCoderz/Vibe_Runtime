@@ -1,0 +1,22 @@
+[package]
+name = "rustclr-net"
+description = "HTTP, MQTT, Modbus and a small web server over a network interface"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rustclr-diag = { path = "../rustclr-diag", version = "0.1.0", default-features = false }
+rustclr-mqtt = { path = "../rustclr-mqtt", version = "0.1.0", default-features = false }
+
+# `std`-only, and that is a fact about the transport rather than an oversight.
+# The sockets here are `std::net`, the timeouts are `std::time`, and the server
+# spawns `std::thread`. A board reaches a network through the HAL's `netif`
+# trait or an AT-command modem instead; the *codec* it needs — MQTT — is
+# `rustclr-mqtt`, which is a separate crate precisely so it builds bare-metal.
+[features]
+default = ["std"]
+std = ["rustclr-diag/std", "rustclr-mqtt/std"]

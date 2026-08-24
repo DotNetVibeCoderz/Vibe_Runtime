@@ -30,6 +30,10 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::fmt::Write;
 
+use rustclr_hal::{Board, HalError};
+
+/// The trait a firmware implements to give the program a console.
+pub use rustclr_core::host::Host;
 use rustclr_core::{CaptureHost, Interpreter};
 use rustclr_gc::{GcObject, Handle, Heap, RootSet, Tracer};
 use rustclr_metadata::{Image, TableId};
@@ -40,22 +44,29 @@ use rustclr_metadata::{Image, TableId};
 /// `Interpreter::with_host` → `rustclr_bcl::install` → `load_image` →
 /// `run_entry_point`, with [`EXEC_SLOTS`] slots:
 ///
-/// | | bytes |
-/// | --- | ---: |
-/// | loader, 202 pre-registered framework types | 127 K |
-/// | managed heap slot table | 21 K |
-/// | RustBCL, 826 native bindings | 106 K |
-/// | loading and running `HelloWorld` | 6 K |
-/// | **peak** | **260,702** |
-pub const FULL_BCL_BYTES: usize = 260_702;
+/// Measured by `cargo test -p rustclr-bcl --test footprint`, which counts
+/// through a wrapping `GlobalAlloc` and **fails if this constant drifts below
+/// what the bindings actually cost**. That test exists because this number did
+/// drift: an M5Stack Core2 with 278,528 bytes read `260702 bytes needed`,
+/// picked the full tier, and panicked part-way through registration on a
+/// 46-byte request. A stale threshold is worse than none — it is a board that
+/// says it will fit and then dies where nobody can attach a debugger.
+///
+/// The figure is measured with `std`, where the prelude is `HashMap`; a board
+/// builds without it and gets `BTreeMap`, which costs less per entry. So this
+/// is an **upper bound** on what a chip pays, which is the safe direction for
+/// a threshold to be wrong in.
+pub const FULL_BCL_BYTES: usize = 385_070;
 
 /// Peak allocation with only the bindings a console program needs.
 ///
-/// `System.Object`, `Console`, `String`, `Math` and interpolated strings — 300
-/// bindings instead of 826. No LINQ, no collections, no reflection, no tasks.
-/// That is 68 KB less, which is the difference between running and not running
-/// on a board with 256 KB of usable RAM.
-pub const MINIMAL_BCL_BYTES: usize = 192_045;
+/// `System.Object`, `Console`, `String`, `Math`, interpolated strings and the
+/// HAL — no LINQ, no collections, no reflection, no tasks. That is 133 KB less
+/// than the full set, which is the difference between running and not running
+/// on a board with 278 KB of usable RAM.
+///
+/// Measured the same way and guarded by the same test.
+pub const MINIMAL_BCL_BYTES: usize = 252_092;
 
 /// What a board's memory budget allows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,10 +161,28 @@ impl RootSet for Roots {
 /// about how it got there — a clock source, a console — or empty. `heap_bytes`
 /// is the size of the board's allocator arena, which decides how much of the
 /// runtime will fit: see [`Tier::for_budget`].
-pub fn run<W: Write>(out: &mut W, board: &str, detail: &str, assembly: &[u8], heap_bytes: usize) {
+pub fn run<W: Write>(
+    out: &mut W,
+    board_name: &str,
+    detail: &str,
+    assembly: &[u8],
+    heap_bytes: usize,
+    board: Option<Box<dyn Board>>,
+    // `console`: where the *program's* own output goes. The firmware supplies
+    // it because only the firmware knows what its console is. `None` buffers
+    // into a `CaptureHost` and prints at the end, which is right for a program
+    // that returns and useless for one that loops forever — which is most
+    // device programs.
+    console: Option<Box<dyn rustclr_core::host::Host>>,
+    // `libraries`: assemblies the program references, in dependency order. A
+    // board has no filesystem to resolve an `AssemblyRef` against, so the
+    // firmware carries what the program needs. They are loaded first, because
+    // a `TypeRef` binds only to a type the registry already has.
+    libraries: &[&[u8]],
+) {
     let _ = writeln!(out);
     let _ = writeln!(out, "========================================");
-    let _ = writeln!(out, " RustCLR on {board}");
+    let _ = writeln!(out, " RustCLR on {board_name}");
     let _ = writeln!(out, " Built by Gravicode Studios, led by Kang Fadhil");
     let _ = writeln!(out, "========================================");
     let _ = writeln!(out);
@@ -162,9 +191,15 @@ pub fn run<W: Write>(out: &mut W, board: &str, detail: &str, assembly: &[u8], he
         let _ = writeln!(out);
     }
 
+    let mut board = board;
+    if let Some(board) = board.as_mut() {
+        exercise_board(out, board.as_mut());
+        let _ = writeln!(out);
+    }
+
     read_assembly(out, assembly);
     let _ = writeln!(out);
-    execute_assembly(out, assembly, heap_bytes);
+    execute_assembly(out, assembly, heap_bytes, libraries, board, console);
     let _ = writeln!(out);
     exercise_collector(out);
 
@@ -226,7 +261,14 @@ fn read_assembly<W: Write>(out: &mut W, assembly: &[u8]) {
 /// collects it and this replays it afterwards, which avoids handing the
 /// interpreter a borrow of the board's console for the length of the run. The
 /// bytes are the same either way.
-fn execute_assembly<W: Write>(out: &mut W, assembly: &[u8], heap_bytes: usize) {
+fn execute_assembly<W: Write>(
+    out: &mut W,
+    assembly: &[u8],
+    heap_bytes: usize,
+    libraries: &[&[u8]],
+    board: Option<Box<dyn Board>>,
+    console: Option<Box<dyn rustclr_core::host::Host>>,
+) {
     let _ = writeln!(out, "-- il interpreter --");
 
     let tier = Tier::for_budget(heap_bytes);
@@ -261,7 +303,15 @@ fn execute_assembly<W: Write>(out: &mut W, assembly: &[u8], heap_bytes: usize) {
         }
     };
 
-    let mut interp = Interpreter::with_host(Box::new(CaptureHost::new()));
+    let streaming = console.is_some();
+    let mut interp = match console {
+        Some(host) => Interpreter::with_host(host),
+        None => Interpreter::with_host(Box::new(CaptureHost::new())),
+    };
+    // The program gets the same board the report above described. Without
+    // this a `Display.Present` or a `Gpio.Write` is told there is no board on
+    // a chip that plainly has one.
+    interp.board = board;
     // A hard ceiling here too: the interpreter allocates every string and boxed
     // value the program makes, and it must not be able to take the whole chip.
     interp.heap = Heap::embedded(EXEC_SLOTS).into();
@@ -274,6 +324,33 @@ fn execute_assembly<W: Write>(out: &mut W, assembly: &[u8], heap_bytes: usize) {
         Tier::None => unreachable!("returned above"),
     }
     let _ = writeln!(out, "native bindings  {}", interp.native_count());
+
+    // Libraries first. Each one's types have to be in the registry before the
+    // program's `TypeRef`s are resolved against them, which is the same order
+    // `Loader::load_from_file` uses on a desktop — there it walks the
+    // directory, here the firmware supplies the list.
+    for (index, library) in libraries.iter().enumerate() {
+        let image = match Image::from_bytes(library.to_vec()) {
+            Ok(image) => image,
+            Err(e) => {
+                let _ = writeln!(out, "library {index}        FAILED to parse: {e}");
+                return;
+            }
+        };
+        match interp.loader.load_image(image) {
+            Ok(id) => {
+                let _ = writeln!(
+                    out,
+                    "library {index}        {}",
+                    interp.loader.assembly(id).name
+                );
+            }
+            Err(e) => {
+                let _ = writeln!(out, "library {index}        FAILED to load: {e}");
+                return;
+            }
+        }
+    }
 
     let id = match interp.loader.load_image(image) {
         Ok(id) => id,
@@ -288,7 +365,12 @@ fn execute_assembly<W: Write>(out: &mut W, assembly: &[u8], heap_bytes: usize) {
     let outcome = interp.run_entry_point(id);
 
     let _ = writeln!(out);
-    let _ = writeln!(out, "--- program output ---");
+    if streaming {
+        // Already on the wire, byte by byte, as the program wrote it.
+        let _ = writeln!(out, "--- end of program output ---");
+    } else {
+        let _ = writeln!(out, "--- program output ---");
+    }
     if let Some(text) = interp.host.captured_output() {
         for line in text.split('\n') {
             // Trailing CR, because `Console.WriteLine` emits CRLF and the board
@@ -368,4 +450,78 @@ fn exercise_collector<W: Write>(out: &mut W) {
     let _ = writeln!(out, "total allocs     {}", stats.total_allocations);
     let _ = writeln!(out, "objects freed    {}", stats.total_objects_freed);
     let _ = writeln!(out, "peak live bytes  {}", stats.peak_live_bytes);
+}
+
+/// Reports what the board underneath actually offers.
+///
+/// **Nothing here drives an output.** A firmware demo that wrote a pin would
+/// be writing an arbitrary pin on hardware it does not know the wiring of —
+/// on a real board that is a short across a driver, or a relay clicking in a
+/// cabinet nobody is watching. Asking the HAL to *resolve* a peripheral proves
+/// the whole path is wired, and it cannot damage anything.
+fn exercise_board<W: Write>(out: &mut W, board: &mut dyn Board) {
+    let _ = writeln!(out, "-- hardware abstraction layer --");
+    let _ = writeln!(out, "board            {}", board.name());
+
+    // Each of these is the same question: does this chip have one, and does
+    // the trait object reach it? A `NotSupported` is an answer, not a failure.
+    let gpio = match board.gpio(0) {
+        Ok(_) => "yes",
+        Err(HalError::NotSupported) => "not on this chip",
+        Err(_) => "error",
+    };
+    let _ = writeln!(out, "gpio pin 0       {gpio}");
+
+    let adc = match board.adc(0) {
+        Ok(channel) => {
+            // Reading an ADC is passive: it samples a voltage that is already
+            // there. Safe on any board, and it proves the path end to end.
+            let bits = channel.resolution_bits();
+            match channel.read_raw() {
+                Ok(raw) => {
+                    let _ = writeln!(out, "adc channel 0    {raw} raw at {bits} bits");
+                    None
+                }
+                Err(e) => Some(e),
+            }
+        }
+        Err(e) => Some(e),
+    };
+    if let Some(e) = adc {
+        let _ = writeln!(out, "adc channel 0    {e}");
+    }
+
+    for (label, present) in [
+        ("i2c bus 0", board.i2c(0).is_ok()),
+        ("spi bus 0", board.spi(0).is_ok()),
+        ("uart port 0", board.uart(0).is_ok()),
+        ("pwm channel 0", board.pwm(0).is_ok()),
+        ("external memory", board.extmem(0).is_ok()),
+    ] {
+        let _ = writeln!(out, "{label:<16} {}", if present { "yes" } else { "not on this chip" });
+    }
+
+    let watchdog = board.watchdog();
+    let _ = writeln!(
+        out,
+        "watchdog         {}",
+        if watchdog.is_running() { "running" } else { "idle" }
+    );
+
+    // The monotonic clock the profiler and `Stopwatch` read. Two reads a few
+    // microseconds apart must not go backwards; a clock that did would make
+    // every duration on this board nonsense.
+    let delay = board.delay();
+    let first = delay.now_us();
+    delay.delay_us(50);
+    let second = delay.now_us();
+    let _ = writeln!(
+        out,
+        "monotonic clock  {}",
+        if second >= first {
+            "moves forward"
+        } else {
+            "GOES BACKWARDS - durations on this board are wrong"
+        }
+    );
 }

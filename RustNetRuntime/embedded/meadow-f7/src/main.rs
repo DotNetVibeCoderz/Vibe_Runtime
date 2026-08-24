@@ -55,6 +55,23 @@ mod usb;
 /// build time. See `build.rs`.
 static HELLO_WORLD: &[u8] = include_bytes!(env!("RUSTCLR_APP_PATH"));
 
+/// Assemblies the embedded program references, in dependency order.
+///
+/// A board has no filesystem, so what a desktop finds beside the program has
+/// to be compiled in. `RUSTCLR_LIB1_PATH` and `RUSTCLR_LIB2_PATH` name them,
+/// and the build script turns each one that is set into a `cfg`. A program
+/// that references nothing — `HelloWorld` — sets neither and gets an empty
+/// list, which costs nothing.
+static APP_LIBRARIES: &[&[u8]] = &[
+    #[cfg(rustclr_lib1)]
+    include_bytes!(env!("RUSTCLR_LIB1_PATH")),
+    #[cfg(rustclr_lib2)]
+    include_bytes!(env!("RUSTCLR_LIB2_PATH")),
+    #[cfg(rustclr_lib3)]
+    include_bytes!(env!("RUSTCLR_LIB3_PATH")),
+];
+
+
 /// The board, for the banner.
 const BOARD: &str = "Meadow F7 Micro v1.0 (STM32F777, Cortex-M7)";
 
@@ -279,7 +296,20 @@ fn main() -> ! {
                     "no crystal - USB may be out of spec"
                 }
             );
-            rustclr_demo_common::run(&mut console, BOARD, detail.as_str(), HELLO_WORLD, HEAP_BYTES);
+            // The F7 is a different family from the F4, but the peripheral
+            // blocks this HAL touches — GPIO, USART, the cycle counter — are
+            // register-compatible, and the clock figures come from the board.
+            let hardware = rustclr_hal_stm32::Stm32F4Board::new(rustclr_hal_stm32::Clocks::MEADOW_F7);
+            rustclr_demo_common::run(
+                &mut console,
+                BOARD,
+                detail.as_str(),
+                HELLO_WORLD,
+                HEAP_BYTES,
+                Some(alloc::boxed::Box::new(hardware)),
+                None,
+                APP_LIBRARIES,
+            );
         }
         was_open = open;
     }

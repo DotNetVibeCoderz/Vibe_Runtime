@@ -1,0 +1,7 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>Files on a device, read and written whole</Description>
+  </PropertyGroup>
+
+</Project>

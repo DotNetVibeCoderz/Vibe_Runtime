@@ -459,7 +459,11 @@ version = "0.1.0"
 dependencies = [
  "libm",
  "rustclr-core",
+ "rustclr-crypto",
+ "rustclr-flashfs",
  "rustclr-gc",
+ "rustclr-gfx",
+ "rustclr-hal",
 ]
 
 [[package]]
@@ -467,8 +471,14 @@ name = "rustclr-core"
 version = "0.1.0"
 dependencies = [
  "rustclr-gc",
+ "rustclr-gfx",
+ "rustclr-hal",
  "rustclr-metadata",
 ]
+
+[[package]]
+name = "rustclr-crypto"
+version = "0.1.0"
 
 [[package]]
 name = "rustclr-demo-common"
@@ -477,12 +487,38 @@ dependencies = [
  "rustclr-bcl",
  "rustclr-core",
  "rustclr-gc",
+ "rustclr-hal",
  "rustclr-metadata",
+]
+
+[[package]]
+name = "rustclr-flashfs"
+version = "0.1.0"
+dependencies = [
+ "rustclr-hal",
 ]
 
 [[package]]
 name = "rustclr-gc"
 version = "0.1.0"
+
+[[package]]
+name = "rustclr-gfx"
+version = "0.1.0"
+dependencies = [
+ "rustclr-hal",
+]
+
+[[package]]
+name = "rustclr-hal"
+version = "0.1.0"
+
+[[package]]
+name = "rustclr-hal-rp2040"
+version = "0.1.0"
+dependencies = [
+ "rustclr-hal",
+]
 
 [[package]]
 name = "rustclr-metadata"
@@ -498,6 +534,7 @@ dependencies = [
  "rp2040-boot2",
  "rp2040-hal",
  "rustclr-demo-common",
+ "rustclr-hal-rp2040",
  "usb-device",
  "usbd-serial",
 ]

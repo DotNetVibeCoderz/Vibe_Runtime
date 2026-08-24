@@ -11,6 +11,23 @@ exclude = [
 ]
 members = [
     "crates/rustclr-metadata",
+    "crates/rustclr-hal",
+    "crates/rustclr-hal-host",
+    "crates/rustclr-flashfs",
+    "crates/rustclr-crypto",
+    "crates/rustclr-db",
+    "crates/rustclr-secureboot",
+    "crates/rustclr-ota",
+    "crates/rustclr-net",
+    "crates/rustclr-espat",
+    "crates/rustclr-gfx",
+    "crates/rustclr-hal-stm32",
+    "crates/rustclr-hal-rp2040",
+    "crates/rustclr-hal-esp32c3",
+    "crates/rustclr-hal-k210",
+    "crates/rustclr-usb",
+    "crates/rustclr-mqtt",
+    "crates/rustclr-diag",
     "crates/rustclr-gc",
     "crates/rustclr-sched",
     "crates/rustclr-interop",
@@ -30,6 +47,23 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 rustclr-metadata = { path = "crates/rustclr-metadata", version = "0.1.0" }
+rustclr-hal      = { path = "crates/rustclr-hal",      version = "0.1.0" }
+rustclr-hal-host = { path = "crates/rustclr-hal-host", version = "0.1.0" }
+rustclr-flashfs  = { path = "crates/rustclr-flashfs",  version = "0.1.0" }
+rustclr-crypto   = { path = "crates/rustclr-crypto",   version = "0.1.0" }
+rustclr-db       = { path = "crates/rustclr-db",       version = "0.1.0" }
+rustclr-secureboot = { path = "crates/rustclr-secureboot", version = "0.1.0" }
+rustclr-ota      = { path = "crates/rustclr-ota",      version = "0.1.0" }
+rustclr-net      = { path = "crates/rustclr-net",      version = "0.1.0" }
+rustclr-espat    = { path = "crates/rustclr-espat",    version = "0.1.0" }
+rustclr-gfx      = { path = "crates/rustclr-gfx",      version = "0.1.0" }
+rustclr-hal-stm32        = { path = "crates/rustclr-hal-stm32", version = "0.1.0" }
+rustclr-hal-rp2040       = { path = "crates/rustclr-hal-rp2040", version = "0.1.0" }
+rustclr-hal-esp32c3      = { path = "crates/rustclr-hal-esp32c3", version = "0.1.0" }
+rustclr-hal-k210         = { path = "crates/rustclr-hal-k210", version = "0.1.0" }
+rustclr-usb      = { path = "crates/rustclr-usb",      version = "0.1.0" }
+rustclr-mqtt     = { path = "crates/rustclr-mqtt",     version = "0.1.0" }
+rustclr-diag     = { path = "crates/rustclr-diag",     version = "0.1.0" }
 rustclr-gc       = { path = "crates/rustclr-gc",       version = "0.1.0" }
 rustclr-sched    = { path = "crates/rustclr-sched",    version = "0.1.0" }
 rustclr-interop  = { path = "crates/rustclr-interop",  version = "0.1.0" }

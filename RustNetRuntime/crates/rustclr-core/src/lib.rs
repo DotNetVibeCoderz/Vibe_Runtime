@@ -83,6 +83,7 @@ pub mod loader;
 pub mod monitor;
 #[cfg(feature = "std")]
 pub mod pool;
+pub mod profile;
 pub mod statics;
 pub mod naming;
 pub mod objects;

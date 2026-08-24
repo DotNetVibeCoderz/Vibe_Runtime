@@ -62,6 +62,8 @@ const RESULT: usize = 1;
 const EXCEPTION: usize = 2;
 const CONTINUATIONS: usize = 3;
 /// The OS thread running this task's body, when `Task.Run` started one.
+/// There are no OS threads without `std`, so nothing reads it there.
+#[cfg(feature = "std")]
 const THREAD: usize = 4;
 
 const PENDING: i32 = 0;
@@ -940,7 +942,7 @@ fn await_on_completed(
     let object_type = interp.loader.core().object;
     let mut cell = ClrObject::new(object_type, 1);
     cell.fields[0] = machine;
-    let cell = interp.heap.alloc(cell);
+    let cell = interp.alloc_clr_object(cell);
 
     // Checking the status and joining the queue happen together, against
     // another thread completing the task in between — see `complete`.

@@ -983,7 +983,7 @@ instead of dying inside the allocator.
 | M5Stack Tough | Xtensa LX6 | 520 K | 176 K + 96 K | full | **executes IL on hardware** |
 | ESP32-WROOM-32 | Xtensa LX6 | 520 K | 176 K + 96 K | full | same image; last flashed pre-interpreter |
 | Meadow F7 Micro | Arm Cortex-M7 | 384 K | 288 K | full | builds; last flashed pre-interpreter |
-| Sipeed Maix Go K210 | RISC-V 64 | 6 M | 1 M | full | builds; SRAM-boots on a HuskyLens but prints nothing |
+| Sipeed Maix Go K210 | RISC-V 64 | 6 M | 1 M | full | **runs** — `HelloWorld.Main` executes, output identical to `dotnet` |
 | Netduino 3 WiFi | Arm Cortex-M4F | 192 K + 64 K CCM | 192 K | minimal | builds; never flashed — no board |
 | Raspberry Pi Pico | Arm Cortex-M0+ | 256 K | 192 K | minimal | builds; never flashed — no board |
 | Nucleo-F401RE | Arm Cortex-M4F | 96 K | 64 K | **none** | builds; never flashed — no board |
@@ -1043,7 +1043,8 @@ front, a heap that quietly grows has not been bounded at all.
 | | |
 | --- | --- |
 | Ahead-of-time compilation | Needs Arm and RISC-V code generators that *execute*; only x86-64 does |
-| The Pico, Netduino, Nucleo-F401RE and K210 | Their images build; none has been flashed, because no board was connected |
+| The Pico, Netduino and Nucleo-F401RE | Their images build; none has been flashed, because no board was connected |
+| The RISC-V and AArch64 code generators on a board | Both emit, and both have their exact bytes asserted against a disassembler, but neither has executed an instruction. The Maix Go is now an RV64 board that could run one — what is in the way is that `rustclr-jit` is `std`-only (`cargo build -p rustclr-jit --target riscv64gc-unknown-none-elf` cannot find `std`) and that `codepage.rs` takes its executable pages from `mmap`/`VirtualAlloc`, which bare metal has neither of |
 
 This table used to have a first row saying IL execution did not run on hardware
 at all — that the chip could read an assembly and manage a heap but not execute
@@ -1056,25 +1057,34 @@ gone rather than softened. This is [Milestone 6](../Plan.md).
 
 ## Debugging
 
-**The hooks exist; the adapter does not.** The runtime can stop before a chosen
-instruction, step into, over and out of calls, and hand a debugger every frame's
-arguments, locals and evaluation stack while the program is stopped. A debugger
-may also set breakpoints *while* stopped, and they take effect on the same run.
-`rustnet debug` drives all of it.
+**Hooks, source lines and a debug adapter all exist.** The runtime can stop
+before a chosen instruction, step into, over and out of calls, and hand a
+debugger every frame's arguments, locals and evaluation stack while the program
+is stopped. A debugger may also set breakpoints *while* stopped, and they take
+effect on the same run. `rustnet debug` drives it from a terminal;
+`rustnet debug --dap` speaks the Debug Adapter Protocol over stdin and stdout,
+so VSCode and Rider can attach.
 
-What is missing is everything between that and an editor:
+Source-line breakpoints and named locals come from the **portable PDB** the
+.NET SDK writes beside the assembly — the same `BSJB` metadata format the
+assembly reader already parses, with the debug tables (`Document`,
+`MethodDebugInformation`, `LocalScope`, `LocalVariable`) now in the schema.
+
+What remains is stated rather than hidden:
 
 | | |
 | --- | --- |
-| A Debug Adapter Protocol server | VSCode and Rider both speak DAP; nothing here does |
-| Source-line breakpoints | needs a portable-PDB reader to map a line to an IL offset |
-| Variable *names* | locals are shown by index, because names live in the PDB too |
+| No PDB, no lines | without one, breakpoints are `Method:offset` and locals are numbered — the command says so rather than offering a syntax that never matches |
+| No pause button | the hook is synchronous, so while the program runs no DAP request is serviced; an editor's pause does nothing until the next breakpoint |
+| One thread is debugged | the thread that runs `Main`. A thread the program starts gets its own interpreter and no debugger, so a breakpoint inside it never fires — its console is still redirected, so its output reaches the editor |
+| Objects are not expanded | a variable that holds a reference shows the handle; expanding it means reading the heap, which the adapter does not have while stopped |
+| No editor extension | the adapter is a stdio DAP server; something has to contribute the debug type and launch it |
+| No `evaluate` | there is no expression evaluator, so an editor's watch window and debug console cannot compute anything |
+| Debugging is interpreted-only | `rustnet debug` does not enable the JIT: compiled code has no IL offset to stop at, and a program that ran half compiled would hit breakpoints in only half its methods |
 
-Breakpoints are therefore `Method:offset`, and the CLI refuses an ambiguous
-method name rather than choosing one. The PDB is the common blocker for the last
-two rows: it is a portable PDB, which is the same `BSJB` metadata format the
-assembly reader already parses, but the debug tables (`Document`,
-`MethodDebugInformation`, and the rest) are not in the schema yet.
+A compiler-generated local the PDB does not name is identified by its slot
+number rather than given an invented one: `[3]=…` in the terminal, `local3` in
+an editor's variables pane.
 
 **The hook costs nothing when nothing is attached.** That is measured rather
 than assumed: interleaved best-of-eleven against a build with the hook removed
@@ -1082,6 +1092,165 @@ puts it within noise. It only holds because the poll is marked cold and never
 inlined — without those, the same measurement showed **8%** on the most
 instruction-dense interpreted workload, because the branch and its registers
 were being hoisted into the hot loop.
+
+---
+
+## Device libraries
+
+**`RustNet.Hal` reaches a board, and the board is a module.** GPIO, ADC, PWM,
+I2C, SPI, UART, watchdog and delay, over traits in `crates/rustclr-hal`. Which
+board is underneath is decided at firmware build time, the way the collector
+and the scheduler are chosen — `requirements.md` asks for exactly that, and a
+peripheral wired into the interpreter would be the one place it was not
+honoured. `rustnet run --board host` installs a simulator, so hardware code is
+testable on a desktop.
+
+**No board is an error.** A program that writes a pin on a machine that has
+none is not doing something harmless; it is doing something that will not
+happen. Every binding throws, naming what was missing and what to do about it.
+Only `Board.Name` and `Board.IsPresent` answer without one, because whether
+there *is* a board is the one hardware question a program running anywhere is
+entitled to ask.
+
+| | |
+| --- | --- |
+| Only the peripherals listed above are bound | The trait crate also describes I2S, CAN, 1-Wire, RTC, external memory, network interfaces, timed signals and cameras. They have no managed bindings yet, so a C# program cannot reach them |
+| One board per interpreter | A worker thread's interpreter does not carry the board across, so a `Task.Run` that touches a pin throws. The same rule as the debugger and the profiler |
+| The simulator is not a chip | Timings are not real, an ADC reads what was written to it, and an I2C bus with nothing attached NACKs. It catches "this program calls a peripheral this board does not have" and it does not catch a race with a sensor's conversion time |
+
+### Storage
+
+**`RustNet.IO.Storage` reads and writes whole files, and that is the shape, not
+a subset.** NOR flash clears bits and cannot set them; the only way back is
+erasing a whole sector. A `Stream` with `Seek` and partial writes over that
+would mean read-erase-write of the surrounding sector on every write — slow,
+and a power-loss window over data that was previously fine. Writes append and
+the newest record wins; deletes append a tombstone.
+
+| | |
+| --- | --- |
+| No handles, no seeking, no partial writes | `AppendAllText` reads, concatenates and writes a new record. Right for a log line, wrong for a megabyte |
+| The store only grows until it is compacted | A superseded record still occupies its bytes. `Storage.UsedBytes` is what a program watches; compaction is not exposed yet |
+| No `FileStream`, no `Path`, no `DirectoryInfo` | Directories are prefixes rather than objects. `CreateDirectory` writes an empty marker so an empty one can still be listed |
+| Region 0 only | Application files live in external-memory region 0. A board with no external memory throws rather than writing to RAM that disappears at the next reset |
+
+### Cryptography
+
+**The algorithms are written out rather than depended on**, and checked against
+the vectors their specifications publish: FIPS 180-4 for SHA-256 (including the
+million-character case that catches a 32-bit length counter), FIPS 197 and
+NIST SP 800-38A for AES-CTR, RFC 4231 for HMAC-SHA256. That is a stronger claim
+than a dependency gives, and it is why four bare-metal targets build without a
+vendoring step.
+
+| | |
+| --- | --- |
+| No RSA, no elliptic curves | Signature verification needs bignum arithmetic, and a hand-rolled bignum with a side channel is worse than no signature check — it is a check that reports success. Secure boot therefore verifies an HMAC over a key provisioned at flash time, which is a real guarantee with a real limitation |
+| No random number generator | Entropy is a property of the hardware. It comes from the board through the HAL, and a board without one says so rather than returning a counter dressed up as randomness |
+| AES is counter mode only | No ECB, deliberately: equal blocks encrypt to equal ciphertext, and offering it beside CTR would be offering a foot-gun with the same shape as the safe option |
+| A (key, counter) pair must never be reused | Reusing one XORs two plaintexts together and both are recoverable. Nothing here can check that — it does not know what came before — so it is stated rather than implied away |
+| Not hardened against physical attack | The AES here is straightforward and table-free. It is not written to resist power analysis by somebody holding the board |
+| Keys are 16 or 32 bytes | A key of another length is refused, not padded. A five-byte password stretched into a 128-bit key is a five-byte password |
+
+### Secure boot and OTA
+
+**The image container is verified with a MAC, not a signature.** The reference
+this was ported from uses RSA PKCS#1 v1.5. RSA needs bignum arithmetic, this
+workspace has no external dependencies, and a hand-rolled bignum with a timing
+side channel is *worse* than no signature check — it is a check that reports
+success.
+
+| | |
+| --- | --- |
+| What it still gives you | Nobody without the key can produce an image the device accepts. A corrupted download, a truncated write, a man-in-the-middle on the update channel and an image built for another chip are all rejected before a byte of payload runs |
+| What it does not | The verifying key is also a signing key. Extracting it from any one device lets an attacker sign images for all of them — which is exactly the property public-key cryptography has and this does not. Per-device keys narrow it to one board |
+| No rollback protection | A device will accept an *older* correctly-signed image. There is no version counter in the container yet, so a downgrade attack against a fixed vulnerability is possible |
+| Confirmation is the new firmware's job | An image can verify perfectly and still be broken. Only the new firmware knows whether it works, so silence for three boots is treated as failure and the old slot comes back |
+
+### Networking
+
+`rustclr-net` — HTTP, Modbus, a small web server — is **`std`-only**, and that
+is a fact about its transport rather than an oversight: the sockets are
+`std::net`, the timeouts are `std::time`, the server spawns `std::thread`. A
+board reaches a network through the HAL's `netif` trait or an AT-command modem
+instead. The codec a device actually needs, MQTT, is `rustclr-mqtt` — a
+separate crate precisely so it builds bare-metal, and it is transport-free:
+packets in, packets out, and the caller moves the bytes.
+
+There are also **no managed bindings for networking yet**, so a C# program
+cannot open a socket. That is the next layer, not a design position.
+
+### Graphics
+
+One RGB565 canvas per interpreter. A 240×240 buffer is 115 KB, which on most
+of these boards is the entire heap budget, so a second one would not be a
+feature — it would be an out-of-memory.
+
+| | |
+| --- | --- |
+| One built-in font | 8×8, ASCII only, integer scaling. Non-ASCII draws as a gap rather than a substitute glyph: a device showing `?` where a degree sign belongs is showing a wrong reading |
+| No anti-aliasing, no sub-pixel positioning | Text and lines are drawn on whole pixels |
+| `Present` needs a board | Drawing does not, which is what lets a UI be tested headlessly. A board with no wired panel accepts the frame and does nothing with it |
+| No image decoding | `DrawImage` takes RGB565 the caller already has. There is no PNG or JPEG decoder |
+
+### Logging on a chip with no atomics
+
+`rustclr-diag` shares a logger, which needs mutual exclusion — and **thumbv6m
+(Cortex-M0+) and rv32imc have no compare-and-swap at all**, so
+`AtomicBool::compare_exchange` does not compile there and `alloc::sync::Arc` is
+configured out for the same reason. Without `std` the logger therefore *tries*
+its borrow and **drops the record** if the logger is busy, counting what it
+dropped.
+
+**Do not log from an interrupt handler on such a chip.** The borrow flag is a
+plain cell there, so a handler that preempts a logging main loop can corrupt
+it. Queue the record and log it from the main loop.
+
+### Text encodings
+
+**UTF-8 and ASCII, and nothing else.** Every wire format an embedded program
+meets — an MQTT payload, an HTTP body, JSON, a sensor's serial protocol — is one
+of those two, and .NET's remaining code-page tables are larger than the whole
+heap on the boards this targets. ASCII substitutes `?` for what it cannot
+encode, matching .NET, so a program that round-trips through it gets the same
+answer here as there. Invalid UTF-8 decodes lossily to U+FFFD, as
+`Encoding.UTF8` does by default; the strict `throwOnInvalidBytes` form is not
+offered rather than being offered and quietly behaving like the lossy one.
+
+---
+
+## Profiling
+
+**`rustnet profile` samples; it does not instrument.** Every 512 IL
+instructions the interpreter reads the clock, and when a sampling period has
+passed it walks its own frame stack and charges the *measured* elapsed time to
+what it finds. Calls are counted exactly; time is sampled.
+
+What that buys is stated in `docs/cli.md`. What it costs:
+
+| | |
+| --- | --- |
+| Wall clock, not CPU time | time blocked in a `Task.Delay`, a `Join` or a lock is charged to the method that waited. Right for "why is this slow", wrong for "what is burning the processor" |
+| One thread | a thread the program starts gets its own interpreter and no profiler; its time and its allocations go unattributed, so on a threaded program the per-type table sums to less than the heap totals beside it |
+| Compiled code is invisible | a compiled method executes no IL, so `rustnet profile` interprets everything unless `--jit` is given. With `--jit` a compiled method's time lands on the interpreted frame that called it and its allocations on nothing — the command says so on stderr rather than printing it quietly |
+| A profile is not a benchmark | interpreting changes the absolute numbers. Use `run --stats` for speed and this for shape |
+| No call graph | self and inclusive time per method, not caller/callee edges. A tree needs every sampled stack kept rather than folded into per-method counters |
+| No line-level attribution | the frame knows its method, and the sample is charged there. Charging an IL offset would need the PDB the debugger reads, and a sample lands between instructions rather than on one |
+| Resolution is the host clock | `Host::monotonic_nanos` on a desktop is `Instant`; a board that has only milliseconds gets milliseconds, and a run shorter than one period reports no samples rather than a made-up distribution |
+
+**The hook costs nothing when nothing is attached.** One `Option::is_some` per
+instruction, the same shape as the debugger's. Measured rather than assumed:
+interleaved best-of-nine against a build with the check removed puts `fields`
+— the most instruction-dense workload — at 2,478.8 ms against 2,480.3 ms
+median, and `fib` at 446.3 against 433.4. Both within the run-to-run spread.
+
+**A program's own diagnostics come from the same counters.**
+`GC.GetTotalAllocatedBytes`, `GC.GetTotalMemory` and `GC.CollectionCount` read
+the heap the profiler reads, so a program cannot disagree with its own profile.
+Two consequences worth naming: `GC.GetAllocatedBytesForCurrentThread()` returns
+the **process** total, because there is one heap and no per-thread allocation
+context; and `GC.CollectionCount` ignores its generation argument, because the
+default collector is not generational and `GC.MaxGeneration` returns 0.
 
 ---
 

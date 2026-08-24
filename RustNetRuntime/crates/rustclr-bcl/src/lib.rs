@@ -117,6 +117,11 @@ pub(crate) mod fmath {
 }
 
 pub mod collections;
+pub mod graphics;
+pub mod net;
+pub mod hal;
+pub mod security;
+pub mod storage;
 pub mod console;
 pub mod interpolation;
 pub mod linq;
@@ -151,6 +156,12 @@ pub fn install(interp: &mut Interpreter) {
     linq::register(interp);
     tasks::register(interp);
     reflection::register(interp);
+    hal::register(interp);
+    storage::register(interp);
+    security::register(interp);
+    graphics::register(interp);
+    #[cfg(feature = "std")]
+    net::register(interp);
 }
 
 /// Registers the bindings a console program needs, and no more.
@@ -174,6 +185,13 @@ pub fn install_minimal(interp: &mut Interpreter) {
     spans::register(interp);
     marshal::register(interp);
     numerics::register(interp);
+    // The HAL is in the minimal set on purpose: a 192 KB board is exactly
+    // where a program is most likely to want a pin and least likely to want
+    // LINQ. Twenty-odd bindings, and without them the small tier could read an
+    // assembly but not do the one thing the board exists for.
+    hal::register(interp);
+    #[cfg(not(feature = "std"))]
+    net::register_offline(interp);
 }
 
 /// The number of native bindings [`install`] provides.

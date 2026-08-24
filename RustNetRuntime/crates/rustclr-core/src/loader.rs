@@ -179,6 +179,14 @@ pub struct Loader {
     by_name: HashMap<String, AssemblyId>,
     #[cfg(feature = "std")]
     search_paths: Vec<PathBuf>,
+    /// Portable PDBs, per assembly. Only ever loaded when asked for: a program
+    /// that is not being debugged should not pay to read them.
+    ///
+    /// Behind an `Arc` because a `Loader` is *cloned* per thread — that is what
+    /// lets every thread read the type registry without a lock — and copying a
+    /// whole PDB per thread would undo the point of it being optional.
+    #[cfg(feature = "std")]
+    debug_info: HashMap<AssemblyId, std::sync::Arc<rustclr_metadata::pdb::Pdb>>,
     primitives: HashMap<Primitive, TypeId>,
     core: CoreTypes,
     /// Synthetic assembly holding the natively implemented framework types.
@@ -203,6 +211,8 @@ impl Loader {
     /// Creates a loader with the framework contract pre-registered.
     pub fn new() -> Self {
         let mut loader = Loader {
+            #[cfg(feature = "std")]
+            debug_info: HashMap::new(),
             registry: TypeRegistry::new(),
             assemblies: Vec::new(),
             by_name: HashMap::new(),
@@ -1328,7 +1338,51 @@ impl Loader {
     pub fn load_from_file(&mut self, path: impl AsRef<Path>) -> ExecResult<AssemblyId> {
         let path = path.as_ref();
         let image = Image::from_file(path).map_err(ExecutionError::Metadata)?;
+        self.load_references_beside(&image, path)?;
         self.load_image(image)
+    }
+
+    /// Loads the assemblies this one references, from the directory it sits in.
+    ///
+    /// A `TypeRef` binds during [`Self::load_image`] and only to a type the
+    /// registry already has, so a library has to be loaded *before* the
+    /// program that uses it — which is why this runs first and recurses.
+    ///
+    /// # What is probed, and what is not
+    ///
+    /// Only `<dir>/<name>.dll`, and only for references that are not part of
+    /// the framework. That is not a heuristic about what a file contains: the
+    /// framework's own types are supplied natively by RustBCL, and loading
+    /// `System.Runtime.dll` from a self-contained publish would give the
+    /// program a second, conflicting `System.Object`. A reference with no file
+    /// beside it is left alone — it either binds to RustBCL or is reported by
+    /// name when something first uses it, which is what `rustnet verify`
+    /// prints.
+    ///
+    /// A cycle terminates because [`Self::load_image`] returns the existing id
+    /// for an assembly already loaded, and the name is recorded before the
+    /// references are followed.
+    #[cfg(feature = "std")]
+    fn load_references_beside(&mut self, image: &Image, path: &Path) -> ExecResult<()> {
+        let Some(directory) = path.parent() else { return Ok(()) };
+        let md = image.metadata();
+        let names: Vec<String> = (1..=md.row_count(TableId::AssemblyRef))
+            .filter_map(|r| md.assembly_ref(r).ok().map(|a| a.name.to_string()))
+            .collect();
+
+        for name in names {
+            if is_framework_assembly(&name) || self.by_name.contains_key(&name) {
+                continue;
+            }
+            let candidate = directory.join(format!("{name}.dll"));
+            if !candidate.is_file() {
+                continue;
+            }
+            // A file that is there but unreadable is a real problem and says
+            // so, rather than becoming an unresolved token later.
+            self.load_from_file(&candidate)?;
+        }
+        Ok(())
     }
 
     /// Loads an already-parsed image.
@@ -2397,6 +2451,86 @@ impl Loader {
         }
     }
 
+    /// Loads the portable PDB sitting beside an assembly, if there is one.
+    ///
+    /// Optional on purpose: debug information is a separate file that may
+    /// simply not be there, and a runtime that refused to run without one would
+    /// be useless. Returns whether anything was found, so a caller can say
+    /// "no source information" rather than silently offering none.
+    #[cfg(feature = "std")]
+    pub fn load_debug_info(&mut self, assembly: AssemblyId) -> bool {
+        let Some(path) = self.assembly(assembly).path.clone() else { return false };
+        let pdb_path = path.with_extension("pdb");
+        let Ok(bytes) = std::fs::read(&pdb_path) else { return false };
+        match rustclr_metadata::pdb::Pdb::parse(&bytes) {
+            Ok(pdb) => {
+                self.debug_info.insert(assembly, std::sync::Arc::new(pdb));
+                true
+            }
+            // A PDB that will not parse is reported as absent rather than
+            // fatal: it is an aid, and a stale or truncated one should not stop
+            // a program running.
+            Err(_) => false,
+        }
+    }
+
+    /// The debug information for an assembly, if any was loaded.
+    #[cfg(feature = "std")]
+    pub fn debug_info(&self, assembly: AssemblyId) -> Option<&rustclr_metadata::pdb::Pdb> {
+        self.debug_info.get(&assembly).map(|p| p.as_ref())
+    }
+
+    /// The source line an IL offset of a method belongs to.
+    #[cfg(feature = "std")]
+    pub fn source_line(&self, method: MethodId, il_offset: u32) -> Option<(String, u32)> {
+        let info = self.registry.method(method);
+        let pdb = self.debug_info.get(&info.assembly)?;
+        let debug = pdb.method(info.token.row())?;
+        let (document, line) = debug.line_for(il_offset)?;
+        Some((pdb.document(document)?.name.clone(), line))
+    }
+
+    /// The name of a local, if the PDB records one.
+    #[cfg(feature = "std")]
+    pub fn local_name(&self, method: MethodId, index: u16) -> Option<&str> {
+        let info = self.registry.method(method);
+        self.debug_info.get(&info.assembly)?.method(info.token.row())?.local_name(index)
+    }
+
+    /// Every place a breakpoint on `file:line` could go.
+    ///
+    /// A list rather than one answer, because a line can genuinely belong to
+    /// more than one method — a lambda and its enclosing method share lines,
+    /// and so do the parts of an `async` state machine. Returning all of them
+    /// and letting the caller set a breakpoint at each is what makes a
+    /// breakpoint on a lambda work; picking one would silently miss it.
+    ///
+    /// Empty when the line has no code at all, which is a real answer: an
+    /// editor asking about a blank line or a comment should be told the
+    /// breakpoint could not be placed rather than have it moved somewhere
+    /// nearby without saying so.
+    #[cfg(feature = "std")]
+    pub fn breakpoints_for_line(&self, file: &str, line: u32) -> Vec<(MethodId, u32)> {
+        let mut found = Vec::new();
+        for (assembly, pdb) in &self.debug_info {
+            let Some(document) = pdb.document_by_suffix(file) else { continue };
+            for method in self.registry.iter_methods() {
+                if method.assembly != *assembly {
+                    continue;
+                }
+                if !matches!(method.kind, MethodKind::Il(_)) {
+                    continue;
+                }
+                let Some(debug) = pdb.method(method.token.row()) else { continue };
+                if let Some(offset) = debug.offset_for_line(document, line) {
+                    found.push((method.id, offset));
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
     /// Which slot an instance field occupies, in any object that has it.
     ///
     /// The flattened layout is base-first, so a field declared in `T` sits at
@@ -2544,6 +2678,21 @@ fn type_sigs_match(a: &TypeSig, b: &TypeSig) -> bool {
         (GenericInst { definition: d1, .. }, GenericInst { definition: d2, .. }) => d1 == d2,
         _ => a == b,
     }
+}
+
+/// Whether a reference names part of the framework rather than a program's
+/// own library.
+///
+/// The framework is supplied by RustBCL natively; loading a real
+/// `System.*.dll` from beside a self-contained publish would give the program
+/// two of every framework type and bind its `TypeRef`s to the wrong one.
+#[cfg(feature = "std")]
+fn is_framework_assembly(name: &str) -> bool {
+    name == "mscorlib"
+        || name == "netstandard"
+        || name == "WindowsBase"
+        || name.starts_with("System")
+        || name.starts_with("Microsoft.")
 }
 
 /// The name a `TypeRef` row binds under, nesting included.

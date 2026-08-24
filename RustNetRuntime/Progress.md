@@ -1,14 +1,18 @@
 # Progress
 
-Tracking for RustNetRuntime. Updated 2026-08-23.
+Tracking for RustNetRuntime. Updated 2026-08-24.
 
-**Verified this session:** `cargo test --workspace` → 206 passed, 0 failed.
+**Verified this session:** `cargo test --workspace` → 416 passed, 0 failed.
+`bash tests/embedded.sh` → 14 crates × 4 bare-metal targets, all built without
+`std`. `bash tests/firmware.sh` → seven firmwares, each installing its real board.
+`bash tests/templates.sh` → all fourteen application templates build.
 Five programs — two conformance suites, a sample, and two written or edited by
 the assistant against a live LLM — produce byte-identical output on RustCLR and
 .NET.
 
 ```
-Conformance    IDENTICAL — checks=345 failures=0
+Device         64 checks, 0 failures  (HAL, storage, crypto, graphics)
+Conformance    IDENTICAL — checks=361 failures=0
 ModernSyntax   IDENTICAL — checks=35 failures=0
 UserDirectory  IDENTICAL
 PrimeSieve     IDENTICAL   (written by Jack from a prompt)
@@ -23,12 +27,501 @@ SensorGateway  IDENTICAL   (edited by Jack from a prompt)
 | --- | --- | --- |
 | `rustclr-metadata` | PE/COFF + ECMA-335 reader, signatures, IL bodies | 28 tests, incl. 9 against a real Roslyn-built assembly |
 | `rustclr-gc` | Handle-based heap, pluggable collectors, mark-sweep, **shared heap + stop-the-world safepoints** | 22 tests; 200k-deep graph marks without stack overflow |
-| `rustclr-core` | Type system, loader, IL interpreter, exception handling, **threads, monitors, task pool** | 25 tests, incl. multi-threaded |
+| `rustclr-core` | Type system, loader, IL interpreter, exception handling, **threads, monitors, task pool**, debugger hooks, **sampling profiler** | 31 tests, incl. multi-threaded |
 | `rustclr-bcl` | Native BCL: Console, String, Math, interpolation, tuples, ranges, Nullable, generic collections, LINQ, Task and async, spans, marshalling, reflection | 29 tests; 988 bindings |
 | `rustclr-sched` | Lock-free MS queue, MPMC channel, thread pool | 17 tests; the queue is the task pool's |
 | `rustclr-interop` | P/Invoke, dynamic loading, marshalling | 9 tests; calls the real `GetCurrentProcessId` |
 | `rustclr-jit` | Compiler trait, IL verifier, analysis, **x86-64 code generator** with floats, arrays, allocation and recursion, W^X pages, tiering | 62 tests, incl. differential against the interpreter |
-| `rustnet-cli` | `run` / `info` / `disasm` / `verify` / `build` / `capabilities` | Drives every fixture |
+| `rustclr-hal` | Board traits: GPIO, I2C, SPI, UART, I2S, PWM, ADC, CAN, 1-Wire, RTC, watchdog, extmem, netif, signals, camera | Zero dependencies; builds on four bare-metal targets |
+| `rustclr-hal-host` | A simulated board, so hardware code is testable on a desktop | 15 tests |
+| `rustclr-flashfs` | Log-structured store for raw NOR flash: named blobs, newest wins | 13 tests |
+| `rustclr-crypto` | SHA-256, HMAC-SHA256, AES-CTR, CRC-32 — written out, not depended on | 14 tests, all against published vectors |
+| `rustclr-hal-k210` · `-esp32c3` · `-rp2040` · `-stm32` | Real peripherals for four chips | 68 tests; each builds for its own bare-metal target |
+| `rustclr-secureboot` | Signed image containers, verified by MAC | 8 tests |
+| `rustclr-ota` | A/B slots, verified images, automatic rollback | 7 tests |
+| `rustclr-gfx` | RGB565 framebuffer, primitives, an embedded 8x8 font | 14 tests, including one that renders the font back to text |
+| `rustclr-mqtt` | An MQTT 3.1.1 codec, transport-free so it builds bare-metal | 4 tests |
+| `rustclr-usb` | USB descriptors and the CDC/HID classes a board presents | 4 tests |
+| `rustclr-db` | An embedded record store with a small SQL surface | 4 tests |
+| `rustclr-diag` | Structured logging and health counters | 9 tests |
+| `rustclr-net` | HTTP, MQTT, Modbus, a small web server | 7 tests; `std`-only — its transport is sockets |
+| `rustnet-cli` | `run` / `info` / `disasm` / `verify` / `build` / `capabilities` / `debug` / `debug --dap` / **`profile`** | Drives every fixture; 5 tests speak DAP to a real process |
+
+### mqtt-dashboard publishes to a real broker, and a stale constant nearly killed a board
+
+The `mqtt-dashboard` template runs, connects to `broker.hivemq.com:1883`,
+subscribes to its command topic and publishes telemetry. Confirmed from
+outside: a separate raw-socket MQTT client subscribed to the broker and
+received three of the dashboard's messages.
+
+```
+tx {"seq":3,"uptime_ms":27934,"rx":2,"chip":"host"}
+  RECEIVED: rustnet/MqttDashboard/telemetry -> {"seq":3,...}
+```
+
+**`RustNet.Net` had no bindings at all.** WiFi and MQTT are bound now, over
+`rustclr-net`'s real sockets. `Wifi.Connect` does two honest things rather than
+one dishonest one: with a board it associates through the HAL's
+`NetInterface`; without one it reports the machine's existing connectivity and
+`GetSsid` answers `host`, because a desktop's radio belongs to the operating
+system and a made-up network name would be worse than the truth.
+
+**A five-argument `string.Concat` did not work, and that is a .NET 9 change.**
+`params string[]` is gone from the reference assembly; Roslyn binds
+`params ReadOnlySpan<string>`, builds the arguments into an inline-array local
+and hands over a span. The declaring type is a `TypeSpec` this loader renders
+as a raw token, so the qualified-name key cannot be written down — the arity
+key can, and `String::Concat/1` now reads a span window through
+`spans::window_values` rather than guessing. The first attempt bound
+`Unsafe.As`, `Unsafe.Add` and `MemoryMarshal.CreateReadOnlySpan` again; they
+were already there and already correct, and the duplicates were removed.
+
+### The threshold that lied
+
+An **M5Stack Core2** — ESP32 rev v3.0, 16 MB, on COM14 — booted RustCLR,
+reported `bcl tier full (260702 bytes needed)` against its 278,528-byte budget,
+and panicked mid-registration on a 46-byte allocation.
+
+`FULL_BCL_BYTES` was measured when RustBCL had 826 bindings. It now has 1,060,
+and the constant had not moved. A threshold that says a board will fit and then
+kills it is worse than no threshold: the failure lands on a chip nobody can
+attach a debugger to.
+
+`cargo test -p rustclr-bcl --test footprint` now measures both tiers through a
+counting `GlobalAlloc` and **fails if either constant drifts below what the
+bindings cost**:
+
+| tier | was declared | measured |
+| --- | ---: | ---: |
+| full | 260,702 | **385,070** |
+| minimal | 192,045 | **252,092** |
+
+With the real numbers the Core2 takes the minimal tier — 435 bindings — and
+runs `HelloWorld.Main` cleanly, printing what `dotnet` prints. Capture:
+[docs/logs/m5stack-core2.log](docs/logs/m5stack-core2.log).
+
+**Two things that made the measurement itself wrong before it was right.** The
+first run had the tests sharing one process-wide counter, so whichever ran
+first paid for lazy statics and reported several kilobytes more — an
+order-dependent number, and a threshold guarded by one fails at random. The
+second had the serialising lock around the measurement but *not* the warm-up,
+so one test's frees landed inside another's window and the live total wrapped
+to 18,446,744,073,709,498,820 bytes. Both are fixed, and the figures now
+reproduce exactly.
+
+### Templates, tools, and a graphics demo on real glass
+
+Fourteen application templates and three host tools came across from the
+Gravicode RustNet reference, and `graphics-primitives` now runs on a Maix Go.
+
+**The managed library is seventeen assemblies, not one.** The first attempt
+merged them, on the reasoning that a board pays metadata per assembly. That was
+backwards, and measuring said so: a loaded assembly's types are *all* registered
+whether the program mentions them or not, so one combined library made a program
+that only draws also carry CAN, Modbus, MQTT, a camera, a VNC server and a
+database.
+
+| `graphics-primitives` | split (Core + Graphics) | one library |
+| --- | ---: | ---: |
+| assembly bytes | **23,552** across 3 | 62,976 |
+| types registered | **253** | 320 |
+| methods registered | **68** | 498 |
+
+430 extra methods for a program that draws. Each template's project references
+only the libraries its source names, derived from the file rather than guessed —
+the first pass read `using` lines alone and missed the fully-qualified uses,
+which is why seven templates would not build.
+
+**One managed change was required, and it is the same one every port needs.**
+RustCLR dispatches a native only for a method with **no IL body**, so the
+reference's `[InternalCall] ... => throw new RuntimeOnlyException()` would run
+the body and the binding would never fire. Every one became `extern` plus
+`[MethodImpl(MethodImplOptions.InternalCall)]`, which is the real .NET
+convention and what the metadata reader classifies correctly.
+
+**`rustnet-mdp` did not come across, and that is a feature.** The reference
+compiles a DLL to an intermediate `RNX` before deploying it. RustCLR reads
+PE/ECMA-335 directly, so what is signed and flashed is exactly what Roslyn
+produced — one fewer metadata writer to keep in step with the compiler, and one
+fewer place for the two to disagree. `RustNet.Deploy`, `RustNet.Workbench` and
+`RustNet.Designer` build with that step removed.
+
+`bash tests/templates.sh` instantiates all fourteen the way `rustnet new` would
+and builds them. A template that does not compile is not a template, and the
+way that gets noticed otherwise is somebody starting a project with one.
+
+### Four things the board found
+
+Getting `graphics-primitives` onto the Maix Go took four fixes, and none of
+them was the one that looked obvious.
+
+**A board has no filesystem to resolve an `AssemblyRef` against.** The firmware
+carries the libraries and loads them first, named by `RUSTCLR_LIB1`/`LIB2` at
+build time. On the chip: `library 0 RustNet.Core`, `library 1
+RustNet.Graphics`, then 253 types — the same number as the desktop.
+
+**The board was described and then dropped on the floor.** `exercise_board`
+reported what the chip had and the interpreter never got it, so a program that
+reached for a pin was told there was none on a board that plainly had one. It
+is owned now and moves in.
+
+**The program's console was captured, not streamed.** Output went into a
+`CaptureHost` and was printed when the entry point returned — and a device
+program loops forever, so nothing was ever printed. The board looked dead while
+it was in fact running the demo. This was the one that cost the most time, and
+it was diagnosed by noticing the earlier build only printed because it *crashed*.
+
+**A panel that is never reset stays dark.** `Display.Present()` was reaching a
+board with no panel attached, which is a documented no-op. Attaching the
+ST7789V driver also brings the backlight up: on a MaixLCD the backlight rail
+hangs off a PMOS switched by the panel's reset line. `[panel] ST7789V 320x240
+on SPI0 octal @ 15 MHz`, and `spi bus 0` correctly starts reporting
+`not on this chip` — the panel has claimed the controller.
+
+**And one that was not a bug.** A 320x240 RGB565 canvas is 153,600 bytes and
+the K210 firmware claimed 1 MB of its 6 MB SRAM; the allocation failed. Raising
+the budget to 2 MB fixed it. 4 MB was tried first and the board went silent —
+recorded in `embedded/k210/README.md` rather than left as a number somebody
+will try again.
+
+The demo runs indefinitely: gradients, a 3D cube, bouncing balls and matrix
+rain, 38 scenes observed without a panic.
+
+### The device layers, and the firmwares that install them
+
+Twelve crates ported or written from the Gravicode RustNet reference, and every
+one of them builds on all four bare-metal targets — `tests/embedded.sh` now
+checks fourteen crates rather than four, because a crate that only builds on a
+desktop is a crate a board cannot use and the way that gets noticed is a
+firmware build failing weeks later.
+
+| Crate | What it is | Evidence |
+| --- | --- | --- |
+| `rustclr-hal` | Board traits — the seam to the hardware | Zero dependencies |
+| `rustclr-hal-host` | A simulator, so device code runs on a desktop | 15 tests |
+| `rustclr-hal-k210` · `-esp32c3` · `-rp2040` · `-stm32` | Real peripherals, four chips | 68 tests; each builds for its own target |
+| `rustclr-flashfs` | Log-structured store for raw NOR flash | 13 tests |
+| `rustclr-crypto` | SHA-256, HMAC, AES-CTR, CRC-32 | 14 tests against published vectors |
+| `rustclr-secureboot` | Signed image containers | 8 tests |
+| `rustclr-ota` | A/B slots, verified images, automatic rollback | 7 tests |
+| `rustclr-gfx` | RGB565 framebuffer, primitives, an 8x8 font | 14 tests |
+| `rustclr-mqtt` · `-usb` · `-db` · `-diag` | Codecs and stores a device needs | 21 tests |
+| `rustclr-net` | HTTP, MQTT, Modbus, a small web server | 7 tests; `std`-only, and the manifest says why |
+
+**Every firmware now installs its real board.** The shared demo takes one and
+reports what the chip actually offers. On the Maix Go, over the wire:
+
+```
+-- hardware abstraction layer --
+board            Sipeed Maix Go
+gpio pin 0       yes
+adc channel 0    not supported
+i2c bus 0        yes
+spi bus 0        yes
+uart port 0      yes
+pwm channel 0    not on this chip
+external memory  not on this chip
+watchdog         idle
+monotonic clock  moves forward
+```
+
+**Nothing in that report drives an output**, and that is the point. A firmware
+demo that wrote a pin would be writing an arbitrary pin on hardware whose
+wiring it does not know — a short across a driver, or a relay clicking in a
+cabinet nobody is watching. Asking the HAL to *resolve* a peripheral proves the
+whole path and cannot damage anything. The ADC is read because reading one is
+passive.
+
+### Three things the port could not simply copy
+
+**The font.** `rustclr-gfx` used `font8x8`. The glyphs are now a 1 KB table in
+`crates/rustclr-gfx/src/font.rs`, generated from pixel art that a person can
+read — and the test renders the table *back* to text, so a wrong byte shows up
+as a misshapen letter rather than as a number nobody can check. Another test
+proves all 94 printable glyphs are distinct, which is what catches a
+copy-paste slip in a 128-entry table.
+
+**Secure boot.** The reference verifies an RSA PKCS#1 v1.5 signature. RSA needs
+bignum arithmetic, this workspace has no external dependencies, and a
+hand-rolled bignum with a timing side channel is *worse* than no signature
+check — it is a check that reports success. So the container verifies an
+HMAC-SHA256 against a key provisioned at flash time. What that still gives:
+nobody without the key can produce an image the device accepts. What it does
+not: the verifying key is also a signing key, so extracting it from one device
+lets an attacker sign for all of them. Both halves are in the crate docs and in
+`docs/limitations.md`, because a MAC honestly described beats a signature that
+is not really one.
+
+**A lock for a chip with no atomics.** `rustclr-diag` shares a logger, which
+needs mutual exclusion — and **thumbv6m and rv32imc have no compare-and-swap at
+all**, so `AtomicBool::compare_exchange` does not compile there and
+`alloc::sync::Arc` is configured out for the same reason. The first attempt was
+a spin lock and would have hung any board where an interrupt handler logged
+while the main loop held it. It is now a *try*-borrow that drops the record and
+counts it. Losing a log line is a cost; a hung board is not one anybody would
+accept to avoid it.
+
+### The blocker, and one BCL gap it found
+
+`Device.dll` references `RustNet.Device.dll` beside it, and the loader had
+never followed an `AssemblyRef` — a `TypeRef` binds only to a type already in
+the registry, so every `RustNet.Hal` token failed to resolve.
+`load_from_file` now loads referenced assemblies from the directory first and
+recurses. Framework names are skipped deliberately: loading a real
+`System.Runtime.dll` from a self-contained publish would give the program a
+second, conflicting `System.Object`.
+
+The device fixture then needed `Encoding.UTF8.GetBytes`, which did not exist.
+UTF-8 and ASCII now do, with the code page carried on the instance so the two
+are genuinely different objects rather than one that behaves like whichever was
+asked for last.
+
+### A C# program can drive hardware
+
+`RustNet.Hal.Gpio.Write(2, true)` now reaches a pin. The path is C# →
+`RustNet.Device.dll` → a native binding → a `Board` trait object → the chip,
+and every link of it is exercised by `tests/fixtures/Device`, which reports
+**43 checks, 0 failures** against the simulator.
+
+**The board is a module, not a wiring.** `requirements.md` asks for the
+collector and the scheduler to be swappable; a peripheral bolted into the
+interpreter would have been the one place that was not honoured. `Board` hangs
+off the interpreter the way the host and the collector do, `crates/rustclr-hal`
+is traits and nothing else, and `crates/rustclr-hal-host` is a simulator so
+hardware code is testable on a desktop. `run --board host` installs it; an
+unknown name lists what exists rather than falling back to the simulator,
+because a program that quietly ran against a simulation when it meant to drive
+a relay has done something worse than fail.
+
+**No board is an error.** Every binding throws, naming what was missing and
+what to do. Only `Board.Name` and `Board.IsPresent` answer without one.
+
+**The blocker was assembly references.** `Device.dll` references
+`RustNet.Device.dll` sitting beside it, and the loader had never followed an
+`AssemblyRef` — a `TypeRef` binds only to a type already in the registry, so
+every `RustNet.Hal` token failed to resolve. `load_from_file` now loads the
+referenced assemblies from the directory first and recurses. Framework names
+are skipped on purpose: loading a real `System.Runtime.dll` from a
+self-contained publish would give the program a second, conflicting
+`System.Object`.
+
+**Storage is whole-file, and that is the shape rather than a subset.**
+`RustNet.IO.Storage` over a log-structured store: writes append, newest wins,
+deletes leave a tombstone. NOR flash clears bits and cannot set them, so a
+seekable stream would mean read-erase-write of a whole sector per write — slow,
+and a power-loss window over data that was previously fine.
+
+### Crypto, written out rather than depended on
+
+The reference implementation reaches for `sha2`, `hmac`, `aes`, `ctr` and
+`rsa`. This workspace has no external dependencies, and that posture is why the
+PE reader, the metadata reader, the portable-PDB reader and the debug adapter's
+JSON are all here in full. So `crates/rustclr-crypto` writes out SHA-256,
+HMAC-SHA256, AES-128/256-CTR and CRC-32 — and checks them against the vectors
+their specifications publish:
+
+| | |
+| --- | --- |
+| SHA-256 | FIPS 180-4, including the million-`a` case that catches a 32-bit length counter |
+| AES | FIPS 197 Appendix B and C.3, both key sizes |
+| AES-CTR | NIST SP 800-38A §F.5.1 |
+| HMAC-SHA256 | RFC 4231, including the over-long key that must be hashed rather than truncated |
+| CRC-32 | the `123456789` check value every implementation publishes |
+
+All fourteen passed on the first run, which is the point: a published vector is
+a stronger claim about correctness than a resolved dependency is.
+
+**What is refused, and why.** No RSA and no elliptic curves — signature
+verification needs bignum arithmetic, and a hand-rolled bignum with a side
+channel is worse than no signature check, because it is a check that reports
+success. No random number generator: entropy belongs to the chip and comes
+through the HAL. AES is counter mode only, because ECB encrypts equal blocks to
+equal ciphertext and offering it beside CTR would be offering a foot-gun with
+the same shape as the safe option. A key that is not 16 or 32 bytes is refused
+rather than padded.
+
+**`Hmac.Verify` exists so nobody writes `computed == expected`.** That
+comparison exits at the first differing byte, and how long it took says where
+that byte was — enough to forge a tag one byte at a time. The binding compares
+in constant time, and the managed doc comment says why the method is there.
+
+### System.Text.Encoding
+
+A real BCL gap, found by a fixture that needed `Encoding.UTF8.GetBytes`. UTF-8
+and ASCII, with the code page carried on the instance so the two are genuinely
+different objects rather than one that behaves like whichever was asked for
+last. Nine Conformance checks, byte-identical to `dotnet` — **361 checks now**
+— and mutation-checked: an encoding that ignored its code page fails two of
+them.
+
+ASCII substitutes `?` rather than throwing, and invalid UTF-8 decodes lossily
+to U+FFFD, both matching .NET. The strict `throwOnInvalidBytes` form is not
+offered rather than offered and quietly behaving like the lossy one.
+
+### RISC-V 64 runs, on a Maix Go
+
+A Sipeed Maix Go arrived on COM10 and settled two open questions at once.
+
+**The interpreter runs on RV64GC.** `HelloWorld.Main` executes on the K210 and
+prints the same three lines `dotnet` does, with the full RustBCL tier — 992
+native bindings, 245 types, nothing trimmed, because 6 MB of SRAM against a
+261 KB peak is the one board of seven with room to spare. The collector suite
+passes beside it. Capture: [docs/logs/maixgo-k210.log](docs/logs/maixgo-k210.log).
+That makes **three architectures** that have run the interpreter on hardware —
+RISC-V 32, RISC-V 64 and Xtensa LX6 — from one source file.
+
+**The HuskyLens was the HuskyLens.** The same firmware, built the same way, had
+been silent on a Sipeed HuskyLens on 2026-08-21, and four causes had been ruled
+out without reaching a verdict. The Maix Go is the second K210 that was needed:
+the firmware is fine, and the failure is in that product's hand-off or its
+`riscv-rt` startup.
+
+**The board found a bug in five minutes.** The sixth report died with
+`memory allocation of 73728 bytes failed` on a 1 MB heap the collector said held
+nothing. Not a leak — **fragmentation**: each report builds the whole runtime
+(260 KB of bindings, a 98 KB slot table) and tears it down, and after five rounds
+a linked-list allocator has no contiguous 72 KB block left. The allocator is now
+re-initialised before each report, which is sound because nothing that outlives
+an iteration is on the heap — `run` drops everything it made, `Detail` is a fixed
+96-byte array, `Uarths` is a unit struct. Verified the way it was found: **45
+consecutive reports, no panic**, where the previous build died at six.
+
+**How to do it again safely.** `kflash -p COM10 -b 1500000 -s fw.bin` boots into
+SRAM and never touches the SPI flash — which matters on a commercial K210 module
+whose flash holds the product's own firmware. Watch the console with **DTR and
+RTS cleared**: on this board they drive ISP and reset, and asserting either
+discards the SRAM image and boots whatever is on flash instead.
+
+**The RISC-V code generator still has not run.** `crates/rustclr-jit` is
+`std`-only — `cargo build -p rustclr-jit --target riscv64gc-unknown-none-elf`
+fails with "can't find crate for `std`" and 463 more, because the crate has no
+`no_std` attribute and therefore no prelude — and `codepage.rs` gets its
+executable pages from `mmap`/`VirtualAlloc`, neither of which exists on bare
+metal. The backend itself is the small part: `riscv64.rs` emits RV64I/M and its
+tests assert the exact bytes. What stands between it and this board is a
+`no_std` port of the crate around it and a `CodePage` that is a static aligned
+buffer plus a `fence.i`. The K210 makes that worth doing — it is the only
+RV64 board here, and the ESP32-C3 is RV32, which this backend does not target.
+
+### The profiler samples itself
+
+`rustnet profile` reports where a program's time went, by method, and what it
+allocated, by type. Self time and inclusive time separately — the two orders
+rarely agree, and the difference is usually the answer — with exact call counts
+beside them.
+
+**There is no sampling thread.** Reading another thread's frame stack means
+stopping it first, and the only machinery for that is the collector's. Instead
+the interpreter counts down 512 instructions, reads the clock itself, and walks
+its own frames. That means no synchronisation on the path that runs every
+instruction, a stack that is never caught mid-update, and a profiler that works
+on a microcontroller, where there is no second thread to spare and the clock is
+a hardware timer.
+
+**Measured elapsed time is charged, not one tick per sample.**
+`Thread::sleep(1ms)` on Windows is anywhere from 1 to 15 ms depending on what
+timer resolution the process happens to have. A profiler that assumed its
+period was honoured would report a program as fifteen times faster than it was;
+charging what the clock says removes the question, and a unit test fires a
+sample 50× late and asserts the whole gap is charged.
+
+**Calls are counted, not sampled.** `fib(20)` reports exactly 21,891. A call is
+rare enough that an increment on it distorts nothing, and "called four million
+times" is often the whole answer. The tables are `Vec`s indexed by `MethodId`
+rather than maps keyed by it — a profiler that hashed on the call path would be
+measuring itself.
+
+**Arrays are charged to their element type.** The first run reported
+`System.Array 45.5%`, which is not something anybody can act on: `new int[n]`
+needs no `TypeSpec` row, so every runtime-made array fell back to the base type.
+A second table indexed by *element* type turned that into `System.Int32[] 43.5%`.
+
+**The hook costs nothing when nothing is attached** — one `Option::is_some` per
+instruction, cold and never inlined, the same shape as the debugger's.
+Interleaved best-of-nine against a build with the check removed: `fields`
+2,478.8 ms against 2,480.3 median, `fib` 446.3 against 433.4. Within the spread.
+
+**A test found an allocation site that was invisible.** The totals have to add
+up — what the profiler charges to types must equal what the heap accounted for —
+and on `HelloWorld` they did not. `await`'s state-machine cell went straight to
+`heap.alloc`, skipping both the allocation counter and the attribution. It now
+goes through `Interpreter::alloc_clr_object`, and the test says so byte for
+byte. On a *threaded* program the totals legitimately differ, because a worker
+thread has no profiler; that test asserts >99% instead, which is exactly the
+gap a threaded fixture leaves and far smaller than a missing site would.
+
+**Seven Conformance checks, all invariants.** How many bytes a runtime allocates
+for the same program is its own business, so nothing pins a number: what both
+runtimes must agree on is that `GC.GetTotalAllocatedBytes` never decreases and
+does move when the program allocates, that `GC.Collect()` shows up in
+`GC.CollectionCount`, and that cumulative allocation outgrows live bytes once
+garbage has been dropped. Mutation-checked: returning live bytes under the
+allocated name fails two of them, and returning a constant fails another.
+
+### VSCode can attach
+
+`rustnet debug --dap` is a Debug Adapter Protocol server: JSON over stdin and
+stdout, framed with `Content-Length:` headers exactly as LSP is. An editor sets
+breakpoints by source line, sees the call stack with file and line, reads
+arguments and locals by name, and steps.
+
+**The runtime's hook was already the right shape.** `Debugger::stopped` is
+called with the program stopped and does not return until it says what to do
+next, which is exactly what an adapter wants: send `stopped`, then keep
+answering `stackTrace`, `scopes` and `variables` until the editor sends a step
+or a continue, and return that. The consequence is stated in the docs rather
+than left to be discovered — while the program *runs*, no request is serviced,
+so an editor's pause button does nothing until the next breakpoint.
+
+**The JSON is hand-written.** This workspace has no external dependencies, and
+DAP messages are flat objects of strings, numbers and short arrays. Pulling in
+`serde_json` to carry them would have been a larger change to the project than
+the feature it serves. 4 unit tests, including one that checks malformed input
+is refused rather than guessed at.
+
+**stdout had to be taken away from the program.** A `Console.WriteLine` written
+straight to stdout lands *inside* a framed message and the editor drops the
+connection. The debuggee gets a host whose writes become `output` events — where
+an editor shows them anyway, and live rather than at the next stop — sharing one
+locked writer with the adapter so a message is never interleaved. `Console.ReadLine`
+answers `null`: stdin carries the editor's requests, and handing the program a
+line of protocol would be worse than telling it there is no console.
+
+**Every thread's console, not just the first.** `Thread.Start` and the task
+pool each built a `SystemHost` outright, so a worker thread's output went to the
+real stdout however the main thread had been redirected — silent corruption of
+the protocol stream for any program that prints from a thread. The interpreter
+now carries a *host factory* the embedder sets, `worker()` copies it, and every
+place that starts a managed thread goes through it. A test in
+`crates/rustclr-core/tests/parallel.rs` fails if a spawned thread writes
+anywhere else.
+
+**The tests drive a real process.** `crates/rustnet-cli/tests/dap.rs` spawns
+`rustnet debug --dap`, speaks framed JSON to it over a pipe, and asserts on what
+comes back. Each was mutation-checked: reporting every breakpoint `verified`
+fails the unverified-line test, an off-by-one in the sequence-point search fails
+the stack-line test, and writing the program's console to real stdout fails the
+output-event test by corrupting the stream the test reads.
+
+### Source-line breakpoints, from a real PDB
+
+`crates/rustclr-metadata/src/pdb.rs` reads the portable PDB the .NET SDK writes
+beside an assembly. It is not a separate format so much as a separate *file* in
+the one already parsed — the same `BSJB` header, with tables 0x30–0x37 carrying
+documents, sequence points and local names.
+
+`rustnet debug --break Program.cs:2189` now resolves to
+`Conformance.Program::Triple(int) at IL_0000`, stops there, and prints every
+frame as `file:line`. Locals render by name. A line with **no** code is refused
+(`no code on Program.cs:1`) rather than moved to a nearby line that has some,
+and a line is resolved to *every* place it has code, because a lambda and its
+enclosing method share lines.
+
+**Two bugs the fixture found.** The absolute line and column belong to the first
+*non-hidden* sequence point, not the first record — reading them from the first
+record produced a `negative sequence point` error on the first real PDB tried.
+And my own test asserted that `checks` and `failures` were locals of `Main`;
+they are static fields, so the test was wrong and the reader was right.
 
 ### Recursion compiles
 
@@ -767,7 +1260,7 @@ is one copy of it, and four copies would have drifted.
 | ESP32-C3 | RISC-V 32 | `riscv32imc-unknown-none-elf` | full | **executes IL on hardware** |
 | ESP32-WROOM-32 | Xtensa LX6 | `xtensa-esp32-none-elf` | full | run on hardware (pre-interpreter) |
 | Meadow F7 Micro | Arm Cortex-M7 | `thumbv7em-none-eabihf` | full | run on hardware (pre-interpreter) |
-| Sipeed Maix Go | RISC-V 64 | `riscv64gc-unknown-none-elf` | full | builds; **not yet flashed** |
+| Sipeed Maix Go | RISC-V 64 | `riscv64gc-unknown-none-elf` | full | **runs on hardware** — COM10, SRAM boot |
 | Netduino 3 WiFi | Arm Cortex-M4F | `thumbv7em-none-eabihf` | minimal | builds; **not yet flashed** |
 | Raspberry Pi Pico | Arm Cortex-M0+ | `thumbv6m-none-eabi` | minimal | builds; **not yet flashed** |
 | Nucleo-F401RE | Arm Cortex-M4F | `thumbv7em-none-eabihf` | **none** | builds; **not yet flashed** |
@@ -1436,6 +1929,10 @@ Each was found by running something real, not by reading code.
 | Bug | Found by |
 | --- | --- |
 | PE optional-header skip was 44/56 bytes instead of 60/76 — **every** image failed to load | Parsing a real Roslyn assembly instead of a hand-built fixture |
+| The K210 firmware exhausted a 1 MB heap after five reports — heap fragmentation from building and tearing down the whole runtime, not a leak | Running it on a real Maix Go and watching past the first report |
+| `await`'s state-machine cell went straight to `heap.alloc`, so it was counted by neither the allocation statistic nor the profiler | Asserting that what the profiler charges to types equals what the heap accounted for. On `HelloWorld` it was 4 objects short |
+| Under `--dap`, a thread the program started wrote to the **real** stdout: `Thread.Start` and the task pool both built a `SystemHost` outright, so one `Console.WriteLine` from a worker would land inside a framed message and the editor would drop the connection | Trying to verify a sentence before writing it into `rustnet capabilities` — the claim was about worker threads, and reading `Interpreter::worker` showed it copied neither the host nor the debugger |
+| The absolute line and column of a portable PDB's sequence points belong to the first **non-hidden** point, not the first record | The first real PDB tried reported a `negative sequence point` |
 | The x86-64 verifier gave every `call` the *enclosing* method's stack delta, so any non-recursive call drifted the depth and reported a stack error in valid IL | `rustnet jit` on the benchmark assembly: two methods said "IL verification failed" where `rustnet verify` said the same assembly was fine |
 | Scalar replacement bailed on every method, because `ret` is signature-dependent and has no static stack effect to look up — the catch-all arm refused it | `rustnet jit` still listing `FieldAccess` as declined after the pass was wired in |
 | A devirtualised call on a **null** receiver reported "the hierarchy analysis was wrong" instead of throwing `NullReferenceException` | Deleting the null guard and finding the Conformance check still passed — the method under test was compilable but never *compiled*, because the tier only takes a method that loops or is called 32 times |
@@ -1554,7 +2051,7 @@ which, because those are not the same thing.
 5. **IL runs on hardware; ahead-of-time compilation does not.** An ESP32-C3
    (RISC-V 32) and an M5Stack Tough (Xtensa LX6) both execute `HelloWorld.Main`
    with the whole of RustBCL, printing bytes identical to `dotnet`. The Pico,
-   Netduino, Nucleo-F401RE and K210 images build but have never been flashed —
+   Netduino and Nucleo-F401RE images build but have never been flashed —
    no board was connected. AOT additionally needs the Arm and RISC-V code
    generators to execute, which is (3).
 
@@ -1577,11 +2074,12 @@ which, because those are not the same thing.
 
    | | |
    | --- | --- |
-   | Debug Adapter Protocol server | the *hooks* are built — breakpoints, stepping, frame inspection, and `rustnet debug` — but nothing speaks DAP, so VSCode and Rider cannot attach |
-   | Source-line breakpoints and variable names | both need a portable-PDB reader; breakpoints are by IL offset today |
+   | Editor extension for the debug adapter | `rustnet debug --dap` is a stdio DAP server and VSCode or Rider can attach to it, but nothing contributes the debug type and launches it |
+   | Expression evaluation while stopped | no `evaluate` request, so an editor's watch window and debug console cannot compute anything |
    | `rustnet deploy` | CodeGen has a Deploy menu and a device flasher; the CLI has no `deploy` command |
-   | Profiler and diagnostics | `run --stats` reports execution and heap counters; there is no profiler |
+   | A call graph, and CPU time | `rustnet profile` reports self and inclusive time per method, exact call counts and allocation by type — but not caller/callee edges, and it measures wall clock, so time blocked in a wait counts against the waiter |
    | Ahead-of-time compilation | only the JIT exists — see (3) and (5) |
+   | The RISC-V and AArch64 code generators have never executed | both emit and both are byte-checked against a disassembler, but `can_compile` answers false off a matching host. The Maix Go could now run the RISC-V one — what is in the way is that `rustclr-jit` is `std`-only and `codepage.rs` needs `mmap`/`VirtualAlloc` |
 
 ### Advanced C# features
 

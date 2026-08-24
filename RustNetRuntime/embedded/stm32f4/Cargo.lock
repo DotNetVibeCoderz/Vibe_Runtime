@@ -320,7 +320,11 @@ version = "0.1.0"
 dependencies = [
  "libm",
  "rustclr-core",
+ "rustclr-crypto",
+ "rustclr-flashfs",
  "rustclr-gc",
+ "rustclr-gfx",
+ "rustclr-hal",
 ]
 
 [[package]]
@@ -328,8 +332,14 @@ name = "rustclr-core"
 version = "0.1.0"
 dependencies = [
  "rustclr-gc",
+ "rustclr-gfx",
+ "rustclr-hal",
  "rustclr-metadata",
 ]
+
+[[package]]
+name = "rustclr-crypto"
+version = "0.1.0"
 
 [[package]]
 name = "rustclr-demo-common"
@@ -338,12 +348,38 @@ dependencies = [
  "rustclr-bcl",
  "rustclr-core",
  "rustclr-gc",
+ "rustclr-hal",
  "rustclr-metadata",
+]
+
+[[package]]
+name = "rustclr-flashfs"
+version = "0.1.0"
+dependencies = [
+ "rustclr-hal",
 ]
 
 [[package]]
 name = "rustclr-gc"
 version = "0.1.0"
+
+[[package]]
+name = "rustclr-gfx"
+version = "0.1.0"
+dependencies = [
+ "rustclr-hal",
+]
+
+[[package]]
+name = "rustclr-hal"
+version = "0.1.0"
+
+[[package]]
+name = "rustclr-hal-stm32"
+version = "0.1.0"
+dependencies = [
+ "rustclr-hal",
+]
 
 [[package]]
 name = "rustclr-metadata"
@@ -357,6 +393,7 @@ dependencies = [
  "cortex-m-rt",
  "embedded-alloc",
  "rustclr-demo-common",
+ "rustclr-hal-stm32",
  "stm32f4xx-hal",
 ]
 

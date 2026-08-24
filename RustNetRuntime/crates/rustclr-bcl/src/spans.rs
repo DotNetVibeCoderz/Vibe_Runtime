@@ -582,3 +582,32 @@ fn create_span(interp: &mut Interpreter, args: &[Value]) -> ExecResult<Option<Va
     }
     Ok(Some(Value::Obj(new_window(interp, array, 0, count as i32)?)))
 }
+
+/// Every element a span window is looking at.
+///
+/// Exported because `String.Concat(ReadOnlySpan<string>)` — which is what
+/// `string.Concat(a, b, c, d, e)` binds to on .NET 9 and later — needs to read
+/// one, and a span is a window rather than an array: source, start, length.
+/// Reading `Source` directly from `strings.rs` would put this file's slot
+/// layout in two places.
+pub fn window_values(interp: &mut Interpreter, window: Value) -> Option<Vec<Value>> {
+    let Value::Obj(handle) = window else { return None };
+    if handle.is_null() {
+        return None;
+    }
+    // Only a span window has these four slots filled this way; anything else
+    // reads as `None` and the caller falls back rather than guessing.
+    let fields = interp
+        .heap
+        .with::<rustclr_core::ClrObject, _>(handle, |o| o.fields.clone())?;
+    if fields.len() <= WIDTH {
+        return None;
+    }
+    let source = fields[SOURCE].as_handle()?;
+    let start = fields[START].as_i32().unwrap_or(0);
+    let length = fields[LENGTH].as_i32().unwrap_or(0);
+    if source.is_null() || length < 0 {
+        return None;
+    }
+    Some((0..length).map(|n| element(interp, source, start + n)).collect())
+}

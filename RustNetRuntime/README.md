@@ -24,10 +24,10 @@ handling — produces identical output on both runtimes:
 
 ```console
 $ dotnet Conformance.dll
-checks=345 failures=0
+checks=361 failures=0
 
 $ rustnet run Conformance.dll --stats
-checks=345 failures=0
+checks=361 failures=0
 
 ─── execution ──────────────────────────────
   wall clock                1367.141 ms
@@ -54,7 +54,7 @@ line divides all 844,563 instructions by time that was largely spent blocked,
 and understates the interpreter considerably. The counters either side of it —
 instructions, calls, allocations — are exact.
 
-The 345 checks cover arithmetic and overflow, `long` maths, control flow,
+The 361 checks cover arithmetic and overflow, `long` maths, control flow,
 strings, arrays, class inheritance, virtual and interface dispatch, properties,
 structs, enums, boxing and casting, `try`/`catch`/`finally`, exception filters,
 nested handlers, divide-by-zero, delegates, generics, LINQ, `async`/`await`,
@@ -64,7 +64,7 @@ allocation under collection pressure. A second suite,
 `tests/fixtures/ModernSyntax/`, does the same for 35 modern C# features. Both
 are normal C# projects you can read and extend.
 
-`cargo test --workspace` runs 206 tests across the eight crates.
+`cargo test --workspace` runs 416 tests across the twenty-five crates.
 
 ---
 
@@ -237,11 +237,11 @@ Full walkthrough: [docs/getting-started.md](docs/getting-started.md).
 | --- | --- |
 | **RustCLR** | The runtime: garbage collector, type system, assembly loader, IL execution engine, exception handling |
 | **RustBCL** | The base class library, implemented natively in Rust — `Console`, `String`, `Math`, `Convert`, `StringBuilder`, `Array`, `GC`, and more |
-| **RustNet Toolchain** | `rustnet` — build, run, inspect, disassemble and verify assemblies |
+| **RustNet Toolchain** | `rustnet` — build, run, inspect, disassemble, verify, **debug** and **profile** assemblies |
 | **Interop Bridge** | P/Invoke into native libraries, with marshalling and safe handle wrappers |
 | **CodeGen** | The Avalonia IDE and its assistant |
 
-Eight Rust crates:
+Twenty-five Rust crates:
 
 ```
 rustclr-metadata   PE/COFF and ECMA-335 reader
@@ -251,6 +251,23 @@ rustclr-bcl        Native base class library
 rustclr-sched      Lock-free queue, channels, thread pool
 rustclr-interop    P/Invoke and marshalling
 rustclr-jit        Compilation interface and IL verifier
+rustclr-hal        Board traits — the seam to the hardware
+rustclr-hal-host   A simulated board, so device code runs on a desktop
+rustclr-hal-k210   Kendryte K210 (RISC-V 64)
+rustclr-hal-esp32c3  ESP32-C3 (RISC-V 32)
+rustclr-hal-rp2040   RP2040 (Cortex-M0+)
+rustclr-hal-stm32    STM32F4 and F7 (Cortex-M4F / M7)
+rustclr-flashfs    Log-structured store for raw NOR flash
+rustclr-crypto     SHA-256, HMAC, AES-CTR, CRC-32
+rustclr-secureboot Signed image containers
+rustclr-ota        A/B slots, verified images, automatic rollback
+rustclr-gfx        RGB565 framebuffer, primitives, an 8x8 font
+rustclr-mqtt       An MQTT 3.1.1 codec, transport-free
+rustclr-usb        USB descriptors and device classes
+rustclr-db         An embedded record store
+rustclr-diag       Structured logging and health counters
+rustclr-net        HTTP, Modbus, a small web server (host only)
+rustclr-espat      Espressif AT commands, without a UART
 rustnet-cli        The toolchain binary
 ```
 
@@ -267,10 +284,24 @@ rustnet disasm <assembly> [filter]           # disassemble to IL
 rustnet verify <assembly>                    # report what will not resolve
 rustnet build [project] [--run]              # compile, then run here
 rustnet capabilities                         # what this runtime implements
+rustnet debug <assembly> --break File.cs:42  # stop at a source line
+rustnet debug <assembly> --dap               # speak DAP, so an editor can attach
+rustnet profile <assembly> [--top N]         # where the time went, and what allocated
 ```
 
 `verify` is the one to reach for first when porting: it names every member a
 program references that RustCLR cannot yet supply, before you run it.
+
+`profile` samples between IL instructions — no sampling thread, so the same
+profiler runs on a microcontroller — and reports self and inclusive time per
+method, exact call counts, and allocation by type, with arrays charged to their
+element type. It measures wall clock, profiles the thread that runs `Main`, and
+interprets by default, because compiled code executes no IL.
+
+`debug` stops before a chosen line or IL offset, steps into, over and out, and
+shows every frame's arguments and locals — by name, where the portable PDB the
+SDK writes beside the assembly names them. With `--dap` it is a Debug Adapter
+Protocol server over stdin and stdout, which is what VSCode and Rider speak.
 
 Reference: [docs/cli.md](docs/cli.md).
 
@@ -562,7 +593,7 @@ allocator.
 | [M5Stack Tough](embedded/esp32-demo) | Xtensa LX6 | 520 K | full | **executes IL on hardware** |
 | [ESP32-WROOM-32](embedded/esp32-demo) | Xtensa LX6 | 520 K | full | same image; last flashed pre-interpreter |
 | [Meadow F7](embedded/meadow-f7) | Cortex-M7 | 384 K | full | builds; last flashed pre-interpreter |
-| [Maix Go K210](embedded/k210) | RISC-V 64 | 6 M | full | builds; never flashed — no board |
+| [Maix Go K210](embedded/k210) | RISC-V 64 | 6 M | full | **runs** — executes `HelloWorld.Main`, output identical to `dotnet` |
 | [Netduino 3 WiFi](embedded/stm32f4) | Cortex-M4F | 256 K | minimal | builds; never flashed — no board |
 | [Pico](embedded/rp2040) | Cortex-M0+ | 256 K | minimal | builds; never flashed — no board |
 | [Nucleo-F401RE](embedded/stm32f4) | Cortex-M4F | 96 K | **none** | builds; never flashed — no board |
@@ -573,9 +604,10 @@ them — and its image is 21 KB rather than 282 KB, because LTO strips an
 interpreter the constant says can never be reached.
 
 All seven share one demonstration ([embedded/demo-common](embedded/demo-common))
-and `bash tests/firmware.sh` builds them. **Two architectures have run the
-interpreter on hardware** — RISC-V 32 and Xtensa LX6, from the same source
-file: [ESP32-C3](docs/logs/esp32c3-interpreter.log) ·
+and `bash tests/firmware.sh` builds them. **Three architectures have run the
+interpreter on hardware** — RISC-V 32, RISC-V 64 and Xtensa LX6, from the same
+source file: [ESP32-C3](docs/logs/esp32c3-interpreter.log) ·
+[Maix Go K210](docs/logs/maixgo-k210.log) ·
 [M5Stack Tough](docs/logs/m5stack-tough.log). Earlier metadata-and-GC captures:
 [Xtensa](docs/logs/esp32-wroom32.log) · [RISC-V](docs/logs/esp32c3.log) ·
 [Arm](docs/logs/meadow-f7.log).
@@ -597,6 +629,7 @@ size.
 - [The runtime in depth](docs/runtime.md)
 - [CodeGen guide](docs/codegen.md) · [Bahasa Indonesia](docs/id/codegen.md)
 - [Toolchain reference](docs/cli.md)
+- [Writing device code](docs/device.md)
 - [Templates](docs/templates.md)
 - [Limitations](docs/limitations.md)
 - [Roadmap](Plan.md) · [Progress](Progress.md)

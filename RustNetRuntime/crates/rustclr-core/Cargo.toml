@@ -10,7 +10,7 @@ rust-version.workspace = true
 
 [features]
 default = ["std"]
-std = ["rustclr-metadata/std", "rustclr-gc/std", "dep:rustclr-sched"]
+std = ["dep:rustclr-net", "rustclr-metadata/std", "rustclr-gc/std", "dep:rustclr-sched"]
 
 [dependencies]
 # Not `workspace = true`: the workspace entry turns default features on, and a
@@ -18,6 +18,13 @@ std = ["rustclr-metadata/std", "rustclr-gc/std", "dep:rustclr-sched"]
 # without `std`, so it names the paths itself.
 rustclr-metadata = { path = "../rustclr-metadata", version = "0.1.0", default-features = false }
 rustclr-gc = { path = "../rustclr-gc", version = "0.1.0", default-features = false }
+# The board seam. Traits only, no dependencies of its own, and it builds
+# without `std` — a board is as much a swappable module as the collector is.
+rustclr-hal = { path = "../rustclr-hal", version = "0.1.0", default-features = false }
+# The drawing surface `RustNet.Graphics` paints on.
+rustclr-gfx = { path = "../rustclr-gfx", version = "0.1.0", default-features = false }
+# The MQTT client a program holds open. `std`-only: it is a socket.
+rustclr-net = { path = "../rustclr-net", version = "0.1.0", optional = true }
 # The thread pool's work queue. `std`-only, because a pool needs threads.
 rustclr-sched = { path = "../rustclr-sched", version = "0.1.0", optional = true }
 

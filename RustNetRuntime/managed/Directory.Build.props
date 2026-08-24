@@ -1,0 +1,25 @@
+<Project>
+
+  <!--
+    Shared by every device library.
+
+    They are separate assemblies on purpose. A board pays a little metadata per
+    assembly, and it pays a lot more for every *type* the loader registers —
+    and a loaded assembly's types are all registered whether the program
+    mentions them or not. One combined library would make a program that only
+    draws also carry CAN, Modbus, MQTT, a camera, a VNC server and a database.
+    Referencing only what you use is what keeps a device image small.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyVersion>0.1.0</AssemblyVersion>
+    <Version>0.1.0</Version>
+    <Authors>Gravicode Studios</Authors>
+    <NoWarn>$(NoWarn);CS1591;CS8600;CS8603;CS8618;CS8625</NoWarn>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+</Project>

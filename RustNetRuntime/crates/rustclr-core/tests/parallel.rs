@@ -175,3 +175,52 @@ fn a_worker_can_cross_a_thread_boundary() {
     fn assert_send<T: Send>() {}
     assert_send::<Interpreter>();
 }
+
+/// A console that several threads share, so a test can see what any of them
+/// wrote.
+struct SharedHost(Arc<std::sync::Mutex<Vec<String>>>);
+
+impl rustclr_core::host::Host for SharedHost {
+    fn write_out(&mut self, text: &str) {
+        self.0.lock().unwrap().push(text.to_string());
+    }
+    fn write_err(&mut self, text: &str) {
+        self.0.lock().unwrap().push(text.to_string());
+    }
+    fn read_line(&mut self) -> Option<String> {
+        None
+    }
+    fn monotonic_millis(&mut self) -> u64 {
+        0
+    }
+    fn wall_clock_millis(&mut self) -> i64 {
+        0
+    }
+}
+
+#[test]
+fn a_spawned_thread_writes_to_the_console_the_embedder_chose() {
+    // `rustnet debug --dap` puts the protocol on stdout, so a worker thread
+    // writing to the *real* stdout would corrupt a framed message and the
+    // editor would drop the connection. Redirecting the main thread's console
+    // is therefore not enough: every thread the program starts has to get the
+    // same one.
+    let written = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut main = Interpreter::with_host(Box::new(SharedHost(Arc::clone(&written))));
+    let factory = Arc::clone(&written);
+    main.host_factory = Some(Arc::new(move || {
+        Box::new(SharedHost(Arc::clone(&factory))) as Box<dyn rustclr_core::host::Host>
+    }));
+
+    let id = main.spawn(main.new_host(), |worker| {
+        worker.host.write_out("from the worker");
+        Ok(())
+    });
+    main.join(id).expect("the worker finished");
+
+    let lines = written.lock().unwrap();
+    assert!(
+        lines.iter().any(|l| l == "from the worker"),
+        "the spawned thread wrote somewhere else entirely: {lines:?}"
+    );
+}

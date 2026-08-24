@@ -314,6 +314,38 @@ fn register_gc(interp: &mut Interpreter) {
         Ok(Some(Value::I32(0)))
     });
     interp.register_native("System.GC::SuppressFinalize(object)", |_i, _a| Ok(None));
+
+    // -- diagnostics ---------------------------------------------------------
+    //
+    // These are the counters a program reads about itself. Every one of them is
+    // answered from the same numbers `rustnet profile` reports, so a program's
+    // own view and the profiler's cannot drift apart.
+
+    // The generation argument is accepted and ignored: the default collector is
+    // non-generational, `MaxGeneration` says 0, and answering the same count for
+    // every generation is what a single-generation collector means. A program
+    // asking about generation 2 gets a true answer about the only heap there is.
+    interp.register_native("System.GC::CollectionCount(int)", |i, _a| {
+        Ok(Some(Value::I32(i.heap.stats().collections as i32)))
+    });
+
+    // Cumulative, never decreasing — the difference between two readings is
+    // what a program actually uses this for. `precise` changes nothing here:
+    // the count is exact already, because every allocation goes through the
+    // interpreter rather than a thread-local buffer that has to be flushed.
+    interp.register_native("System.GC::GetTotalAllocatedBytes(bool)", |i, _a| {
+        Ok(Some(Value::I64(i.heap.stats().total_bytes_allocated as i64)))
+    });
+    interp.register_native("System.GC::GetTotalAllocatedBytes()", |i, _a| {
+        Ok(Some(Value::I64(i.heap.stats().total_bytes_allocated as i64)))
+    });
+
+    // One heap, shared by every thread, and no per-thread allocation context —
+    // so this is the process total. Stated in `docs/limitations.md` rather than
+    // silently returning a plausible smaller number.
+    interp.register_native("System.GC::GetAllocatedBytesForCurrentThread()", |i, _a| {
+        Ok(Some(Value::I64(i.heap.stats().total_bytes_allocated as i64)))
+    });
 }
 
 fn register_array(interp: &mut Interpreter) {

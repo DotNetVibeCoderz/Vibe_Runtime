@@ -1,0 +1,17 @@
+[package]
+name = "rustclr-crypto"
+description = "SHA-256, HMAC-SHA256, AES-CTR and CRC-32, written out rather than depended on"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# Nothing. See the crate docs: the specifications and their test vectors are
+# public, and a dependency here would have to build for four bare-metal targets.
+[dependencies]
+
+[features]
+default = ["std"]
+std = []

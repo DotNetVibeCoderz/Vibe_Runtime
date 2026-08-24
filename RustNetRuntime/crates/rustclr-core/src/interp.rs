@@ -20,7 +20,7 @@ use crate::opcode::{decode_all, Instruction, Op, Operand};
 use crate::types::*;
 use crate::value::{ByRef, StructValue, Value};
 use rustclr_gc::safepoint::{Mutators, Registration};
-use rustclr_gc::{Handle, SharedHeap};
+use rustclr_gc::{GcObject, Handle, SharedHeap};
 use rustclr_metadata::{ExceptionClause, HandlerKind, Token, TypeSig};
 
 #[allow(unused_imports)]
@@ -261,6 +261,44 @@ pub struct Interpreter {
     /// reading the object's type at all. That read was a second trip through
     /// the heap's lock for every `ldfld` and `stfld` in the program.
     field_slots: HashMap<FieldId, usize>,
+    /// How a thread this program starts gets its console.
+    ///
+    /// `None` means real stdio, which is right for `rustnet run` and wrong for
+    /// `rustnet debug --dap`: there stdout carries the protocol, and a
+    /// `Console.WriteLine` from a worker thread landing in the middle of a
+    /// framed message corrupts it. The embedder that redirected the main
+    /// thread's console has to be able to redirect a spawned thread's too, so
+    /// the host is *built by it* rather than assumed here.
+    #[cfg(feature = "std")]
+    pub host_factory: Option<alloc::sync::Arc<dyn Fn() -> Box<dyn Host> + Send + Sync>>,
+    /// The board underneath, if the embedder installed one.
+    ///
+    /// `None` is a desktop with no hardware: `RustNet.Hal` calls then fail
+    /// with a message saying no board is installed, rather than pretending a
+    /// pin was written. The firmware for a real chip installs its own; a test
+    /// or the CLI installs the simulator.
+    ///
+    /// It sits here for the same reason the host does: a native binding is
+    /// handed `&mut Interpreter` and nothing else.
+    pub board: Option<Box<dyn rustclr_hal::Board>>,
+    /// The drawing surface, if a program opened one.
+    ///
+    /// One per interpreter and not per surface: a 240x240 RGB565 buffer is
+    /// 115 KB, which on most of the boards here is the whole heap budget. A
+    /// second one would not be a feature, it would be an out-of-memory.
+    pub canvas: Option<rustclr_gfx::Framebuffer>,
+    /// The MQTT connection, if a program opened one.
+    ///
+    /// One per interpreter: a device has one broker and a few kilobytes, so a
+    /// client pool would be a feature nothing here asked for.
+    #[cfg(feature = "std")]
+    pub mqtt: Option<rustclr_net::mqtt::MqttClient>,
+    /// The attached profiler, if any.
+    ///
+    /// `None` costs one `is_some` per instruction — the same shape as the
+    /// debugger hook, and for the same reason: a program run without one must
+    /// not pay for the hook existing.
+    pub profiler: Option<crate::profile::Profiler>,
     /// The attached debugger, if any.
     ///
     /// `None` costs one branch per instruction — the location is not built and
@@ -372,6 +410,13 @@ impl Interpreter {
             field_defaults: HashMap::new(),
             field_slots: HashMap::new(),
             dispatching: Vec::new(),
+            board: None,
+            canvas: None,
+            #[cfg(feature = "std")]
+            mqtt: None,
+            profiler: None,
+            #[cfg(feature = "std")]
+            host_factory: None,
             debugger: None,
             breakpoints: crate::debug::Breakpoints::new(),
             stepping: None,
@@ -479,12 +524,12 @@ impl Interpreter {
     // -- heap helpers --------------------------------------------------------
 
     pub fn alloc_string(&mut self, s: &str) -> Handle {
-        self.stats.allocations += 1;
-        self.heap.alloc(ClrString::from_str(s))
+        self.alloc_clr_string(ClrString::from_str(s))
     }
 
     pub fn alloc_clr_string(&mut self, s: ClrString) -> Handle {
         self.stats.allocations += 1;
+        self.attribute(self.loader.core().string, s.size_hint());
         self.heap.alloc(s)
     }
 
@@ -519,6 +564,20 @@ impl Interpreter {
         let fields = self.field_defaults(type_id).to_vec();
         let obj = ClrObject { type_id, fields, monitor: None };
         self.stats.allocations += 1;
+        self.attribute(type_id, obj.size_hint());
+        self.heap.alloc(obj)
+    }
+
+    /// Allocates an object that has already been filled in.
+    ///
+    /// The counted way to put a prepared `ClrObject` on the heap. Reaching for
+    /// `heap.alloc` directly skips both the allocation counter and the
+    /// profiler's attribution, which is how one `await` site came to be
+    /// invisible to `rustnet profile` — the totals stopped adding up, and a
+    /// test now says so.
+    pub fn alloc_clr_object(&mut self, obj: ClrObject) -> Handle {
+        self.stats.allocations += 1;
+        self.attribute(obj.type_id, obj.size_hint());
         self.heap.alloc(obj)
     }
 
@@ -641,12 +700,14 @@ impl Interpreter {
             .unwrap_or_else(|| self.loader.core().array);
         let storage = ArrayStorage::zeroed(primitive, is_reference, length);
         self.stats.allocations += 1;
-        self.heap.alloc(ClrArray {
+        let array = ClrArray {
             array_type,
             element_type,
             storage,
             dimensions: vec![length as u32],
-        })
+        };
+        self.attribute_array(element_type, array.size_hint());
+        self.heap.alloc(array)
     }
 
     /// Allocates an array whose elements are untyped evaluation-stack values.
@@ -663,17 +724,41 @@ impl Interpreter {
             .find_sz_array(element_type)
             .unwrap_or_else(|| self.loader.core().array);
         self.stats.allocations += 1;
-        self.heap.alloc(ClrArray {
+        let array = ClrArray {
             array_type,
             element_type,
             storage: ArrayStorage::Values(vec![Value::Null; length]),
             dimensions: vec![length as u32],
-        })
+        };
+        self.attribute_array(element_type, array.size_hint());
+        self.heap.alloc(array)
     }
 
     pub fn box_value(&mut self, type_id: TypeId, value: Value) -> Handle {
         self.stats.allocations += 1;
-        self.heap.alloc(ClrBox { type_id, value })
+        let boxed = ClrBox { type_id, value };
+        self.attribute(type_id, boxed.size_hint());
+        self.heap.alloc(boxed)
+    }
+
+    /// Charges an array to its element type, when something is profiling.
+    #[inline]
+    fn attribute_array(&mut self, element: TypeId, bytes: usize) {
+        if let Some(profiler) = self.profiler.as_mut() {
+            profiler.allocated_array(element, bytes);
+        }
+    }
+
+    /// Charges an allocation to a type, when something is profiling.
+    ///
+    /// Takes the size the *collector* will account for rather than a size of
+    /// its own, so "what allocated the bytes" and "how full the heap is" can
+    /// never disagree.
+    #[inline]
+    fn attribute(&mut self, type_id: TypeId, bytes: usize) {
+        if let Some(profiler) = self.profiler.as_mut() {
+            profiler.allocated(type_id, bytes);
+        }
     }
 
     pub fn type_of(&self, handle: Handle) -> Option<TypeId> {
@@ -808,6 +893,7 @@ impl Interpreter {
     }
 
     pub fn force_collect(&mut self) {
+        let started = self.profiler.as_ref().map(|_| self.host.monotonic_nanos());
         let roots = self.roots();
         let heap = self.heap.clone();
         // Every other registered thread parks before `collect` runs, and each
@@ -815,6 +901,14 @@ impl Interpreter {
         // collecting against `roots` and costs a flag check.
         self.mutators.stop_the_world(roots, |all| heap.collect(all));
         self.stats.collections += 1;
+        // The whole stop-the-world, not the marking alone: what a program
+        // notices is how long it was not running.
+        if let Some(started) = started {
+            let elapsed = self.host.monotonic_nanos().saturating_sub(started);
+            if let Some(profiler) = self.profiler.as_mut() {
+                profiler.collected(elapsed);
+            }
+        }
     }
 
     /// An interpreter that runs the same program on another thread.
@@ -859,7 +953,22 @@ impl Interpreter {
         worker.literal_cache = self.literal_cache.clone();
         worker.type_objects = self.type_objects.clone();
         worker.loaded_size = self.loader.registry.method_count();
+        // A thread this worker starts in turn gets the same console.
+        worker.host_factory = self.host_factory.clone();
         worker
+    }
+
+    /// A console for a thread this program is about to start.
+    ///
+    /// Real stdio unless the embedder said otherwise. Every place that starts a
+    /// managed thread goes through this, so redirecting the console redirects
+    /// *all* of it rather than only the thread that happened to be first.
+    #[cfg(feature = "std")]
+    pub fn new_host(&self) -> Box<dyn Host> {
+        match &self.host_factory {
+            Some(build) => build(),
+            None => Box::new(crate::host::SystemHost::new()),
+        }
     }
 
     /// Runs `body` on a real OS thread and returns a token for joining it.
@@ -941,7 +1050,13 @@ impl Interpreter {
         if let Some(pool) = &self.pool {
             return pool.clone();
         }
-        let pool = crate::pool::TaskPool::start(self, crate::pool::default_host);
+        // The pool's workers get whatever console this interpreter hands out,
+        // so a redirected console reaches `Task.Run` as well as `Main`.
+        let factory = self.host_factory.clone();
+        let pool = crate::pool::TaskPool::start(self, move || match &factory {
+            Some(build) => build(),
+            None => crate::pool::default_host(),
+        });
         self.pool = Some(pool.clone());
         pool
     }
@@ -1355,6 +1470,9 @@ impl Interpreter {
             is_filter: false,
         });
         self.stats.max_frame_depth = self.stats.max_frame_depth.max(self.frames.len());
+        if let Some(profiler) = self.profiler.as_mut() {
+            profiler.entered(method);
+        }
         Ok(Entered::Frame)
     }
 
@@ -1482,17 +1600,39 @@ impl Interpreter {
 
     // -- the loop ------------------------------------------------------------
 
+    /// Takes a sample if a sampling period has passed.
+    ///
+    /// Cold and never inlined, for the reason the debug hook is: without it,
+    /// the branch and its registers get hoisted into the loop that runs every
+    /// instruction and cost something even when it does nothing.
+    #[cold]
+    #[inline(never)]
+    fn profile_poll(&mut self) {
+        let Some(profiler) = self.profiler.as_mut() else { return };
+        if !profiler.tick() {
+            return;
+        }
+        let now = self.host.monotonic_nanos();
+        // The stack is copied out because `sample` needs `&mut` on the
+        // profiler while it reads the frames. It happens once per interval,
+        // not once per instruction.
+        let stack: Vec<crate::MethodId> = self.frames.iter().map(|f| f.method).collect();
+        if let Some(profiler) = self.profiler.as_mut() {
+            profiler.sample(now, &stack);
+        }
+    }
+
     /// Decides whether to stop here, and stops if so.
     ///
     /// `cold` and never inlined: this is called from the instruction loop and
     /// answers "no" on every instruction of every program that is not being
     /// debugged. Letting it be inlined puts its registers and its code in the
     /// hot path for the benefit of a branch that is essentially never taken.
-    #[cold]
-    #[inline(never)]
     ///
     /// Only called with a debugger attached. Everything expensive — describing
     /// frames, naming methods — happens after the decision, never before it.
+    #[cold]
+    #[inline(never)]
     fn debug_poll(&mut self, il_offset: u32) {
         let depth = self.frames.len();
         let method = self.frame_ref().method;
@@ -1625,6 +1765,11 @@ impl Interpreter {
         // already run could not step into the call it makes.
         if self.debugger.is_some() {
             self.debug_poll(instruction.offset);
+        }
+        // The profiler's own check is a decrement and a compare; the clock is
+        // only read when that says an interval has passed.
+        if self.profiler.is_some() {
+            self.profile_poll();
         }
 
         self.stats.instructions_executed += 1;

@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>Azure IoT Hub, AWS IoT Core, Google IoT and IFTTT</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../RustNet.Net/RustNet.Net.csproj" />
+    <ProjectReference Include="../RustNet.Security/RustNet.Security.csproj" />
+  </ItemGroup>
+
+</Project>

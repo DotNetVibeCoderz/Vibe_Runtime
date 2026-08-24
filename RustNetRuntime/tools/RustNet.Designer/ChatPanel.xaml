@@ -1,0 +1,228 @@
+<UserControl x:Class="RustNet.Designer.ChatPanel"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:wv="clr-namespace:Microsoft.Web.WebView2.Wpf;assembly=Microsoft.Web.WebView2.Wpf"
+             Background="{StaticResource Slate}">
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- ==== header ============================================== -->
+        <Border Grid.Row="0" BorderBrush="{StaticResource Rail}" BorderThickness="0,0,0,1" Padding="10,8,8,8">
+            <StackPanel>
+                <Grid>
+                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                        <!-- The signal mark: on when Jack is working, dim when idle. -->
+                        <Border x:Name="SignalMark" Width="3" Height="14" CornerRadius="1.5"
+                                Background="{StaticResource CyanDim}" Margin="0,0,8,0"/>
+                        <TextBlock Text="JACK THE CODE BENDER" FontFamily="{StaticResource FontMono}"
+                                   FontSize="10" Foreground="{StaticResource Cyan}" VerticalAlignment="Center"/>
+                    </StackPanel>
+                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                        <ToggleButton x:Name="SessionsToggle" Style="{StaticResource ToggleChip}"
+                                      Content="SESSIONS" Margin="0,0,4,0"
+                                      ToolTip="Switch, create or delete conversations"
+                                      Checked="OnSessionsToggled" Unchecked="OnSessionsToggled"/>
+                        <ToggleButton x:Name="SettingsToggle" Style="{StaticResource ToggleChip}"
+                                      Content="SETTINGS" Margin="0,0,4,0"
+                                      ToolTip="Persona, sampling and tools — saved to app.config"
+                                      Checked="OnSettingsToggled" Unchecked="OnSettingsToggled"/>
+                        <Button x:Name="HideButton" Style="{StaticResource GhostButton}" Content="✕"
+                                ToolTip="Hide the assistant (Ctrl+J)" Click="OnHide"/>
+                    </StackPanel>
+                </Grid>
+
+                <Grid Margin="0,8,0,0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <ComboBox x:Name="ProviderBox" Grid.Column="0" Width="94" Margin="0,0,4,0"
+                              ToolTip="Which service answers" SelectionChanged="OnProviderChanged"/>
+                    <ComboBox x:Name="ModelBox" Grid.Column="1" Margin="0,0,4,0"
+                              ToolTip="Model" SelectionChanged="OnModelChanged"/>
+                    <ToggleButton x:Name="ToolsToggle" Grid.Column="2" Style="{StaticResource ToggleChip}"
+                                  Content="TOOLS" ToolTip="Let Jack call functions: search, docs, canvas, code"
+                                  Checked="OnToolsToggled" Unchecked="OnToolsToggled"/>
+                </Grid>
+            </StackPanel>
+        </Border>
+
+        <!-- ==== transcript, with the drawers layered over it ======== -->
+        <Grid Grid.Row="1">
+            <wv:WebView2 x:Name="Transcript" DefaultBackgroundColor="#14161A"/>
+
+            <!-- Shown when WebView2 is unavailable, so the panel still works. -->
+            <ScrollViewer x:Name="FallbackScroll" Visibility="Collapsed" Background="{StaticResource Graphite}">
+                <TextBox x:Name="FallbackText" IsReadOnly="True" TextWrapping="Wrap" BorderThickness="0"
+                         Background="Transparent" Padding="12" AcceptsReturn="True"/>
+            </ScrollViewer>
+
+            <!-- sessions drawer -->
+            <Border x:Name="SessionsDrawer" Visibility="Collapsed" Background="{StaticResource Slate}"
+                    BorderBrush="{StaticResource Rail}" BorderThickness="0,0,0,1">
+                <DockPanel>
+                    <Border DockPanel.Dock="Bottom" BorderBrush="{StaticResource Rail}" BorderThickness="0,1,0,0"
+                            Padding="8">
+                        <StackPanel Orientation="Horizontal">
+                            <Button Style="{StaticResource PrimaryButton}" Content="New session"
+                                    Click="OnNewSession" Margin="0,0,4,0"/>
+                            <Button Style="{StaticResource FlatButton}" Content="Reset"
+                                    ToolTip="Empty this conversation but keep it in the list"
+                                    Click="OnResetSession" Margin="0,0,4,0"/>
+                            <Button Style="{StaticResource FlatButton}" Content="Delete"
+                                    ToolTip="Delete this conversation and its uploads"
+                                    Click="OnDeleteSession"/>
+                        </StackPanel>
+                    </Border>
+                    <ListBox x:Name="SessionList" SelectionChanged="OnSessionSelected"
+                             ItemContainerStyle="{StaticResource SessionItem}">
+                        <ListBox.ItemTemplate>
+                            <DataTemplate>
+                                <StackPanel>
+                                    <TextBlock Text="{Binding Title}" TextTrimming="CharacterEllipsis"/>
+                                    <TextBlock FontFamily="{StaticResource FontMono}" FontSize="9.5"
+                                               Foreground="{StaticResource Muted}">
+                                        <Run Text="{Binding Messages.Count, Mode=OneWay}"/>
+                                        <Run Text="msgs ·"/>
+                                        <Run Text="{Binding Model, Mode=OneWay}"/>
+                                    </TextBlock>
+                                </StackPanel>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
+                </DockPanel>
+            </Border>
+
+            <!-- settings drawer -->
+            <Border x:Name="SettingsDrawer" Visibility="Collapsed" Background="{StaticResource Slate}">
+                <DockPanel>
+                    <Border DockPanel.Dock="Bottom" BorderBrush="{StaticResource Rail}" BorderThickness="0,1,0,0"
+                            Padding="8">
+                        <StackPanel Orientation="Horizontal">
+                            <Button Style="{StaticResource PrimaryButton}" Content="Save to app.config"
+                                    Click="OnSaveSettings" Margin="0,0,4,0"/>
+                            <Button Style="{StaticResource FlatButton}" Content="Reset persona"
+                                    Click="OnResetPersona"/>
+                        </StackPanel>
+                    </Border>
+                    <ScrollViewer VerticalScrollBarVisibility="Auto">
+                        <StackPanel Margin="10,8,10,10">
+                            <TextBlock Style="{StaticResource PaneHeading}" Text="PERSONA" Margin="0,0,0,4"/>
+                            <TextBox x:Name="PersonaBox" AcceptsReturn="True" TextWrapping="Wrap"
+                                     Height="220" VerticalScrollBarVisibility="Auto"
+                                     VerticalContentAlignment="Top"/>
+
+                            <TextBlock Style="{StaticResource PaneHeading}" Text="SAMPLING" Margin="0,12,0,4"/>
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
+                                </Grid.RowDefinitions>
+                                <TextBlock Grid.Row="0" Grid.Column="0" Style="{StaticResource Readout}"
+                                           Text="temperature" Width="96"/>
+                                <TextBox x:Name="TemperatureBox" Grid.Row="0" Grid.Column="1" Margin="0,0,0,4"/>
+                                <TextBlock Grid.Row="1" Grid.Column="0" Style="{StaticResource Readout}"
+                                           Text="top_p" Width="96"/>
+                                <TextBox x:Name="TopPBox" Grid.Row="1" Grid.Column="1" Margin="0,0,0,4"/>
+                                <TextBlock Grid.Row="2" Grid.Column="0" Style="{StaticResource Readout}"
+                                           Text="max_tokens" Width="96"/>
+                                <TextBox x:Name="MaxTokensBox" Grid.Row="2" Grid.Column="1" Margin="0,0,0,4"/>
+                                <TextBlock Grid.Row="3" Grid.Column="0" Style="{StaticResource Readout}"
+                                           Text="history turns" Width="96"/>
+                                <TextBox x:Name="HistoryBox" Grid.Row="3" Grid.Column="1"/>
+                            </Grid>
+
+                            <CheckBox x:Name="StreamingCheck" Content="Stream the reply as it is written"
+                                      Margin="0,10,0,0"/>
+
+                            <TextBlock Style="{StaticResource PaneHeading}" Text="FUNCTIONS AVAILABLE"
+                                       Margin="0,14,0,4"/>
+                            <TextBlock x:Name="ToolListText" Style="{StaticResource Readout}" TextWrapping="Wrap"/>
+
+                            <TextBlock Style="{StaticResource PaneHeading}" Text="KEYS" Margin="0,14,0,4"/>
+                            <TextBlock x:Name="KeyStatusText" Style="{StaticResource Readout}" TextWrapping="Wrap"/>
+                        </StackPanel>
+                    </ScrollViewer>
+                </DockPanel>
+            </Border>
+
+            <!-- prompt gallery -->
+            <Border x:Name="PromptDrawer" Visibility="Collapsed" Background="{StaticResource Slate}">
+                <DockPanel>
+                    <Border DockPanel.Dock="Top" BorderBrush="{StaticResource Rail}" BorderThickness="0,0,0,1"
+                            Padding="10,6">
+                        <Grid>
+                            <TextBlock Text="PROMPTS THAT PRODUCE SOMETHING"
+                                       FontFamily="{StaticResource FontMono}" FontSize="10"
+                                       Foreground="{StaticResource Amber}" VerticalAlignment="Center"/>
+                            <Button Style="{StaticResource GhostButton}" Content="✕" HorizontalAlignment="Right"
+                                    Click="OnClosePrompts"/>
+                        </Grid>
+                    </Border>
+                    <ScrollViewer VerticalScrollBarVisibility="Auto">
+                        <StackPanel x:Name="PromptList" Margin="0,4,0,10"/>
+                    </ScrollViewer>
+                </DockPanel>
+            </Border>
+        </Grid>
+
+        <!-- ==== composer ============================================ -->
+        <Border Grid.Row="2" BorderBrush="{StaticResource Rail}" BorderThickness="0,1,0,0" Padding="8">
+            <StackPanel>
+                <ItemsControl x:Name="AttachmentStrip" Margin="0,0,0,6">
+                    <ItemsControl.ItemsPanel>
+                        <ItemsPanelTemplate>
+                            <WrapPanel/>
+                        </ItemsPanelTemplate>
+                    </ItemsControl.ItemsPanel>
+                </ItemsControl>
+
+                <TextBox x:Name="Composer" AcceptsReturn="True" TextWrapping="Wrap" MinHeight="58" MaxHeight="180"
+                         VerticalScrollBarVisibility="Auto" VerticalContentAlignment="Top"
+                         FontFamily="{StaticResource FontSans}" FontSize="12.5"
+                         PreviewKeyDown="OnComposerKeyDown"/>
+
+                <Grid Margin="0,6,0,0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <StackPanel Grid.Column="0" Orientation="Horizontal">
+                        <Button Style="{StaticResource GhostButton}" Content="Image"
+                                ToolTip="Attach an image — it is uploaded to this session and sent as image content"
+                                Click="OnAttachImage" Margin="0,0,2,0"/>
+                        <Button Style="{StaticResource GhostButton}" Content="Document"
+                                ToolTip="Attach a document — its link and an excerpt go into the message"
+                                Click="OnAttachDocument" Margin="0,0,2,0"/>
+                        <Button Style="{StaticResource GhostButton}" Content="Prompts"
+                                ToolTip="Ready-made prompts that produce a screen or a file"
+                                Click="OnShowPrompts"/>
+                    </StackPanel>
+                    <!-- Trimmed rather than wrapped: the hint may lose its tail
+                         in a narrow panel, but the Send button must not move. -->
+                    <TextBlock x:Name="ComposerHint" Grid.Column="1" Style="{StaticResource Readout}"
+                               FontSize="9.5" Margin="8,0,8,0" TextTrimming="CharacterEllipsis"
+                               HorizontalAlignment="Right" Text="⏎ send · ⇧⏎ newline"/>
+                    <Grid Grid.Column="2">
+                        <Button x:Name="SendButton" Style="{StaticResource PrimaryButton}" Content="Send"
+                                Click="OnSend" Padding="16,5"/>
+                        <Button x:Name="StopButton" Style="{StaticResource FlatButton}" Content="Stop"
+                                Visibility="Collapsed" Click="OnStop" Padding="16,5"/>
+                    </Grid>
+                </Grid>
+            </StackPanel>
+        </Border>
+    </Grid>
+</UserControl>

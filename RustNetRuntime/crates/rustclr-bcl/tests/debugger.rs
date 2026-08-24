@@ -239,3 +239,108 @@ fn a_debugger_can_set_a_breakpoint_while_stopped() {
         "a breakpoint set while stopped did not take effect on the same run"
     );
 }
+
+#[test]
+fn a_breakpoint_can_be_set_by_source_line() {
+    let Some(mut interp) = interpreter() else { return };
+    let assembly = interp
+        .loader
+        .assemblies()
+        .iter()
+        .find(|a| a.name.contains("Conformance"))
+        .map(|a| a.id)
+        .expect("the fixture is loaded");
+    assert!(
+        interp.loader.load_debug_info(assembly),
+        "the SDK writes a portable PDB beside the fixture"
+    );
+
+    // The line `Triple` is declared on. Found by reading the source rather
+    // than hard-coded, so the test survives the fixture being edited.
+    let source = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/Conformance/Program.cs"
+    ))
+    .unwrap();
+    let line = source
+        .lines()
+        .position(|l| l.contains("static int Triple(int v)"))
+        .expect("the fixture defines Triple") as u32
+        + 1;
+
+    let places = interp.loader.breakpoints_for_line("Program.cs", line);
+    assert_eq!(places.len(), 1, "one method has code on that line: {places:?}");
+    let (found, offset) = places[0];
+    assert_eq!(
+        interp.loader.registry.method(found).name,
+        "Triple",
+        "the line resolved to the wrong method"
+    );
+
+    // And it actually stops there.
+    interp.breakpoints.add(found, offset);
+    let (debugger, log) = ScriptedDebugger::new(vec![DebugCommand::Run, DebugCommand::Run]);
+    interp.attach_debugger(Box::new(debugger));
+    let two_levels = method(&interp, "TwoLevels");
+    interp.invoke(two_levels, vec![Value::I32(9)]).expect("runs");
+
+    let stops = log.lock().unwrap();
+    assert!(
+        stops.iter().any(|s| s.reason == StopReason::Breakpoint && s.method.contains("Triple")),
+        "a breakpoint set by line never fired: {stops:?}"
+    );
+
+    // The offset maps back to the line it came from.
+    assert_eq!(
+        interp.loader.source_line(found, offset).map(|(_, l)| l),
+        Some(line),
+        "the offset does not map back to the line that produced it"
+    );
+}
+
+#[test]
+fn a_line_with_no_code_places_no_breakpoint() {
+    let Some(mut interp) = interpreter() else { return };
+    let assembly = interp
+        .loader
+        .assemblies()
+        .iter()
+        .find(|a| a.name.contains("Conformance"))
+        .map(|a| a.id)
+        .expect("the fixture is loaded");
+    interp.loader.load_debug_info(assembly);
+
+    // Line 1 is a `using` or a comment. Moving the breakpoint to the nearest
+    // line that does have code is what most tools do and what this refuses:
+    // the user asked about a line, and the honest answer is that it has none.
+    assert!(
+        interp.loader.breakpoints_for_line("Program.cs", 1).is_empty(),
+        "something claimed to have code on line 1"
+    );
+    assert!(
+        interp.loader.breakpoints_for_line("NoSuchFile.cs", 10).is_empty(),
+        "a file that is not in the PDB must not resolve to one that is"
+    );
+}
+
+#[test]
+fn locals_are_named_from_the_pdb() {
+    let Some(mut interp) = interpreter() else { return };
+    let assembly = interp
+        .loader
+        .assemblies()
+        .iter()
+        .find(|a| a.name.contains("Conformance"))
+        .map(|a| a.id)
+        .expect("the fixture is loaded");
+    interp.loader.load_debug_info(assembly);
+
+    let carries = method(&interp, "CarriesAnArrayAcrossIterations");
+    // Its locals are `carried`, `total` and `i`, in that order.
+    assert_eq!(interp.loader.local_name(carries, 0), Some("carried"));
+    assert_eq!(
+        interp.loader.local_name(carries, 1),
+        Some("total"),
+        "slot 1 is not the local the source declares second"
+    );
+}

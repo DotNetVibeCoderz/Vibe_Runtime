@@ -1,0 +1,15 @@
+[package]
+name = "rustclr-db"
+description = "An embedded record store with a small SQL surface"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+
+[features]
+default = ["std"]
+std = []

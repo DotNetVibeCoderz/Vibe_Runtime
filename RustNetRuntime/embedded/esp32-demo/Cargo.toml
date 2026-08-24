@@ -12,6 +12,9 @@ publish = false
 [workspace]
 
 [features]
+# The M5Stack Core2's panel: an AXP192 gating its rails and an ILI9342C
+# drawing. Xtensa only — it is an ESP32 board.
+board-m5core2 = ["esp32"]
 # Exactly one chip must be selected; the HAL crates refuse to build otherwise.
 # Two very different cores — Xtensa LX6 and RISC-V — from one source file.
 esp32 = [
@@ -33,9 +36,13 @@ esp32c3 = [
 # The two RustCLR crates that build without `std`. No default features: that is
 # what turns `std` off.
 rustclr-demo-common = { path = "../demo-common" }
+rustclr-hal = { path = "../../crates/rustclr-hal", default-features = false }
+# Real ESP32-C3 peripherals. The Xtensa ESP32 has no HAL crate here.
+rustclr-hal-esp32c3 = { path = "../../crates/rustclr-hal-esp32c3", default-features = false }
 
 # `rt` and `exception-handler` are defaults; they have to come back explicitly
 # because the chip feature has to be selectable, which needs defaults off.
+embedded-hal = "1.0"
 esp-hal = { version = "1.1.2", default-features = false, features = [
     "unstable",
     "rt",

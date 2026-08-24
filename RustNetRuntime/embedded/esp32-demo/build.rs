@@ -30,4 +30,32 @@ fn main() {
     println!("cargo:rustc-env=RUSTCLR_APP_PATH={}", app.display());
     println!("cargo:rerun-if-env-changed=RUSTCLR_APP");
     println!("cargo:rerun-if-changed={}", app.display());
+
+    // ── the libraries it references ──────────────────────────────────────
+    //
+    // A board has no filesystem, so an `AssemblyRef` cannot be resolved by
+    // looking beside the program the way `rustnet run` does. Whatever the
+    // program references has to be carried too, and named in dependency order:
+    //
+    //     RUSTCLR_APP=MyApp.dll     //     RUSTCLR_LIB1=RustNet.Core.dll     //     RUSTCLR_LIB2=RustNet.Graphics.dll cargo build --release
+    //
+    // Three is the current ceiling because `include_bytes!` needs one literal
+    // per file and the list has to be written out. `mqtt-dashboard` uses all
+    // three; a program needing more says so at build time rather than failing
+    // to resolve a token on the board.
+    println!("cargo::rustc-check-cfg=cfg(rustclr_lib1)");
+    println!("cargo::rustc-check-cfg=cfg(rustclr_lib2)");
+    println!("cargo::rustc-check-cfg=cfg(rustclr_lib3)");
+    for (n, var) in [(1, "RUSTCLR_LIB1"), (2, "RUSTCLR_LIB2"), (3, "RUSTCLR_LIB3")] {
+        println!("cargo:rerun-if-env-changed={var}");
+        if let Some(path) = env::var_os(var) {
+            let path = PathBuf::from(path);
+            if !path.is_file() {
+                panic!("{var} does not name a readable file: {}", path.display());
+            }
+            println!("cargo:rustc-env={var}_PATH={}", path.display());
+            println!("cargo:rustc-cfg=rustclr_lib{n}");
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
 }

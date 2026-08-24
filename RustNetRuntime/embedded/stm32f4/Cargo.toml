@@ -25,6 +25,8 @@ netduino3-f427vi = ["stm32f4xx-hal/stm32f427"]
 
 [dependencies]
 rustclr-demo-common = { path = "../demo-common" }
+# Real STM32F4 peripherals.
+rustclr-hal-stm32 = { path = "../../crates/rustclr-hal-stm32", default-features = false }
 
 cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
 cortex-m-rt = "0.7"

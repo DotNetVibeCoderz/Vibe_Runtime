@@ -64,6 +64,23 @@ use stm32f4xx_hal::{pac, prelude::*};
 /// build time. See `build.rs`.
 static HELLO_WORLD: &[u8] = include_bytes!(env!("RUSTCLR_APP_PATH"));
 
+/// Assemblies the embedded program references, in dependency order.
+///
+/// A board has no filesystem, so what a desktop finds beside the program has
+/// to be compiled in. `RUSTCLR_LIB1_PATH` and `RUSTCLR_LIB2_PATH` name them,
+/// and the build script turns each one that is set into a `cfg`. A program
+/// that references nothing — `HelloWorld` — sets neither and gets an empty
+/// list, which costs nothing.
+static APP_LIBRARIES: &[&[u8]] = &[
+    #[cfg(rustclr_lib1)]
+    include_bytes!(env!("RUSTCLR_LIB1_PATH")),
+    #[cfg(rustclr_lib2)]
+    include_bytes!(env!("RUSTCLR_LIB2_PATH")),
+    #[cfg(rustclr_lib3)]
+    include_bytes!(env!("RUSTCLR_LIB3_PATH")),
+];
+
+
 #[cfg(feature = "nucleo-f401re")]
 const BOARD: &str = "Nucleo-F401RE (STM32F401RE, Cortex-M4F)";
 #[cfg(feature = "netduino3-f427vi")]
@@ -166,7 +183,21 @@ fn report<W: core::fmt::Write>(out: &mut W, sysclk_hz: u32, console: &str) {
         sysclk_hz / 1_000_000,
         HEAP_BYTES / 1024
     );
-    rustclr_demo_common::run(out, BOARD, detail.as_str(), HELLO_WORLD, HEAP_BYTES);
+    #[cfg(feature = "nucleo-f401re")]
+    let clocks = rustclr_hal_stm32::Clocks::NUCLEO_F401RE;
+    #[cfg(feature = "netduino3-f427vi")]
+    let clocks = rustclr_hal_stm32::Clocks::NETDUINO3_WIFI;
+    let hardware = rustclr_hal_stm32::Stm32F4Board::new(clocks);
+    rustclr_demo_common::run(
+        out,
+        BOARD,
+        detail.as_str(),
+        HELLO_WORLD,
+        HEAP_BYTES,
+        Some(alloc::boxed::Box::new(hardware)),
+        None,
+        APP_LIBRARIES,
+    );
 }
 
 /// A panic has nowhere to unwind to here.

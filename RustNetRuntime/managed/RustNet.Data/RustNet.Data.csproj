@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>An on-device record store with a small SQL surface</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../RustNet.Serialization/RustNet.Serialization.csproj" />
+  </ItemGroup>
+
+</Project>

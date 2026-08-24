@@ -123,7 +123,11 @@ version = "0.1.0"
 dependencies = [
  "libm",
  "rustclr-core",
+ "rustclr-crypto",
+ "rustclr-flashfs",
  "rustclr-gc",
+ "rustclr-gfx",
+ "rustclr-hal",
 ]
 
 [[package]]
@@ -131,8 +135,14 @@ name = "rustclr-core"
 version = "0.1.0"
 dependencies = [
  "rustclr-gc",
+ "rustclr-gfx",
+ "rustclr-hal",
  "rustclr-metadata",
 ]
+
+[[package]]
+name = "rustclr-crypto"
+version = "0.1.0"
 
 [[package]]
 name = "rustclr-demo-common"
@@ -141,12 +151,38 @@ dependencies = [
  "rustclr-bcl",
  "rustclr-core",
  "rustclr-gc",
+ "rustclr-hal",
  "rustclr-metadata",
+]
+
+[[package]]
+name = "rustclr-flashfs"
+version = "0.1.0"
+dependencies = [
+ "rustclr-hal",
 ]
 
 [[package]]
 name = "rustclr-gc"
 version = "0.1.0"
+
+[[package]]
+name = "rustclr-gfx"
+version = "0.1.0"
+dependencies = [
+ "rustclr-hal",
+]
+
+[[package]]
+name = "rustclr-hal"
+version = "0.1.0"
+
+[[package]]
+name = "rustclr-hal-k210"
+version = "0.1.0"
+dependencies = [
+ "rustclr-hal",
+]
 
 [[package]]
 name = "rustclr-k210"
@@ -156,6 +192,7 @@ dependencies = [
  "riscv",
  "riscv-rt",
  "rustclr-demo-common",
+ "rustclr-hal-k210",
 ]
 
 [[package]]

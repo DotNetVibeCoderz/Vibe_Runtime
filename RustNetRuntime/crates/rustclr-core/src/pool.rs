@@ -170,7 +170,7 @@ impl TaskPool {
         }
         // A worker built from a blocked one: same heap, same statics, its own
         // frames and its own copy of the loader.
-        let mut interp = parent.worker(default_host());
+        let mut interp = parent.worker(parent.new_host());
         self.inner.workers.fetch_add(1, Ordering::AcqRel);
         self.inner.running.fetch_add(1, Ordering::AcqRel);
         let pool = TaskPool { inner: Arc::clone(&self.inner) };

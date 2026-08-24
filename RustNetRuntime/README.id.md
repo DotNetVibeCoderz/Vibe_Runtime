@@ -24,10 +24,10 @@ menghasilkan keluaran yang identik di kedua runtime:
 
 ```console
 $ dotnet Conformance.dll
-checks=345 failures=0
+checks=361 failures=0
 
 $ rustnet run Conformance.dll --stats
-checks=345 failures=0
+checks=361 failures=0
 
 ─── execution ──────────────────────────────
   wall clock                1367.141 ms
@@ -55,7 +55,7 @@ instruksi dengan waktu yang sebagian besar dihabiskan dalam keadaan terblokir,
 dan itu jauh meremehkan si interpreter. Pencacah di kanan-kirinya — instruksi,
 panggilan, alokasi — akurat.
 
-Ke-345 pemeriksaan itu mencakup aritmatika dan overflow, matematika `long`, alur
+Ke-361 pemeriksaan itu mencakup aritmatika dan overflow, matematika `long`, alur
 kontrol, string, array, pewarisan kelas, dispatch virtual dan interface,
 property, struct, enum, boxing dan casting, `try`/`catch`/`finally`, filter
 exception, handler bersarang, pembagian nol, delegate, generic, LINQ,
@@ -65,7 +65,7 @@ exception, handler bersarang, pembagian nol, delegate, generic, LINQ,
 `tests/fixtures/ModernSyntax/`, melakukan hal sama untuk 35 fitur C# modern.
 Keduanya proyek C# biasa yang bisa Anda baca dan kembangkan.
 
-`cargo test --workspace` menjalankan 206 test di delapan crate.
+`cargo test --workspace` menjalankan 416 test di dua puluh lima crate.
 
 ---
 
@@ -242,21 +242,38 @@ Panduan lengkap: [docs/id/memulai.md](docs/id/memulai.md).
 | --- | --- |
 | **RustCLR** | Runtime inti: garbage collector, sistem tipe, loader assembly, mesin eksekusi IL, penanganan exception |
 | **RustBCL** | Base class library, diimplementasikan native dengan Rust — `Console`, `String`, `Math`, `Convert`, `StringBuilder`, `Array`, `GC`, dan lainnya |
-| **RustNet Toolchain** | `rustnet` — build, run, inspeksi, disassembly, dan verifikasi assembly |
+| **RustNet Toolchain** | `rustnet` — build, run, inspeksi, disassembly, verifikasi, **debug**, dan **profil** assembly |
 | **Interop Bridge** | P/Invoke ke library native, dengan marshalling dan pembungkus handle yang aman |
 | **CodeGen** | IDE Avalonia beserta asistennya |
 
-Delapan crate Rust:
+Dua puluh lima crate Rust:
 
 ```
-rustclr-metadata   Pembaca PE/COFF dan ECMA-335
-rustclr-gc         Managed heap, collector yang bisa diganti
-rustclr-core       Sistem tipe, loader, interpreter IL
-rustclr-bcl        Base class library native
-rustclr-sched      Antrean lock-free, channel, thread pool
-rustclr-interop    P/Invoke dan marshalling
-rustclr-jit        Antarmuka kompilasi dan verifier IL
-rustnet-cli        Biner toolchain
+rustclr-metadata   PE/COFF and ECMA-335 reader
+rustclr-gc         Managed heap, pluggable collectors
+rustclr-core       Type system, loader, IL interpreter
+rustclr-bcl        Native base class library
+rustclr-sched      Lock-free queue, channels, thread pool
+rustclr-interop    P/Invoke and marshalling
+rustclr-jit        Compilation interface and IL verifier
+rustclr-hal        Board traits — the seam to the hardware
+rustclr-hal-host   A simulated board, so device code runs on a desktop
+rustclr-hal-k210   Kendryte K210 (RISC-V 64)
+rustclr-hal-esp32c3  ESP32-C3 (RISC-V 32)
+rustclr-hal-rp2040   RP2040 (Cortex-M0+)
+rustclr-hal-stm32    STM32F4 and F7 (Cortex-M4F / M7)
+rustclr-flashfs    Log-structured store for raw NOR flash
+rustclr-crypto     SHA-256, HMAC, AES-CTR, CRC-32
+rustclr-secureboot Signed image containers
+rustclr-ota        A/B slots, verified images, automatic rollback
+rustclr-gfx        RGB565 framebuffer, primitives, an 8x8 font
+rustclr-mqtt       An MQTT 3.1.1 codec, transport-free
+rustclr-usb        USB descriptors and device classes
+rustclr-db         An embedded record store
+rustclr-diag       Structured logging and health counters
+rustclr-net        HTTP, Modbus, a small web server (host only)
+rustclr-espat      Espressif AT commands, without a UART
+rustnet-cli        The toolchain binary
 ```
 
 Arsitektur lengkap: [docs/architecture.md](docs/architecture.md).
@@ -272,11 +289,28 @@ rustnet disasm <assembly> [filter]           # bongkar ke IL
 rustnet verify <assembly>                    # laporkan apa yang tidak ter-resolve
 rustnet build [proyek] [--run]               # kompilasi, lalu jalankan di sini
 rustnet capabilities                         # yang sudah diimplementasikan runtime
+rustnet debug <assembly> --break File.cs:42  # berhenti pada satu baris sumber
+rustnet debug <assembly> --dap               # bicara DAP, agar editor bisa attach
+rustnet profile <assembly> [--top N]         # ke mana waktu pergi, dan apa yang dialokasikan
 ```
 
 `verify` adalah perintah pertama yang layak dipakai saat memindahkan program:
 ia menyebutkan setiap anggota yang dirujuk program tetapi belum bisa disediakan
 RustCLR — sebelum Anda menjalankannya.
+
+`profile` mengambil sampel di antara instruksi IL — tanpa thread pengambil
+sampel, sehingga profiler yang sama berjalan di mikrokontroler — lalu melaporkan
+waktu self dan inclusive per metode, jumlah pemanggilan yang eksak, serta
+alokasi per tipe, dengan array dibebankan ke tipe elemennya. Yang diukur adalah
+wall clock, yang diprofilkan adalah thread yang menjalankan `Main`, dan
+semuanya diinterpretasi secara default karena kode terkompilasi tidak
+menjalankan IL.
+
+`debug` berhenti sebelum baris atau IL offset yang dipilih, melakukan step
+into/over/out, dan menampilkan argumen serta local setiap frame — dengan nama
+aslinya, selama portable PDB yang ditulis SDK ada di sebelah assembly. Dengan
+`--dap` ia menjadi server Debug Adapter Protocol lewat stdin dan stdout, yaitu
+protokol yang dipakai VSCode dan Rider.
 
 Rujukan: [docs/cli.md](docs/cli.md).
 
@@ -578,7 +612,7 @@ menyatakannya dalam satu baris teks alih-alih mati di dalam allocator.
 | [ESP32-C3](embedded/esp32-demo) | RISC-V 32 | 400 K | penuh | **mengeksekusi IL di perangkat keras** |
 | [ESP32-WROOM-32](embedded/esp32-demo) | Xtensa LX6 | 520 K | penuh | terbangun; flash terakhir sebelum interpreter |
 | [Meadow F7](embedded/meadow-f7) | Cortex-M7 | 384 K | penuh | terbangun; flash terakhir sebelum interpreter |
-| [Maix Go K210](embedded/k210) | RISC-V 64 | 6 M | penuh | terbangun; belum pernah di-flash — tidak ada papan |
+| [Maix Go K210](embedded/k210) | RISC-V 64 | 6 M | penuh | **jalan** — menjalankan `HelloWorld.Main`, output identik dengan `dotnet` |
 | [Netduino 3 WiFi](embedded/stm32f4) | Cortex-M4F | 256 K | minimal | terbangun; belum pernah di-flash — tidak ada papan |
 | [Pico](embedded/rp2040) | Cortex-M0+ | 256 K | minimal | terbangun; belum pernah di-flash — tidak ada papan |
 | [Nucleo-F401RE](embedded/stm32f4) | Cortex-M4F | 96 K | **tidak ada** | terbangun; belum pernah di-flash — tidak ada papan |
@@ -591,8 +625,12 @@ pernah terjangkau.
 
 Ketujuhnya berbagi satu demonstrasi
 ([embedded/demo-common](embedded/demo-common)) dan `bash tests/firmware.sh`
-membangun semuanya. Hanya baris pertama yang sudah berjalan di perangkat keras
-sejak interpreter mendarat; rekaman metadata-dan-GC sebelumnya:
+membangun semuanya. **Tiga arsitektur sudah menjalankan interpreter di
+perangkat keras** — RISC-V 32, RISC-V 64, dan Xtensa LX6, dari berkas sumber
+yang sama: [ESP32-C3](docs/logs/esp32c3-interpreter.log) ·
+[Maix Go K210](docs/logs/maixgo-k210.log) ·
+[M5Stack Tough](docs/logs/m5stack-tough.log). Rekaman metadata-dan-GC
+sebelumnya:
 [Xtensa](docs/logs/esp32-wroom32.log) · [RISC-V](docs/logs/esp32c3.log) ·
 [Arm](docs/logs/meadow-f7.log).
 

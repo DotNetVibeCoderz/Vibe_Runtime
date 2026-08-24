@@ -4,8 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status: milestones 1-3 and 5 complete, 4 and 6 partly done, and it works
 
-The runtime executes real Roslyn-compiled assemblies. `cargo test --workspace` runs 206 tests;
-the conformance fixture prints `checks=345 failures=0` on RustCLR, byte-identical to `dotnet`,
+The runtime executes real Roslyn-compiled assemblies. `cargo test --workspace` runs 416 tests;
+the conformance fixture prints `checks=361 failures=0` on RustCLR, byte-identical to `dotnet`,
 and `ModernSyntax` prints `checks=35 failures=0`. Generic collections, LINQ and
 `async`/`await` all run, `Span<T>` and `unsafe` pointers work, and reflection works on
 real `System.Type` objects.
@@ -86,20 +86,93 @@ Threads share one heap and one set of static fields, and each gets an identical 
 of the loader — which is why no lock sits on the path that runs every instruction.
 
 **The whole runtime builds without `std`, and the interpreter runs on microcontrollers** —
-an ESP32-C3 (RISC-V 32) and an M5Stack Tough (Xtensa LX6) both execute `HelloWorld.Main`
-with the whole of RustBCL, printing bytes identical to `dotnet`. Two architectures,
-one source file. `bash tests/embedded.sh` checks metadata, gc, core and bcl on four
+an ESP32-C3 (RISC-V 32), a Sipeed Maix Go (K210, RISC-V **64**) and an M5Stack Tough
+(Xtensa LX6) all execute `HelloWorld.Main` with the whole of RustBCL, printing bytes
+identical to `dotnet`. Three architectures, one source file. The K210 is booted into
+SRAM (`kflash -s`, which never touches its flash) and watched with DTR and RTS
+cleared, because either one resets the chip and discards the image. `bash tests/embedded.sh` checks metadata, gc, core and bcl on four
 bare-metal targets. Memory is the binding constraint there: 260,702 bytes peak with every
 binding, 192,045 with a console-only subset, and each firmware picks from its heap budget —
 the Nucleo-F401RE's 96 KB clears neither, which it reports rather than faulting.
 
 CodeGen builds and runs. Not a git repository.
 
-**Debugger hooks exist, a debug adapter does not.** Breakpoints by (method, IL
-offset), step into/over/out, and a view of every frame while stopped —
-`rustnet debug` drives them. No DAP server, and no source-line breakpoints:
-both need a portable-PDB reader. The hook is `#[cold]` and never inlined
-because without that it cost 8% on the interpreter.
+**An editor can attach.** `rustnet debug --dap` is a Debug Adapter Protocol
+server — JSON over stdin/stdout — with breakpoints by source line, the call
+stack as `file:line`, and locals by name, all read out of the portable PDB the
+SDK writes beside the assembly. `rustnet debug` alone drives the same hooks
+from a terminal. Its JSON is hand-written because the workspace has no external
+dependencies. Under `--dap` **stdout belongs to the protocol**: the program's
+console becomes `output` events. The hook is `#[cold]` and never inlined
+because without that it cost 8% on the interpreter. What is missing is stated
+in `docs/limitations.md`: no editor extension, no `evaluate`, and no pause
+while running, because the hook is synchronous.
+
+**The profiler samples itself.** `rustnet profile` reports self and inclusive
+time per method, exact call counts, and what was allocated by type — arrays
+charged to their element type, not lumped under `System.Array`. There is no
+sampling thread: the interpreter counts down 512 instructions, reads the clock,
+and walks its own frames, which is why it needs no synchronisation and works on
+a board. It charges *measured* elapsed time rather than one tick per sample, so
+a late sample does not shorten the run it reports. It measures **wall clock**,
+profiles **one thread**, and interprets by default because compiled code runs no
+IL. A program reads the same counters through `GC.CollectionCount` and
+`GC.GetTotalAllocatedBytes`, so the two cannot disagree.
+
+**A C# program can drive hardware.** `RustNet.Hal.Gpio.Write(2, true)` reaches a
+pin: C# → `managed/RustNet.Device` → a native binding → a `Board` trait object →
+the chip. The board is a *swappable module* like the collector and the
+scheduler — `crates/rustclr-hal` is traits only, `crates/rustclr-hal-host` is a
+simulator, and `rustnet run --board host` installs it. **No board is an error,
+not a no-op.** `RustNet.IO.Storage` is whole-file over a log-structured flash
+store, because NOR cannot set bits and a seekable stream would erase a sector
+per write. `RustNet.Security` is SHA-256, HMAC, AES-CTR and CRC-32 **written out
+rather than depended on**, checked against the vectors FIPS 180-4, FIPS 197,
+SP 800-38A and RFC 4231 publish — no RSA, no RNG, and `docs/limitations.md` says
+why. `tests/fixtures/Device` is the hardware sibling of the Conformance fixture.
+
+**The managed libraries are seventeen assemblies under `managed/`, and that is
+load-bearing.** A loaded assembly's types are *all* registered whether the
+program mentions them or not, so one combined library made a program that only
+draws also carry CAN, MQTT, a camera and a database — measured at 320 types and
+498 methods against 253 and 68 for the two it actually used. Every template
+references only the libraries its source names. Porting from the reference
+requires exactly one managed change: `[InternalCall] ... => throw new
+RuntimeOnlyException()` must become `extern` + `[MethodImpl(InternalCall)]`,
+because RustCLR dispatches a native only for a method with no IL body.
+
+**Fourteen templates in `templates/`** (`bash tests/templates.sh`), and three
+host tools in `tools/` — Deploy, Workbench, Designer. The reference's
+`rustnet-mdp` (DLL→RNX) is deliberately absent: RustCLR reads PE/ECMA-335, so
+what gets signed and flashed is exactly what Roslyn produced.
+
+**`graphics-primitives` runs on the Maix Go**, drawing into a 320x240 RGB565
+canvas through an ST7789V. A firmware carries its libraries via
+`RUSTCLR_LIB1`/`LIB2` because a board has no filesystem to resolve an
+`AssemblyRef` against; the program's console **streams** rather than being
+captured, because a device program loops forever and a captured console prints
+nothing; and attaching the panel is what raises the backlight, since the
+backlight rail hangs off the panel's reset line.
+
+The loader now **follows assembly references** from the directory a program sits
+in, skipping framework names so a self-contained publish cannot supply a second
+`System.Object`.
+
+**The device layers are all in**, ported from the Gravicode RustNet reference:
+`hal` + four chip HALs (K210, ESP32-C3, RP2040, STM32), `flashfs`, `crypto`,
+`secureboot`, `ota`, `gfx`, `mqtt`, `usb`, `db`, `diag`, `net`. Every one but
+`net` builds on all four bare-metal targets — `tests/embedded.sh` checks
+fourteen crates. **Each of the seven firmwares installs its real board** and
+reports what the chip offers; nothing in that report drives an output, because
+a demo that wrote an arbitrary pin on unknown wiring is a short or a relay.
+
+Three things the port could not copy, each with the reason in
+`docs/limitations.md`: the **font** is now a 1 KB table generated from readable
+pixel art (a test renders it back to text); **secure boot** verifies an HMAC
+rather than RSA, so the verifying key can also sign and that is stated rather
+than glossed; and **`rustclr-diag`'s lock** is a try-borrow that drops a record,
+because thumbv6m and rv32imc have no compare-and-swap and a spin lock would hang
+any board whose interrupt handler logged.
 
 `requirements.md` is the single source of truth for scope. Read it before starting any work —
 this file summarizes its binding decisions but does not replace it. `Plan.md` holds the
@@ -181,8 +254,8 @@ the C# side is one project built by path.
 ```bash
 # Runtime
 cargo build --release                      # produces target/release/rustnet
-cargo test --workspace                     # 206 tests; must stay green
-bash tests/embedded.sh                     # 4 crates x 4 bare-metal targets; must stay green
+cargo test --workspace                     # 416 tests; must stay green
+bash tests/embedded.sh                     # 14 crates x 4 bare-metal targets; must stay green
 bash tests/firmware.sh                     # seven board firmwares; must stay green
 cargo test -p rustclr-core                 # one crate
 cargo test -p rustclr-gc a_cycle_is        # one test by substring
@@ -203,7 +276,7 @@ Before claiming a runtime change works, run a real assembly through both runtime
 
 ```bash
 cd tests/fixtures/Conformance && dotnet build -c Release
-dotnet bin/Release/net10.0/Conformance.dll                    # expect: checks=345 failures=0
+dotnet bin/Release/net10.0/Conformance.dll                    # expect: checks=361 failures=0
 ../../../target/debug/rustnet.exe run bin/Release/net10.0/Conformance.dll
 ```
 

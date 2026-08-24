@@ -333,3 +333,66 @@ pub fn sleep_millis(interp: &mut Interpreter, ms: u64) {
         }
     }
 }
+
+/// Allocates a managed `byte[]`.
+///
+/// The storage is `ArrayStorage::U8`, so the bytes land in the array's own
+/// representation rather than a boxed value per element — which matters when
+/// a driver hands back a 4 KB block read.
+pub fn byte_array(interp: &mut Interpreter, bytes: &[u8]) -> Handle {
+    let byte_type = interp.loader.primitive_type(Primitive::Byte);
+    let array = interp.alloc_array(byte_type, bytes.len());
+    interp.heap.with_mut::<ClrArray, _>(array, |a| {
+        if let rustclr_core::ArrayStorage::U8(v) = &mut a.storage {
+            v.copy_from_slice(bytes);
+        } else {
+            for (i, b) in bytes.iter().enumerate() {
+                a.storage.set(i, &Value::I32(*b as i32));
+            }
+        }
+    });
+    array
+}
+
+/// Reads argument `i` as a `byte[]`. A `null` array reads as empty, which is
+/// what a zero-length write means to every bus.
+pub fn arg_bytes(interp: &mut Interpreter, args: &[Value], i: usize) -> ExecResult<Vec<u8>> {
+    let handle = arg_handle(interp, args, i)?;
+    if handle.is_null() {
+        return Ok(Vec::new());
+    }
+    Ok(interp
+        .heap
+        .with::<ClrArray, _>(handle, |a| match &a.storage {
+            rustclr_core::ArrayStorage::U8(v) => v.clone(),
+            other => (0..other.len())
+                .map(|i| other.get(i).and_then(|v| v.as_i32()).unwrap_or(0) as u8)
+                .collect(),
+        })
+        .unwrap_or_default())
+}
+
+/// Copies `bytes` into an existing managed `byte[]`, returning how many landed.
+///
+/// The caller's buffer bounds the copy: a driver that returned more than was
+/// asked for would be a buffer overrun in a runtime whose reason for existing
+/// is that it does not have those.
+pub fn fill_byte_array(interp: &mut Interpreter, target: Handle, bytes: &[u8]) -> usize {
+    if target.is_null() {
+        return 0;
+    }
+    interp
+        .heap
+        .with_mut::<ClrArray, _>(target, |a| {
+            let n = bytes.len().min(a.storage.len());
+            if let rustclr_core::ArrayStorage::U8(v) = &mut a.storage {
+                v[..n].copy_from_slice(&bytes[..n]);
+            } else {
+                for i in 0..n {
+                    a.storage.set(i, &Value::I32(bytes[i] as i32));
+                }
+            }
+            n
+        })
+        .unwrap_or(0)
+}

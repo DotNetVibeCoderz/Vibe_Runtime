@@ -20,6 +20,17 @@ pub trait Host: Send {
     fn monotonic_millis(&mut self) -> u64;
     /// Unix epoch milliseconds, for `DateTime.Now`.
     fn wall_clock_millis(&mut self) -> i64;
+
+    /// Monotonic nanoseconds, for the profiler.
+    ///
+    /// Milliseconds by default, scaled — correct but coarse, which is the
+    /// right answer for a host that has nothing finer. A host with a
+    /// high-resolution clock should override it: at a 1 ms sampling period a
+    /// millisecond clock cannot tell a sample that arrived on time from one
+    /// that arrived twice as late.
+    fn monotonic_nanos(&mut self) -> u64 {
+        self.monotonic_millis().saturating_mul(1_000_000)
+    }
     /// Command-line arguments visible to the program.
     fn args(&self) -> &[String] {
         &[]
@@ -103,6 +114,10 @@ impl Host for SystemHost {
 
     fn monotonic_millis(&mut self) -> u64 {
         self.start.elapsed().as_millis() as u64
+    }
+
+    fn monotonic_nanos(&mut self) -> u64 {
+        self.start.elapsed().as_nanos() as u64
     }
 
     fn wall_clock_millis(&mut self) -> i64 {

@@ -37,6 +37,23 @@ use riscv_rt::entry;
 /// The assembly to read, compiled by Roslyn for `net10.0`.
 static HELLO_WORLD: &[u8] = include_bytes!(env!("RUSTCLR_APP_PATH"));
 
+/// Assemblies the embedded program references, in dependency order.
+///
+/// A board has no filesystem, so what a desktop finds beside the program has
+/// to be compiled in. `RUSTCLR_LIB1_PATH` and `RUSTCLR_LIB2_PATH` name them,
+/// and the build script turns each one that is set into a `cfg`. A program
+/// that references nothing — `HelloWorld` — sets neither and gets an empty
+/// list, which costs nothing.
+static APP_LIBRARIES: &[&[u8]] = &[
+    #[cfg(rustclr_lib1)]
+    include_bytes!(env!("RUSTCLR_LIB1_PATH")),
+    #[cfg(rustclr_lib2)]
+    include_bytes!(env!("RUSTCLR_LIB2_PATH")),
+    #[cfg(rustclr_lib3)]
+    include_bytes!(env!("RUSTCLR_LIB3_PATH")),
+];
+
+
 const BOARD: &str = "Kendryte K210 (RV64GC, Sipeed Maix Go)";
 
 /// The console baud. The Maix Go's USB bridge runs at this by default.
@@ -47,9 +64,20 @@ const BAUD: u32 = 115_200;
 /// A static array in `.bss` rather than the linker's `.heap` region, which
 /// leaves `_heap_size` at zero and gives `.stack` everything between the end of
 /// `.bss` and the top of SRAM.
-// The K210 is the one board with room to spare — 6 MB of SRAM against a peak
-// need of 261 KB — so this is generous rather than calculated.
-const HEAP_BYTES: usize = 1024 * 1024;
+// 1 MB was generous for a console program and not enough for a graphical one:
+// the `graphics-primitives` template asks for a 320x240 RGB565 canvas, which
+// is 153,600 bytes on top of RustBCL's 261 KB, and the allocator refused it.
+// The K210 is the one board with room to answer that — 6 MB of SRAM, of which
+// the firmware image and stack use well under one — so the budget is 4 MB.
+//
+// **2 MB, not 4.** The K210's general-purpose SRAM is two banks — 4 MB at
+// 0x80000000 and 2 MB at 0x80400000 — and `memory.x` describes them as one
+// region. A 4 MB heap puts this array across the boundary between them, and
+// the board went silent: it booted and never printed a character. 2 MB keeps
+// the whole array inside the first bank, with the firmware image below it and
+// the stack above, and it prints. The four-megabyte case is recorded in the
+// crate README rather than left as a number somebody will try again.
+const HEAP_BYTES: usize = 2 * 1024 * 1024;
 
 #[global_allocator]
 static ALLOCATOR: LlffHeap = LlffHeap::empty();
@@ -188,6 +216,39 @@ impl core::fmt::Write for Uarths {
     }
 }
 
+/// The program's console: straight to UARTHS, no buffering.
+///
+/// A device program's output has to appear *as it is written*. Buffering it
+/// until the entry point returns works for `HelloWorld` and hides everything a
+/// program that loops forever ever says — which looks exactly like a board
+/// that failed to boot.
+struct ConsoleHost;
+
+impl rustclr_demo_common::Host for ConsoleHost {
+    fn write_out(&mut self, text: &str) {
+        let _ = core::fmt::Write::write_str(&mut Uarths, text);
+    }
+
+    fn write_err(&mut self, text: &str) {
+        let _ = core::fmt::Write::write_str(&mut Uarths, text);
+    }
+
+    fn read_line(&mut self) -> Option<alloc::string::String> {
+        // The console is output-only here: the same UART carries the loader,
+        // and reading it would race whatever is watching.
+        None
+    }
+
+    fn monotonic_millis(&mut self) -> u64 {
+        riscv::register::mcycle::read64() / (cpu_hz() as u64 / 1_000)
+    }
+
+    fn wall_clock_millis(&mut self) -> i64 {
+        // No RTC battery on this board, so there is no wall clock to report.
+        0
+    }
+}
+
 #[entry]
 fn main() -> ! {
     // SAFETY: called once, before anything allocates. Only hart 0 gets here;
@@ -223,7 +284,87 @@ fn main() -> ! {
     // report. The boards with flash print once, because there the firmware is
     // still there after the reset.
     loop {
-        rustclr_demo_common::run(&mut console, BOARD, detail.as_str(), HELLO_WORLD, HEAP_BYTES);
+        // The allocator is reset before each report, and the reason is a
+        // measured failure rather than caution: on a Maix Go the sixth report
+        // died with `memory allocation of 73728 bytes failed` on a 1 MB heap
+        // that the collector said held nothing. Not a leak — fragmentation.
+        // Building the whole runtime (260 KB of bindings, a 98 KB slot table)
+        // and tearing it down again, five times, leaves a linked-list
+        // allocator with no contiguous block that size.
+        //
+        // Sound because nothing that outlives an iteration is on the heap:
+        // `run` drops everything it made before returning, `Detail` is a fixed
+        // 96-byte array, and `Uarths` is a unit struct. Those three facts are
+        // the whole proof obligation — adding a heap-backed local out here
+        // would break it.
+        //
+        // SAFETY: no allocation from a previous iteration is still reachable.
+        unsafe {
+            ALLOCATOR.init(core::ptr::addr_of_mut!(HEAP_MEMORY) as usize, HEAP_BYTES);
+        }
+        // The board is built fresh each iteration, for the same reason the
+        // allocator is reset: nothing from the previous report may still be
+        // reachable when the heap goes back to the start.
+        let clocks = rustclr_hal_k210::Clocks::detect();
+        let mut hardware =
+            rustclr_hal_k210::K210Board::new("Sipeed Maix Go", clocks, None);
+
+        // The panel. Without this `Display.Present()` is a no-op: the
+        // framebuffer is drawn, complete and readable, and never reaches
+        // glass. Attaching it takes SPI0 out of general circulation, which is
+        // why it is a decision the firmware makes rather than something the
+        // board does on its own.
+        //
+        // `init` also brings the backlight up. On a MaixLCD the backlight rail
+        // hangs off a PMOS switched by the panel's reset line, so a panel that
+        // is never reset is a panel that stays dark however much is drawn into
+        // it — which is exactly what a running demo with a black screen looks
+        // like.
+        let mut panel = rustclr_hal_k210::lcd::St7789::new(
+            rustclr_hal_k210::lcd::MAIX_PANEL,
+            clocks.spi_hz(0),
+            clocks.cpu_hz,
+        );
+        // `DEFAULT_CLOCK_HZ`, not the core clock. `init` feeds this straight
+        // to `spi.set_target_hz`, so passing 390 MHz asked for a bus 26x past
+        // what an ST7789V accepts: the panel kept whatever was in its RAM and
+        // the screen looked like a board that had not been written to at all.
+        match panel.init(rustclr_hal_k210::lcd::DEFAULT_CLOCK_HZ) {
+            Ok(()) => {
+                // A solid fill straight through the driver, before any managed
+                // code runs. It separates two failures that look identical from
+                // the console: a panel that is not being written at all, and a
+                // framebuffer that never reaches `present`. If the screen goes
+                // green here and stays stale afterwards, the fault is above the
+                // driver, not in it.
+                let probe = panel.fill(0x07E0);
+                let _ = writeln!(
+                    console,
+                    "panel            rustclr: ST7789V on SPI0 @ {} MHz, fill {}",
+                    rustclr_hal_k210::lcd::DEFAULT_CLOCK_HZ / 1_000_000,
+                    match &probe {
+                        Ok(()) => "ok",
+                        Err(_) => "FAILED",
+                    }
+                );
+                hardware.attach_panel(panel);
+            }
+            Err(e) => {
+                // Said rather than swallowed: a board with no panel still runs
+                // everything else, and the report should not imply glass.
+                let _ = writeln!(console, "panel            rustclr: not brought up: {e}");
+            }
+        }
+        rustclr_demo_common::run(
+            &mut console,
+            BOARD,
+            detail.as_str(),
+            HELLO_WORLD,
+            HEAP_BYTES,
+            Some(alloc::boxed::Box::new(hardware)),
+            Some(alloc::boxed::Box::new(ConsoleHost)),
+            APP_LIBRARIES,
+        );
         // A fixed cycle count, not one derived from `clock`: if the clock
         // reading is wrong the delay would be wrong with it, and the report
         // would repeat either far too often or never again.

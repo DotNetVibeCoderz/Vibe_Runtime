@@ -10,7 +10,7 @@ rust-version.workspace = true
 
 [features]
 default = ["std"]
-std = ["rustclr-core/std", "rustclr-gc/std"]
+std = ["dep:rustclr-net", "rustclr-core/std", "rustclr-gc/std", "rustclr-hal/std"]
 # Float maths from libm instead of std. Enable together with no-default-features.
 libm-math = ["dep:libm"]
 
@@ -19,9 +19,22 @@ libm-math = ["dep:libm"]
 # features on, and RustBCL has to be buildable without `std`.
 rustclr-core = { path = "../rustclr-core", version = "0.1.0", default-features = false }
 rustclr-gc = { path = "../rustclr-gc", version = "0.1.0", default-features = false }
+# The board seam the `RustNet.Hal` bindings talk to.
+rustclr-hal = { path = "../rustclr-hal", version = "0.1.0", default-features = false }
+# The store behind `RustNet.IO`.
+rustclr-flashfs = { path = "../rustclr-flashfs", version = "0.1.0" }
+# The algorithms behind `RustNet.Security`.
+rustclr-crypto = { path = "../rustclr-crypto", version = "0.1.0", default-features = false }
+rustclr-gfx = { path = "../rustclr-gfx", version = "0.1.0", default-features = false }
+# The MQTT client behind `RustNet.Net`. `std`-only, like its sockets.
+rustclr-net = { path = "../rustclr-net", version = "0.1.0", optional = true }
 
 # The one external dependency anywhere in the runtime, and it is optional.
 # `System.Math` is most of a libm, and `core` has no transcendental functions,
 # so without this a chip would have a `Math` class that cannot take a square
 # root. A default (`std`) build does not pull it in.
 libm = { version = "0.2", optional = true }
+
+[dev-dependencies]
+# The simulated board the device fixture runs against.
+rustclr-hal-host = { path = "../rustclr-hal-host", version = "0.1.0" }

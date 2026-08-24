@@ -1,0 +1,12 @@
+[package]
+name = "rustclr-hal-host"
+description = "A simulated board: every HAL trait against in-memory state, so hardware code is testable on a desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rustclr-hal = { workspace = true, features = ["std"] }

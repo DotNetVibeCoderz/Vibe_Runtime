@@ -1111,7 +1111,11 @@ version = "0.1.0"
 dependencies = [
  "libm",
  "rustclr-core",
+ "rustclr-crypto",
+ "rustclr-flashfs",
  "rustclr-gc",
+ "rustclr-gfx",
+ "rustclr-hal",
 ]
 
 [[package]]
@@ -1119,8 +1123,14 @@ name = "rustclr-core"
 version = "0.1.0"
 dependencies = [
  "rustclr-gc",
+ "rustclr-gfx",
+ "rustclr-hal",
  "rustclr-metadata",
 ]
+
+[[package]]
+name = "rustclr-crypto"
+version = "0.1.0"
 
 [[package]]
 name = "rustclr-demo-common"
@@ -1129,6 +1139,7 @@ dependencies = [
  "rustclr-bcl",
  "rustclr-core",
  "rustclr-gc",
+ "rustclr-hal",
  "rustclr-metadata",
 ]
 
@@ -1136,17 +1147,45 @@ dependencies = [
 name = "rustclr-esp32-demo"
 version = "0.1.0"
 dependencies = [
+ "embedded-hal 1.0.0",
  "esp-alloc",
  "esp-backtrace",
  "esp-bootloader-esp-idf",
  "esp-hal",
  "esp-println",
  "rustclr-demo-common",
+ "rustclr-hal",
+ "rustclr-hal-esp32c3",
+]
+
+[[package]]
+name = "rustclr-flashfs"
+version = "0.1.0"
+dependencies = [
+ "rustclr-hal",
 ]
 
 [[package]]
 name = "rustclr-gc"
 version = "0.1.0"
+
+[[package]]
+name = "rustclr-gfx"
+version = "0.1.0"
+dependencies = [
+ "rustclr-hal",
+]
+
+[[package]]
+name = "rustclr-hal"
+version = "0.1.0"
+
+[[package]]
+name = "rustclr-hal-esp32c3"
+version = "0.1.0"
+dependencies = [
+ "rustclr-hal",
+]
 
 [[package]]
 name = "rustclr-metadata"

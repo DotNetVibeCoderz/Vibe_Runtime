@@ -1,0 +1,22 @@
+[package]
+name = "rustclr-hal-stm32"
+description = "The HAL traits against real stm32 hardware"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# The traits and nothing else. A chip crate that pulled a vendor HAL would
+# make the whole workspace depend on it.
+[dependencies]
+rustclr-hal = { path = "../rustclr-hal", version = "0.1.0", default-features = false }
+
+[features]
+default = []
+# The F7's GPIO and USART registers sit at different base addresses from the
+# F4's. The Meadow F7 firmware turns this on; the Nucleo and Netduino builds
+# leave it off. Declared here because the code gates on it, and an undeclared
+# feature is a `cfg` that silently never matches.
+stm32f7 = []

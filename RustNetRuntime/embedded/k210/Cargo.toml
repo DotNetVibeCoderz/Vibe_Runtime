@@ -12,6 +12,8 @@ publish = false
 
 [dependencies]
 rustclr-demo-common = { path = "../demo-common" }
+# The real K210 peripherals, so `RustNet.Hal` reaches a pin on this chip.
+rustclr-hal-k210 = { path = "../../crates/rustclr-hal-k210", default-features = false }
 
 # `critical-section-single-hart` supplies the critical_section implementation
 # the allocator needs. Sound here for the reason the feature name gives: only

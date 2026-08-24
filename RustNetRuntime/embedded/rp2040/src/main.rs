@@ -49,6 +49,23 @@ pub static BOOT2: [u8; 256] = rp2040_boot2::BOOT_LOADER_W25Q080;
 /// flash.
 static HELLO_WORLD: &[u8] = include_bytes!(env!("RUSTCLR_APP_PATH"));
 
+/// Assemblies the embedded program references, in dependency order.
+///
+/// A board has no filesystem, so what a desktop finds beside the program has
+/// to be compiled in. `RUSTCLR_LIB1_PATH` and `RUSTCLR_LIB2_PATH` name them,
+/// and the build script turns each one that is set into a `cfg`. A program
+/// that references nothing — `HelloWorld` — sets neither and gets an empty
+/// list, which costs nothing.
+static APP_LIBRARIES: &[&[u8]] = &[
+    #[cfg(rustclr_lib1)]
+    include_bytes!(env!("RUSTCLR_LIB1_PATH")),
+    #[cfg(rustclr_lib2)]
+    include_bytes!(env!("RUSTCLR_LIB2_PATH")),
+    #[cfg(rustclr_lib3)]
+    include_bytes!(env!("RUSTCLR_LIB3_PATH")),
+];
+
+
 const BOARD: &str = "Raspberry Pi RP2040 (Cortex-M0+)";
 
 /// The crystal every RP2040 board carries; the ROM and USB both depend on it.
@@ -190,7 +207,20 @@ fn main() -> ! {
                 clocks.system_clock.freq().to_MHz(),
                 XTAL_HZ / 1_000_000
             );
-            rustclr_demo_common::run(&mut console, BOARD, detail.as_str(), HELLO_WORLD, HEAP_BYTES);
+            let hardware = rustclr_hal_rp2040::Rp2040Board::new(
+                "Raspberry Pi Pico",
+                rustclr_hal_rp2040::clocks::init(125_000_000),
+            );
+            rustclr_demo_common::run(
+                &mut console,
+                BOARD,
+                detail.as_str(),
+                HELLO_WORLD,
+                HEAP_BYTES,
+                Some(alloc::boxed::Box::new(hardware)),
+                None,
+                APP_LIBRARIES,
+            );
         }
         was_open = open;
     }

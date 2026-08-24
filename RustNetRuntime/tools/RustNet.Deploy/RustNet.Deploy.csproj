@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <Description>RustNet device deployment library: RNDP protocol client, transports, image signing.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="System.IO.Ports" Version="9.0.0" />
+  </ItemGroup>
+</Project>

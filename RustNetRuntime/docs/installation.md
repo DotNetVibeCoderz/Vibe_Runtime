@@ -133,7 +133,7 @@ cargo build --release            # target/release/rustnet
 dotnet run --project src/CodeGen # the IDE
 ```
 
-`cargo test --workspace` should report 111 passing tests.
+`cargo test --workspace` should report 416 passing tests.
 
 ---
 

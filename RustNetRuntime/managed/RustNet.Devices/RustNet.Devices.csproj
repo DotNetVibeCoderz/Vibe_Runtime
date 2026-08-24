@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>Drivers for the parts that hang off a board</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../RustNet.Hal/RustNet.Hal.csproj" />
+
+    <ProjectReference Include="../RustNet.Buses/RustNet.Buses.csproj" />
+  </ItemGroup>
+
+</Project>

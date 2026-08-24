@@ -2125,7 +2125,106 @@ static class Program
         CheckEq("mutual recursion, the other parity", IsEvenLength(8), 0);
         Check("a fault inside a compiled callee reaches the caller", CalleeFaultPropagates());
 
+        // ── Runtime diagnostics a program can read about itself ─────────────
+        //
+        // Every assertion here is an *invariant*, never an absolute: how many
+        // bytes a runtime allocates for the same program is its own business,
+        // and a check that pinned a number would fail on .NET or on RustCLR
+        // for a reason that is not a bug. What both must agree on is that the
+        // counters are cumulative, that collecting is visible, and that the
+        // numbers move when the program allocates.
+        Check("GC.GetTotalAllocatedBytes never decreases", AllocatedBytesRise());
+        Check("GC.GetTotalAllocatedBytes counts new allocations", AllocationIsCounted());
+        Check("GC.CollectionCount is non-negative", GC.CollectionCount(0) >= 0);
+        Check("GC.Collect() is visible in CollectionCount", CollectIsCounted());
+        Check("GC.CollectionCount never decreases", CollectionCountRises());
+        Check("allocated bytes exceed live bytes after garbage", GarbageIsAllocatedThenDropped());
+        Check("GC.GetTotalMemory reports something live", GC.GetTotalMemory(false) > 0);
+
+        // ── System.Text.Encoding ────────────────────────────────────────────
+        //
+        // UTF-8 and ASCII, which is what a wire format is. Every assertion is
+        // one both runtimes must agree on exactly, because this file is diffed
+        // against `dotnet` byte for byte.
+        CheckEq("UTF-8 encodes ASCII one byte per character",
+            System.Text.Encoding.UTF8.GetBytes("abc").Length, 3);
+        CheckEq("UTF-8 encodes a two-byte character as two bytes",
+            System.Text.Encoding.UTF8.GetBytes("é").Length, 2);
+        CheckEq("UTF-8 encodes an emoji as four bytes",
+            System.Text.Encoding.UTF8.GetBytes("😀").Length, 4);
+        Check("UTF-8 round-trips a non-ASCII string",
+            System.Text.Encoding.UTF8.GetString(
+                System.Text.Encoding.UTF8.GetBytes("halo dunia éü")) == "halo dunia éü");
+        CheckEq("GetByteCount agrees with GetBytes",
+            System.Text.Encoding.UTF8.GetByteCount("café"),
+            System.Text.Encoding.UTF8.GetBytes("café").Length);
+
+        // ASCII substitutes rather than throwing, and the substitute is `?`.
+        CheckEq("ASCII is one byte per character whatever the character",
+            System.Text.Encoding.ASCII.GetBytes("café").Length, 4);
+        Check("ASCII substitutes a question mark for what it cannot encode",
+            System.Text.Encoding.ASCII.GetString(
+                System.Text.Encoding.ASCII.GetBytes("café")) == "caf?");
+
+        // The two encodings are different objects, not one wearing two names.
+        Check("UTF8 and ASCII are distinct encodings",
+            System.Text.Encoding.UTF8.CodePage != System.Text.Encoding.ASCII.CodePage);
+        CheckEq("UTF-8 reports its usual code page",
+            System.Text.Encoding.UTF8.CodePage, 65001);
+
         Console.WriteLine("checks=" + checks + " failures=" + failures);
+    }
+
+    // ── Fixtures for runtime diagnostics ────────────────────────────────────
+
+    private static bool AllocatedBytesRise()
+    {
+        long first = GC.GetTotalAllocatedBytes(false);
+        long second = GC.GetTotalAllocatedBytes(false);
+        return second >= first;
+    }
+
+    /// Allocating has to move the counter. Without this the check above passes
+    /// against a binding that returns a constant.
+    private static bool AllocationIsCounted()
+    {
+        long before = GC.GetTotalAllocatedBytes(false);
+        long sink = 0;
+        for (int i = 0; i < 2000; i++)
+        {
+            int[] block = new int[64];
+            block[0] = i;
+            sink += block[0];
+        }
+        long after = GC.GetTotalAllocatedBytes(false);
+        return after > before && sink > 0;
+    }
+
+    private static bool CollectIsCounted()
+    {
+        int before = GC.CollectionCount(0);
+        GC.Collect();
+        return GC.CollectionCount(0) > before;
+    }
+
+    private static bool CollectionCountRises()
+    {
+        int first = GC.CollectionCount(0);
+        int second = GC.CollectionCount(0);
+        return second >= first;
+    }
+
+    /// Garbage that is dropped: the cumulative total has to outgrow what is
+    /// live, or the runtime is reporting live bytes under an allocated name.
+    private static bool GarbageIsAllocatedThenDropped()
+    {
+        for (int i = 0; i < 4000; i++)
+        {
+            string temporary = "garbage" + i;
+            if (temporary.Length == 0) return false;
+        }
+        GC.Collect();
+        return GC.GetTotalAllocatedBytes(false) > GC.GetTotalMemory(false);
     }
 
     // ── Fixtures for calls between compiled methods ─────────────────────────

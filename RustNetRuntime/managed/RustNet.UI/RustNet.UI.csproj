@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>A declarative UI over the panel</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../RustNet.Graphics/RustNet.Graphics.csproj" />
+
+    <ProjectReference Include="../RustNet.Serialization/RustNet.Serialization.csproj" />
+  </ItemGroup>
+
+</Project>

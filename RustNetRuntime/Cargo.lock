@@ -14,7 +14,13 @@ version = "0.1.0"
 dependencies = [
  "libm",
  "rustclr-core",
+ "rustclr-crypto",
+ "rustclr-flashfs",
  "rustclr-gc",
+ "rustclr-gfx",
+ "rustclr-hal",
+ "rustclr-hal-host",
+ "rustclr-net",
 ]
 
 [[package]]
@@ -22,13 +28,86 @@ name = "rustclr-core"
 version = "0.1.0"
 dependencies = [
  "rustclr-gc",
+ "rustclr-gfx",
+ "rustclr-hal",
  "rustclr-metadata",
+ "rustclr-net",
  "rustclr-sched",
+]
+
+[[package]]
+name = "rustclr-crypto"
+version = "0.1.0"
+
+[[package]]
+name = "rustclr-db"
+version = "0.1.0"
+
+[[package]]
+name = "rustclr-diag"
+version = "0.1.0"
+
+[[package]]
+name = "rustclr-espat"
+version = "0.1.0"
+
+[[package]]
+name = "rustclr-flashfs"
+version = "0.1.0"
+dependencies = [
+ "rustclr-hal",
 ]
 
 [[package]]
 name = "rustclr-gc"
 version = "0.1.0"
+
+[[package]]
+name = "rustclr-gfx"
+version = "0.1.0"
+dependencies = [
+ "rustclr-hal",
+ "rustclr-hal-host",
+]
+
+[[package]]
+name = "rustclr-hal"
+version = "0.1.0"
+
+[[package]]
+name = "rustclr-hal-esp32c3"
+version = "0.1.0"
+dependencies = [
+ "rustclr-hal",
+]
+
+[[package]]
+name = "rustclr-hal-host"
+version = "0.1.0"
+dependencies = [
+ "rustclr-hal",
+]
+
+[[package]]
+name = "rustclr-hal-k210"
+version = "0.1.0"
+dependencies = [
+ "rustclr-hal",
+]
+
+[[package]]
+name = "rustclr-hal-rp2040"
+version = "0.1.0"
+dependencies = [
+ "rustclr-hal",
+]
+
+[[package]]
+name = "rustclr-hal-stm32"
+version = "0.1.0"
+dependencies = [
+ "rustclr-hal",
+]
 
 [[package]]
 name = "rustclr-interop"
@@ -52,7 +131,38 @@ name = "rustclr-metadata"
 version = "0.1.0"
 
 [[package]]
+name = "rustclr-mqtt"
+version = "0.1.0"
+
+[[package]]
+name = "rustclr-net"
+version = "0.1.0"
+dependencies = [
+ "rustclr-diag",
+ "rustclr-mqtt",
+]
+
+[[package]]
+name = "rustclr-ota"
+version = "0.1.0"
+dependencies = [
+ "rustclr-crypto",
+ "rustclr-secureboot",
+]
+
+[[package]]
 name = "rustclr-sched"
+version = "0.1.0"
+
+[[package]]
+name = "rustclr-secureboot"
+version = "0.1.0"
+dependencies = [
+ "rustclr-crypto",
+]
+
+[[package]]
+name = "rustclr-usb"
 version = "0.1.0"
 
 [[package]]
@@ -62,6 +172,7 @@ dependencies = [
  "rustclr-bcl",
  "rustclr-core",
  "rustclr-gc",
+ "rustclr-hal-host",
  "rustclr-interop",
  "rustclr-jit",
  "rustclr-metadata",

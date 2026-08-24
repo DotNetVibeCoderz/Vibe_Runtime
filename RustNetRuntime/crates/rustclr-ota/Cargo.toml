@@ -1,0 +1,17 @@
+[package]
+name = "rustclr-ota"
+description = "Over-the-air updates: A/B slots, verified images, automatic rollback"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rustclr-secureboot = { path = "../rustclr-secureboot", version = "0.1.0", default-features = false }
+rustclr-crypto = { path = "../rustclr-crypto", version = "0.1.0", default-features = false }
+
+[features]
+default = ["std"]
+std = ["rustclr-secureboot/std", "rustclr-crypto/std"]

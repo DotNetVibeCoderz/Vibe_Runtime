@@ -1,0 +1,7 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>The panel: a canvas and drawing primitives</Description>
+  </PropertyGroup>
+
+</Project>

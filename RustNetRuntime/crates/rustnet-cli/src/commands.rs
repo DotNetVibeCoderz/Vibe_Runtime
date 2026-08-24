@@ -10,6 +10,28 @@ use std::path::Path;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
+/// Installs the board `RustNet.Hal` will talk to.
+///
+/// Named rather than detected: which board is underneath is a fact about the
+/// hardware, and a runtime that guessed would drive the wrong pins. An
+/// unknown name lists what there is instead of falling back to the simulator,
+/// because a program that quietly ran against a simulation when it was meant
+/// to drive a relay has done something worse than fail.
+fn install_board(interp: &mut Interpreter, name: &str) -> Result<()> {
+    match name {
+        "host" | "sim" | "simulator" => {
+            interp.board = Some(Box::new(rustclr_hal_host::HostBoard::new()));
+            Ok(())
+        }
+        "none" => Ok(()),
+        other => Err(format!(
+            "unknown board `{other}`. This build has: host (the simulator), none.
+A real chip installs its own board from its firmware, not from this flag."
+        )
+        .into()),
+    }
+}
+
 /// Builds an interpreter with the full runtime installed.
 fn runtime(args: Vec<String>) -> Interpreter {
     runtime_with_bcl(args, false)
@@ -43,8 +65,12 @@ pub fn run(
     jit_threshold: Option<u32>,
     inline: bool,
     minimal_bcl: bool,
+    board: Option<&str>,
 ) -> Result<i32> {
     let mut interp = runtime_with_bcl(args, minimal_bcl);
+    if let Some(name) = board {
+        install_board(&mut interp, name)?;
+    }
     if minimal_bcl {
         eprintln!(
             "[rustnet] --bcl minimal: {} native bindings, the set a 192 KB board can hold",
@@ -567,7 +593,7 @@ pub fn build(project: &str, configuration: &str, then_run: bool) -> Result<i32> 
         .ok_or("build succeeded but no output assembly was found under bin/")?;
 
     println!("Running {} on RustCLR…\n", assembly.display());
-    run(&assembly.to_string_lossy(), Vec::new(), false, false, None, true, None, true, false)
+    run(&assembly.to_string_lossy(), Vec::new(), false, false, None, true, None, true, false, None)
 }
 
 /// Finds the first `.dll` under a build output directory.
@@ -727,13 +753,104 @@ pub fn capabilities() -> Result<i32> {
     println!("                               a program through them.");
     println!("                               A debugger may set breakpoints WHILE stopped");
     println!("                               and they take effect on the same run.");
-    println!("                               NOT a debug adapter: there is no DAP server,");
-    println!("                               and breakpoints are by IL offset rather than");
-    println!("                               by source line, because mapping a line needs");
-    println!("                               a portable-PDB reader this runtime does not");
-    println!("                               have. VSCode and Rider cannot attach yet.");
+    println!("  source-line breakpoints      yes, where a portable PDB sits beside the");
+    println!("                               assembly - `--break File.cs:line` resolves to");
+    println!("                               EVERY place that line has code. A line with");
+    println!("                               no code is refused, not moved to a nearby one.");
+    println!("                               Locals are named from the PDB where it names");
+    println!("                               them; a compiler-generated slot is shown by");
+    println!("                               number instead of an invented name. No PDB");
+    println!("                               means IL offsets only, and it says so.");
+    println!("  debug adapter (DAP)          yes - `rustnet debug --dap` speaks the Debug");
+    println!("                               Adapter Protocol over stdin/stdout, so VSCode");
+    println!("                               and Rider can attach. Breakpoints, stepping,");
+    println!("                               call stack, arguments and locals. The");
+    println!("                               program's console arrives as `output` events.");
+    println!("                               While the program RUNS no requests are");
+    println!("                               serviced: an editor's pause button does");
+    println!("                               nothing until the next breakpoint, because");
+    println!("                               the hook is synchronous by design.");
+    println!("                               ONE thread is debugged: the one that runs");
+    println!("                               Main. A thread the program starts runs with");
+    println!("                               no debugger, so a breakpoint inside it never");
+    println!("                               fires. Its console is still redirected.");
     println!("                               The hook costs nothing when nothing is");
     println!("                               attached - measured, not assumed.");
+    println!("  profiler                     yes - `rustnet profile` samples between IL");
+    println!("                               instructions and reports self and inclusive");
+    println!("                               time per method, exact call counts, and what");
+    println!("                               was allocated by type. It samples ITSELF:");
+    println!("                               no sampling thread, so it works on a board.");
+    println!("                               Measured elapsed time is charged rather than");
+    println!("                               one tick per sample, so a late sample does");
+    println!("                               not shorten the run it reports.");
+    println!("                               WALL CLOCK, not CPU: time blocked in a wait");
+    println!("                               counts against the method that waited.");
+    println!("                               ONE thread is profiled and everything is");
+    println!("                               interpreted by default - compiled code runs");
+    println!("                               no IL, so `--jit` charges its time and its");
+    println!("                               allocations to whoever called it.");
+    println!("                               Costs nothing when nothing is attached -");
+    println!("                               measured, not assumed.");
+    println!("  diagnostics a program reads  GC.CollectionCount, GetTotalMemory,");
+    println!("                               GetTotalAllocatedBytes, Stopwatch,");
+    println!("                               Environment.TickCount - answered from the");
+    println!("                               same counters the profiler reports, so a");
+    println!("                               program and its profile cannot disagree.");
+    println!("\nDevice");
+    println!("  board seam                   yes - `RustNet.Hal` reaches whatever board the");
+    println!("                               firmware installed: GPIO, ADC, PWM, I2C, SPI,");
+    println!("                               UART, watchdog, delay. The board is a");
+    println!("                               swappable module like the collector and the");
+    println!("                               scheduler, not something wired in.");
+    println!("                               `run --board host` installs a simulator so");
+    println!("                               hardware code is testable on a desktop.");
+    println!("  no board                     an ERROR, not a no-op. A program that writes");
+    println!("                               a pin on a machine that has none is told so.");
+    println!("                               Only `Board.Name` and `Board.IsPresent`");
+    println!("                               answer without a board.");
+    println!("  storage                      yes - `RustNet.IO.Storage` over a log-");
+    println!("                               structured store on the board's external");
+    println!("                               memory. Files are read and written WHOLE:");
+    println!("                               NOR flash cannot set bits, so a seekable");
+    println!("                               stream would erase a sector per write.");
+    println!("  crypto                       SHA-256, HMAC-SHA256, AES-128/256-CTR,");
+    println!("                               CRC-32 - written out, not depended on, and");
+    println!("                               checked against the vectors FIPS 180-4,");
+    println!("                               FIPS 197, SP 800-38A and RFC 4231 publish.");
+    println!("                               NO RSA or elliptic curves: a hand-rolled");
+    println!("                               bignum with a side channel is worse than no");
+    println!("                               signature check, because it reports success.");
+    println!("                               NO random number generator: entropy belongs");
+    println!("                               to the chip, and a board without one says so");
+    println!("                               rather than returning a counter.");
+    println!("  graphics                     yes - one RGB565 canvas, lines, rects,");
+    println!("                               circles, text in a built-in 8x8 font, and");
+    println!("                               `Present` to the board panel. Drawing needs");
+    println!("                               no board, which is how a UI is tested");
+    println!("                               headlessly. ONE canvas: 240x240 is 115 KB,");
+    println!("                               and on most of these boards that is the");
+    println!("                               whole heap.");
+    println!("  signed images                yes - `RCSB` containers verified before a");
+    println!("                               byte of payload runs, with the chip family");
+    println!("                               checked so an ESP32 image cannot brick an");
+    println!("                               STM32. A MAC, NOT a signature: the verifying");
+    println!("                               key can also sign, so extracting it from one");
+    println!("                               device compromises every device sharing it.");
+    println!("                               No rollback protection yet.");
+    println!("  over-the-air updates         yes - A/B slots, so a failed write costs a");
+    println!("                               reboot rather than a probe. New firmware");
+    println!("                               must CONFIRM itself; three silent boots roll");
+    println!("                               back. Silence is treated as failure, which");
+    println!("                               is the safe direction.");
+    println!("  device crates                MQTT codec, USB descriptors, a record store,");
+    println!("                               structured logging - all bare-metal. HTTP,");
+    println!("                               Modbus and the web server are host-only:");
+    println!("                               their transport is `std` sockets.");
+    println!("  text encodings               UTF-8 and ASCII. Every wire format a device");
+    println!("                               meets is one of the two, and .NET's code-page");
+    println!("                               tables are larger than the heap on the boards");
+    println!("                               this targets.");
     println!("\nMemory");
     println!("  collector                    {}", interp.heap.collector_name());
     println!("  pluggable collectors         yes");
@@ -1049,26 +1166,115 @@ fn is_supported_array(sig: &rustclr_core::metadata::TypeSig) -> bool {
         || rustclr_jit::translate::is_double_array(sig)
 }
 
-/// `rustnet debug` — run under the debugger hooks, printing every stop.
+/// `rustnet debug` — run under the debugger hooks.
 ///
-/// This is not a debug adapter. It is the smallest thing that exercises the
-/// hooks end to end and shows what an adapter would see: where execution
-/// stopped, in what method, at what IL offset, and what the frames held.
+/// Two front ends over the same hooks. Without `--dap` it prints every stop —
+/// where execution stopped, in what method, at what source line, and what the
+/// frames held — which is the smallest thing that exercises the hooks end to
+/// end. With `--dap` it speaks the Debug Adapter Protocol over stdin and
+/// stdout instead, and an editor drives it.
 ///
-/// Breakpoints are given as `Method:offset` rather than `file:line`, because
-/// mapping a line to an IL offset needs a portable PDB reader and this runtime
-/// does not have one yet. Offering a `file:line` syntax that silently never
-/// matched would be worse than not offering it.
-pub fn debug(path: &str, breakpoints: &[(String, u32)], step: bool) -> Result<i32> {
+/// Breakpoints are `File.cs:line` where a portable PDB sits beside the
+/// assembly, and `Method:offset` always. A line with no code is refused rather
+/// than moved to a nearby line that does.
+pub fn debug(
+    path: &str,
+    breakpoints: &[(String, u32)],
+    step: bool,
+    dap: bool,
+) -> Result<i32> {
     use rustclr_core::debug::{DebugCommand, DebugControl, DebugFrame, Debugger, StopReason};
 
-    let mut interp = Interpreter::with_host(Box::new(rustclr_core::SystemHost::new()));
+    // Under `--dap` stdout carries the protocol and nothing else may write to
+    // it — not this command, and not the program being debugged. Its console
+    // becomes `output` events, which is where an editor shows it anyway.
+    let wire = if dap { Some(crate::dap::Wire::new(std::io::stdout())) } else { None };
+    let mut interp = match &wire {
+        Some(wire) => Interpreter::with_host(Box::new(crate::dap::DapHost::new(
+            wire.clone(),
+            Vec::new(),
+        ))),
+        None => Interpreter::with_host(Box::new(rustclr_core::SystemHost::new())),
+    };
+    if let Some(wire) = &wire {
+        // Every thread the program starts, not just this one. A `Task.Run` or a
+        // `Thread.Start` that printed to the real stdout would land inside a
+        // framed message and the editor would drop the connection.
+        let wire = wire.clone();
+        interp.host_factory = Some(std::sync::Arc::new(move || {
+            Box::new(crate::dap::DapHost::new(wire.clone(), Vec::new()))
+        }));
+    }
     rustclr_bcl::install(&mut interp);
     let assembly = interp.loader.load_from_file(path)?;
+    // Source information is optional; say so rather than silently offering
+    // breakpoints by line that could never match.
+    let has_source = interp.loader.load_debug_info(assembly);
+    if !has_source {
+        // Over stderr under `--dap`: stdout is the protocol's.
+        let note = "no portable PDB beside this assembly — breakpoints by line are unavailable";
+        if dap {
+            eprintln!("{note}");
+        } else {
+            println!("{note}");
+        }
+    }
+
+    // The adapter takes the process over from here: it owns the conversation,
+    // and the breakpoints come from the editor rather than the command line.
+    if let Some(wire) = wire {
+        let map = crate::dap::SourceMap::build(&interp);
+        let mut adapter = crate::dap::DapAdapter::new(std::io::stdin(), wire, map);
+        // An editor that disconnects during the handshake gets no program run.
+        if !adapter.handshake() {
+            return Ok(0);
+        }
+        interp.attach_debugger(Box::new(adapter));
+        let outcome = interp.run_entry_point(assembly);
+        // `terminated` is what ends the editor's session; without it the debug
+        // view keeps spinning after the program has stopped.
+        let code = match &outcome {
+            Ok(code) => *code,
+            Err(_) => 1,
+        };
+        if let Some(mut debugger) = interp.debugger.take() {
+            debugger.finished(match &outcome {
+                Ok(code) => Ok(*code),
+                Err(e) => Err(format!("{e}")),
+            });
+        }
+        return Ok(code);
+    }
 
     // Resolve each name to a method before running, so a typo is an error now
     // rather than a breakpoint that silently never fires.
     for (name, offset) in breakpoints {
+        // `File.cs:line` when the name looks like a file, which is what an
+        // editor speaks. Resolved to *every* place that line has code: a
+        // lambda and its enclosing method share lines, and setting only one
+        // would silently miss the other.
+        if name.ends_with(".cs") {
+            let places = interp.loader.breakpoints_for_line(name, *offset);
+            if places.is_empty() {
+                return Err(format!(
+                    "no code on {name}:{offset}{}",
+                    if has_source { "" } else { " (and no PDB was found)" }
+                )
+                .into());
+            }
+            for (method, il) in places {
+                interp.breakpoints.add(method, il);
+                println!(
+                    "breakpoint: {}:{} -> {} at IL_{:04X}",
+                    name,
+                    offset,
+                    interp.loader.registry.method(method).qualified_name,
+                    il
+                );
+            }
+            continue;
+        }
+
         // Exact name first, then qualified name. A substring match is
         // deliberately *not* a fallback: asking for `Triple` and silently
         // getting `TripledAsync` is a plausible wrong answer, which is the one
@@ -1117,9 +1323,61 @@ pub fn debug(path: &str, breakpoints: &[(String, u32)], step: bool) -> Result<i3
         println!("no breakpoints and no --step: the program will run to completion");
     }
 
+    // Source lines and local names need the loader, and the loader lives
+    // inside the interpreter the debugger is attached to. Rather than hand the
+    // debugger a borrow it cannot have, what it needs is captured up front:
+    // both are fixed once the assembly is loaded.
+    let mut source_of: std::collections::HashMap<rustclr_core::MethodId, Vec<(u32, String, u32)>> =
+        Default::default();
+    let mut names_of: std::collections::HashMap<rustclr_core::MethodId, Vec<(u16, String)>> =
+        Default::default();
+    if has_source {
+        let methods: Vec<(rustclr_core::MethodId, rustclr_core::AssemblyId, u32)> = interp
+            .loader
+            .registry
+            .iter_methods()
+            .filter(|m| matches!(m.kind, MethodKind::Il(_)))
+            .map(|m| (m.id, m.assembly, m.token.row()))
+            .collect();
+        for (id, assembly, row) in methods {
+            let Some(pdb) = interp.loader.debug_info(assembly) else { continue };
+            let Some(debug) = pdb.method(row) else { continue };
+            let lines: Vec<(u32, String, u32)> = debug
+                .sequence_points
+                .iter()
+                .filter_map(|point| {
+                    let line = point.start_line?;
+                    let name = &pdb.document(point.document)?.name;
+                    let file = name.rsplit(['/', '\\']).next().unwrap_or(name);
+                    Some((point.il_offset, file.to_string(), line))
+                })
+                .collect();
+            if !lines.is_empty() {
+                source_of.insert(id, lines);
+            }
+            let names: Vec<(u16, String)> =
+                debug.locals.iter().map(|l| (l.index, l.name.clone())).collect();
+            if !names.is_empty() {
+                names_of.insert(id, names);
+            }
+        }
+    }
+
     struct Tracer {
         step: bool,
         stops: usize,
+        source: std::collections::HashMap<rustclr_core::MethodId, Vec<(u32, String, u32)>>,
+        names: std::collections::HashMap<rustclr_core::MethodId, Vec<(u16, String)>>,
+    }
+    impl Tracer {
+        /// The last sequence point at or before this offset — the one whose
+        /// span covers it. `None` where the PDB says nothing, which is shown
+        /// as an IL offset rather than as the nearest line.
+        fn where_in_source(&self, method: rustclr_core::MethodId, offset: u32) -> Option<String> {
+            let points = self.source.get(&method)?;
+            let (_, file, line) = points.iter().take_while(|(at, _, _)| *at <= offset).last()?;
+            Some(format!("{file}:{line}"))
+        }
     }
     impl Debugger for Tracer {
         fn stopped(
@@ -1130,24 +1388,47 @@ pub fn debug(path: &str, breakpoints: &[(String, u32)], step: bool) -> Result<i3
         ) -> DebugCommand {
             self.stops += 1;
             if let Some(top) = frames.first() {
+                let at = self
+                    .where_in_source(top.method, top.il_offset)
+                    .unwrap_or_else(|| format!("IL_{:04X}", top.il_offset));
                 println!(
-                    "\n─── {:?} · {} · IL_{:04X} · {} frame(s)",
+                    "\n─── {:?} · {} · {} · {} frame(s)",
                     reason,
                     top.method_name,
-                    top.il_offset,
+                    at,
                     frames.len()
                 );
                 if !top.arguments.is_empty() {
                     println!("  args    {}", render(top.arguments));
                 }
                 if !top.locals.is_empty() {
-                    println!("  locals  {}", render(top.locals));
+                    // Named where the PDB names them, by index where it does
+                    // not — rather than inventing a name for a compiler
+                    // temporary that never had one.
+                    let names = self.names.get(&top.method);
+                    let rendered: Vec<String> = top
+                        .locals
+                        .iter()
+                        .enumerate()
+                        .map(|(i, value)| {
+                            match names
+                                .and_then(|n| n.iter().find(|(slot, _)| *slot as usize == i))
+                            {
+                                Some((_, name)) => format!("{name}={value:?}"),
+                                None => format!("[{i}]={value:?}"),
+                            }
+                        })
+                        .collect();
+                    println!("  locals  {}", rendered.join(", "));
                 }
                 if !top.stack.is_empty() {
                     println!("  stack   {}", render(top.stack));
                 }
                 for frame in frames.iter().skip(1).take(8) {
-                    println!("     at {} · IL_{:04X}", frame.method_name, frame.il_offset);
+                    let at = self
+                        .where_in_source(frame.method, frame.il_offset)
+                        .unwrap_or_else(|| format!("IL_{:04X}", frame.il_offset));
+                    println!("     at {} · {}", frame.method_name, at);
                 }
             }
             // A step budget, so `--step` on a real program terminates rather
@@ -1163,7 +1444,12 @@ pub fn debug(path: &str, breakpoints: &[(String, u32)], step: bool) -> Result<i3
         }
     }
 
-    interp.attach_debugger(Box::new(Tracer { step, stops: 0 }));
+    interp.attach_debugger(Box::new(Tracer {
+        step,
+        stops: 0,
+        source: source_of,
+        names: names_of,
+    }));
     let code = interp.run_entry_point(assembly)?;
     Ok(code)
 }
@@ -1175,4 +1461,289 @@ fn render(values: &[rustclr_core::Value]) -> String {
         .map(|v| format!("{v:?}"))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// `rustnet profile` — run under the sampling profiler and report the result.
+///
+/// **Everything is interpreted unless `--jit` is given.** The profiler samples
+/// between IL instructions, and compiled code does not execute IL: with the
+/// code generator on, the time a compiled method spends is charged to whatever
+/// interpreted frame called into it, which is a plausible-looking wrong answer
+/// rather than a missing one. Interpreting instead changes the absolute numbers
+/// — a profile is a shape, not a benchmark — but keeps them attributable.
+pub fn profile(
+    path: &str,
+    args: Vec<String>,
+    top: usize,
+    period_us: u64,
+    json: bool,
+    jit: bool,
+) -> Result<i32> {
+    let mut interp = runtime(args);
+    if jit {
+        // Said plainly rather than left in the report's footnotes: a profile
+        // taken this way attributes compiled time to the wrong method.
+        eprintln!(
+            "[rustnet] --jit: methods the code generator takes do not execute IL, so their"
+        );
+        eprintln!(
+            "[rustnet] time is charged to the interpreted frame that called them."
+        );
+        interp.native_tier = Some(Box::new(rustclr_jit::JitTier::new()));
+    }
+    let id = interp.loader.load_from_file(path)?;
+    rustclr_interop::install(&mut interp);
+
+    interp.profiler = Some(rustclr_core::profile::Profiler::new(
+        &interp.loader.registry,
+        period_us.saturating_mul(1_000),
+    ));
+
+    let started = std::time::Instant::now();
+    let outcome = interp.run_entry_point(id);
+    let elapsed = started.elapsed();
+    let now = interp.host.monotonic_nanos();
+    if let Some(profiler) = interp.profiler.as_mut() {
+        profiler.finish(now);
+    }
+
+    let exit_code = match outcome {
+        Ok(code) => code,
+        Err(e) => {
+            report_failure(&interp, &e);
+            1
+        }
+    };
+
+    let report = interp
+        .profiler
+        .as_ref()
+        .expect("the profiler was installed")
+        .report(&interp.loader.registry);
+
+    if json {
+        println!("{}", profile_json(&report, &interp, elapsed));
+    } else {
+        print_profile(&report, &interp, elapsed, top);
+    }
+    Ok(exit_code)
+}
+
+/// Nanoseconds as a human reads them.
+fn duration(nanos: u64) -> String {
+    if nanos >= 1_000_000_000 {
+        format!("{:.2} s", nanos as f64 / 1e9)
+    } else if nanos >= 1_000_000 {
+        format!("{:.1} ms", nanos as f64 / 1e6)
+    } else if nanos >= 1_000 {
+        format!("{:.1} us", nanos as f64 / 1e3)
+    } else {
+        format!("{nanos} ns")
+    }
+}
+
+/// A count with thousands separators — `4,000,031` reads, `4000031` does not.
+fn grouped(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = n as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{n} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// A proportion as a short bar, so the shape is readable without arithmetic.
+fn bar(percent: f64) -> String {
+    let filled = ((percent / 100.0) * 12.0).round().clamp(0.0, 12.0) as usize;
+    let mut out = String::new();
+    for i in 0..12 {
+        out.push(if i < filled { '#' } else { '.' });
+    }
+    out
+}
+
+fn print_profile(
+    report: &rustclr_core::profile::Report,
+    interp: &Interpreter,
+    elapsed: std::time::Duration,
+    top: usize,
+) {
+    let heap = interp.heap.stats();
+
+    println!("\n─── where the time went ────────────────────────────────────────────");
+    if report.samples == 0 {
+        // Better than an empty table: the reason is always the same one.
+        println!(
+            "  no samples — the program finished inside one sampling period ({}).",
+            duration(report.period_nanos)
+        );
+        println!("  Lower it with --period-us.");
+    } else {
+        println!("  {:<44} {:>9}  {:>7}  {:>13}", "method", "self", "share", "calls");
+        for row in report.methods.iter().take(top) {
+            let percent = report.percent(row.profile.self_nanos);
+            println!(
+                "  {:<44} {:>9}  {:>6.1}%  {:>13}",
+                truncate(&row.name, 44),
+                duration(row.profile.self_nanos),
+                percent,
+                grouped(row.profile.calls),
+            );
+        }
+        if report.methods.len() > top {
+            println!("  ... {} more methods", report.methods.len() - top);
+        }
+
+        // Inclusive time answers a different question — "what is this call
+        // tree costing me" — and the two orders rarely agree.
+        let mut by_inclusive: Vec<_> = report.methods.iter().collect();
+        by_inclusive.sort_by(|a, b| b.profile.inclusive_nanos.cmp(&a.profile.inclusive_nanos));
+        println!("\n  by inclusive time (the method and everything it called)");
+        for row in by_inclusive.iter().take(top.min(8)) {
+            let percent = report.percent(row.profile.inclusive_nanos);
+            println!(
+                "  {:<44} {:>9}  {:>6.1}%  {}",
+                truncate(&row.name, 44),
+                duration(row.profile.inclusive_nanos),
+                percent,
+                bar(percent),
+            );
+        }
+    }
+
+    println!("\n─── what was allocated ─────────────────────────────────────────────");
+    let (total_count, total_bytes) = report.total_allocations();
+    if total_count == 0 {
+        println!("  nothing was allocated");
+    } else {
+        println!("  {:<44} {:>11}  {:>7}  {:>9}", "type", "bytes", "share", "objects");
+        for row in report.types.iter().take(top) {
+            let percent = if total_bytes == 0 {
+                0.0
+            } else {
+                row.profile.bytes as f64 * 100.0 / total_bytes as f64
+            };
+            println!(
+                "  {:<44} {:>11}  {:>6.1}%  {:>9}",
+                truncate(&row.name, 44),
+                bytes(row.profile.bytes),
+                percent,
+                grouped(row.profile.count),
+            );
+        }
+        if report.types.len() > top {
+            println!("  ... {} more types", report.types.len() - top);
+        }
+    }
+
+    println!("\n─── memory ─────────────────────────────────────────────────────────");
+    println!("  collector             {:>18}", interp.heap.collector_name());
+    println!("  allocated             {:>18}", bytes(total_bytes));
+    println!("  objects               {:>18}", grouped(total_count));
+    println!("  peak live             {:>18}", bytes(heap.peak_live_bytes as u64));
+    println!("  live at exit          {:>18}", bytes(interp.heap.live_bytes() as u64));
+    println!("  collections           {:>18}", grouped(report.gc.collections));
+    if report.gc.collections > 0 {
+        let share = if elapsed.as_nanos() > 0 {
+            report.gc.total_nanos as f64 * 100.0 / elapsed.as_nanos() as f64
+        } else {
+            0.0
+        };
+        println!(
+            "  time collecting       {:>18}   ({share:.1}% of the run)",
+            duration(report.gc.total_nanos)
+        );
+        println!("  longest pause         {:>18}", duration(report.gc.longest_nanos));
+        println!("  reclaimed             {:>18}", grouped(heap.total_objects_freed));
+    }
+
+    println!("\n─── run ────────────────────────────────────────────────────────────");
+    println!("  wall clock            {:>18}", duration(elapsed.as_nanos() as u64));
+    println!("  sampled               {:>18}", duration(report.wall_nanos));
+    println!(
+        "  samples               {:>18}   (period {})",
+        grouped(report.samples),
+        duration(report.period_nanos)
+    );
+    println!("  IL instructions       {:>18}", grouped(interp.stats.instructions_executed));
+}
+
+/// The same report as JSON, for an IDE or a script.
+///
+/// Hand-written like the debug adapter's, and for the same reason: the
+/// workspace has no external dependencies.
+fn profile_json(
+    report: &rustclr_core::profile::Report,
+    interp: &Interpreter,
+    elapsed: std::time::Duration,
+) -> String {
+    let mut out = String::from("{\n");
+    out.push_str(&format!("  \"wallNanos\": {},\n", elapsed.as_nanos() as u64));
+    out.push_str(&format!("  \"sampledNanos\": {},\n", report.wall_nanos));
+    out.push_str(&format!("  \"samples\": {},\n", report.samples));
+    out.push_str(&format!("  \"periodNanos\": {},\n", report.period_nanos));
+    out.push_str(&format!("  \"instructions\": {},\n", interp.stats.instructions_executed));
+    out.push_str("  \"methods\": [\n");
+    for (i, row) in report.methods.iter().enumerate() {
+        out.push_str(&format!(
+            "    {{\"name\": {}, \"selfNanos\": {}, \"inclusiveNanos\": {}, \"calls\": {}}}{}\n",
+            crate::json::Json::str(row.name.clone()).write(),
+            row.profile.self_nanos,
+            row.profile.inclusive_nanos,
+            row.profile.calls,
+            if i + 1 == report.methods.len() { "" } else { "," },
+        ));
+    }
+    out.push_str("  ],\n  \"types\": [\n");
+    for (i, row) in report.types.iter().enumerate() {
+        out.push_str(&format!(
+            "    {{\"name\": {}, \"bytes\": {}, \"count\": {}}}{}\n",
+            crate::json::Json::str(row.name.clone()).write(),
+            row.profile.bytes,
+            row.profile.count,
+            if i + 1 == report.types.len() { "" } else { "," },
+        ));
+    }
+    out.push_str("  ],\n");
+    out.push_str(&format!(
+        "  \"gc\": {{\"collections\": {}, \"totalNanos\": {}, \"longestNanos\": {}}},\n",
+        report.gc.collections, report.gc.total_nanos, report.gc.longest_nanos
+    ));
+    let heap = interp.heap.stats();
+    out.push_str(&format!(
+        "  \"heap\": {{\"peakLiveBytes\": {}, \"liveBytesAtExit\": {}, \"objectsFreed\": {}}}\n",
+        heap.peak_live_bytes,
+        interp.heap.live_bytes(),
+        heap.total_objects_freed
+    ));
+    out.push('}');
+    out
+}
+
+/// Keeps a long qualified name inside a column, cutting the *front* — the
+/// distinguishing part of `Namespace.Type::Method` is at the end.
+fn truncate(name: &str, width: usize) -> String {
+    if name.chars().count() <= width {
+        return name.to_string();
+    }
+    let kept: String = name.chars().skip(name.chars().count() - (width - 1)).collect();
+    format!("~{kept}")
 }

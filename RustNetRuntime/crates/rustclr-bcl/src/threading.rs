@@ -98,6 +98,8 @@ fn register_thread(interp: &mut Interpreter) {
 
 /// Runs the thread body synchronously; see this module's note on serialisation.
 /// The slot on a `Thread` holding the id of the OS thread it started.
+/// Unused without `std`, where `Thread.Start` runs the body synchronously.
+#[cfg(feature = "std")]
 const THREAD_ID: usize = 1;
 
 /// `Thread.Start()` — spawns.
@@ -111,7 +113,7 @@ fn start_thread(interp: &mut Interpreter, args: &[Value]) -> ExecResult<Option<V
         .unwrap_or(Value::Null);
     let parameter = if args.len() > 1 { Some(arg(interp, args, 1)?) } else { None };
 
-    let id = interp.spawn(Box::new(rustclr_core::SystemHost::new()), move |worker| {
+    let id = interp.spawn(interp.new_host(), move |worker| {
         invoke_delegate(worker, body, parameter).map(|_| ())
     });
 

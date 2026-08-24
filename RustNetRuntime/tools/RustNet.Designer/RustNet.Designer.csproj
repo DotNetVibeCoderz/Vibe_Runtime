@@ -1,0 +1,49 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Description>RustNet UI Designer: a WPF drag-and-drop editor for embedded UI that opens/edits/saves the RustNet.UI XML layout format, with the "Jack The Code Bender" AI assistant.</Description>
+    <AssemblyName>rustnet-designer</AssemblyName>
+    <!-- Semantic Kernel marks connectors and a few kernel APIs experimental;
+         we opt in deliberately rather than sprinkling pragmas. -->
+    <NoWarn>$(NoWarn);SKEXP0001;SKEXP0010;SKEXP0020;SKEXP0040;SKEXP0050;SKEXP0070;SKEXP0110</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\managed\RustNet.UI\RustNet.UI.csproj" />
+    <!-- Deploying from the Designer uses the same library the CLI does, in
+         process: Signing for the container, RndpClient for the wire. There is
+         no DLL→RNX step: RustCLR reads the assembly the SDK produced. -->
+    <ProjectReference Include="..\RustNet.Deploy\RustNet.Deploy.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- Assistant: Semantic Kernel + one connector per selectable provider.
+         Anthropic has no first-party SK connector, so Anthropic.SDK's
+         IChatClient is bridged into SK with AsChatCompletionService(). -->
+    <PackageReference Include="Microsoft.SemanticKernel" Version="1.78.0" />
+    <PackageReference Include="Microsoft.SemanticKernel.Connectors.Google" Version="1.78.0-alpha" />
+    <PackageReference Include="Microsoft.SemanticKernel.Connectors.Ollama" Version="1.78.0-alpha" />
+    <PackageReference Include="Anthropic.SDK" Version="5.9.0" />
+    <!-- Chat transcript: Markdig renders markdown to HTML, WebView2 shows it. -->
+    <PackageReference Include="Markdig" Version="0.44.0" />
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.4078.44" />
+    <!-- Code editor pane. -->
+    <PackageReference Include="AvalonEdit" Version="6.3.1.120" />
+    <!-- Formatting C# properly needs a real parser; a brace-counting
+         re-indenter mangles strings, verbatim literals and comments. -->
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Workspaces" Version="4.14.0" />
+    <!-- app.config (ConfigurationManager) comes from Microsoft.WindowsDesktop.App;
+         no package reference needed. -->
+  </ItemGroup>
+  <ItemGroup>
+    <None Update="App.config" CopyToOutputDirectory="PreserveNewest" />
+    <!-- Local credentials, gitignored. App.config pulls it in with
+         <appSettings file="…">, so it has to sit beside the exe. Absent in a
+         fresh checkout, which is fine — the placeholders fall back to the
+         environment. -->
+    <None Update="rustnet-designer.secrets.config" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="rustnet-designer.secrets.config.example" CopyToOutputDirectory="Never" />
+  </ItemGroup>
+</Project>

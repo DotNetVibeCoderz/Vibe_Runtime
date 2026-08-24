@@ -1,0 +1,104 @@
+<UserControl x:Class="RustNet.Designer.Editor.CodePane"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:ae="http://icsharpcode.net/sharpdevelop/avalonedit"
+             Background="{StaticResource Graphite}">
+    <DockPanel>
+        <!-- editor toolbar -->
+        <Border DockPanel.Dock="Top" BorderBrush="{StaticResource Rail}" BorderThickness="0,0,0,1"
+                Padding="6,4">
+            <Grid>
+                <!-- Two columns, not overlaid: the toolbar is wide enough that a
+                     right-aligned readout in the same cell collides with it. -->
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <StackPanel Grid.Column="0" Orientation="Horizontal">
+                    <Button Style="{StaticResource GhostButton}" Content="Cut" Click="OnCut"
+                            ToolTip="Cut (Ctrl+X)"/>
+                    <Button Style="{StaticResource GhostButton}" Content="Copy" Click="OnCopy"
+                            ToolTip="Copy (Ctrl+C)"/>
+                    <Button Style="{StaticResource GhostButton}" Content="Paste" Click="OnPaste"
+                            ToolTip="Paste (Ctrl+V)"/>
+                    <Border Style="{StaticResource StripDivider}"/>
+                    <Button Style="{StaticResource GhostButton}" Content="Undo" Click="OnUndo"
+                            ToolTip="Undo (Ctrl+Z)"/>
+                    <Button Style="{StaticResource GhostButton}" Content="Redo" Click="OnRedo"
+                            ToolTip="Redo (Ctrl+Y)"/>
+                    <Border Style="{StaticResource StripDivider}"/>
+                    <Button Style="{StaticResource GhostButton}" Content="Find" Click="OnFind"
+                            ToolTip="Find (Ctrl+F)"/>
+                    <Button Style="{StaticResource GhostButton}" Content="Replace" Click="OnReplace"
+                            ToolTip="Replace (Ctrl+H)"/>
+                    <Button Style="{StaticResource GhostButton}" Content="Go to line" Click="OnGoToLine"
+                            ToolTip="Go to line (Ctrl+G)"/>
+                    <Border Style="{StaticResource StripDivider}"/>
+                    <Button Style="{StaticResource GhostButton}" Content="Format" Click="OnFormat"
+                            ToolTip="Format the document (Alt+Shift+F)"/>
+                </StackPanel>
+                <TextBlock x:Name="CaretReadout" Grid.Column="1" Style="{StaticResource Readout}"
+                           FontSize="9.5" HorizontalAlignment="Right" Margin="8,0,4,0"
+                           TextTrimming="CharacterEllipsis" Text="Ln 1, Col 1"/>
+            </Grid>
+        </Border>
+
+        <!-- find and replace: AvalonEdit ships find only, so this is ours -->
+        <Border x:Name="FindBar" DockPanel.Dock="Top" Visibility="Collapsed"
+                Background="{StaticResource Slate}" BorderBrush="{StaticResource Rail}"
+                BorderThickness="0,0,0,1" Padding="6,5">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="60"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+
+                <TextBlock Grid.Row="0" Grid.Column="0" Style="{StaticResource Readout}" Text="find"/>
+                <TextBox x:Name="FindBox" Grid.Row="0" Grid.Column="1" Margin="0,0,6,0"
+                         TextChanged="OnFindTextChanged" PreviewKeyDown="OnFindBoxKeyDown"/>
+                <StackPanel Grid.Row="0" Grid.Column="2" Orientation="Horizontal">
+                    <Button Style="{StaticResource GhostButton}" Content="Prev" Click="OnFindPrevious"
+                            ToolTip="Previous match (Shift+F3)"/>
+                    <Button Style="{StaticResource GhostButton}" Content="Next" Click="OnFindNext"
+                            ToolTip="Next match (F3)"/>
+                    <ToggleButton x:Name="MatchCase" Style="{StaticResource ToggleChip}" Content="Aa"
+                                  Margin="4,0,2,0" ToolTip="Match case"
+                                  Checked="OnSearchOptionChanged" Unchecked="OnSearchOptionChanged"/>
+                    <ToggleButton x:Name="UseRegex" Style="{StaticResource ToggleChip}" Content=".*"
+                                  Margin="0,0,4,0" ToolTip="Regular expression"
+                                  Checked="OnSearchOptionChanged" Unchecked="OnSearchOptionChanged"/>
+                    <Button Style="{StaticResource GhostButton}" Content="✕" Click="OnCloseFind"
+                            ToolTip="Close (Esc)"/>
+                </StackPanel>
+
+                <TextBlock x:Name="ReplaceLabel" Grid.Row="1" Grid.Column="0" Margin="0,5,0,0"
+                           Style="{StaticResource Readout}" Text="replace"/>
+                <TextBox x:Name="ReplaceBox" Grid.Row="1" Grid.Column="1" Margin="0,5,6,0"
+                         PreviewKeyDown="OnFindBoxKeyDown"/>
+                <StackPanel x:Name="ReplaceActions" Grid.Row="1" Grid.Column="2" Orientation="Horizontal"
+                            Margin="0,5,0,0">
+                    <Button Style="{StaticResource GhostButton}" Content="Replace" Click="OnReplaceOne"/>
+                    <Button Style="{StaticResource GhostButton}" Content="All" Click="OnReplaceAll"/>
+                    <TextBlock x:Name="MatchCount" Style="{StaticResource Readout}" FontSize="9.5"
+                               Margin="6,0,4,0" VerticalAlignment="Center"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <!-- tab-specific actions -->
+        <Border DockPanel.Dock="Bottom" BorderBrush="{StaticResource Rail}" BorderThickness="0,1,0,0"
+                Padding="8,6">
+            <ContentPresenter x:Name="FooterHost"/>
+        </Border>
+
+        <ae:TextEditor x:Name="Editor" ShowLineNumbers="True" WordWrap="False"
+                       FontFamily="{StaticResource FontMono}" FontSize="12"
+                       Background="{StaticResource Sunken}" Foreground="{StaticResource Ink}"
+                       LineNumbersForeground="#FF4A5260" Padding="6,6,0,6"/>
+    </DockPanel>
+</UserControl>

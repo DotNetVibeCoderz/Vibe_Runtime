@@ -35,7 +35,7 @@ Jalankan suite test untuk memastikan hasil build-nya sehat:
 cargo test --workspace
 ```
 
-Anda mestinya melihat 141 test lulus.
+Anda mestinya melihat 416 test lulus.
 
 ---
 
@@ -76,7 +76,7 @@ dotnet bin/Release/net10.0/Conformance.dll
 rustnet run bin/Release/net10.0/Conformance.dll
 ```
 
-Keduanya mencetak `checks=345 failures=0`. Kalau suatu saat berbeda, itu bug
+Keduanya mencetak `checks=361 failures=0`. Kalau suatu saat berbeda, itu bug
 runtime — dan pemeriksaan yang berbeda itu langsung menunjuk penyebabnya.
 `tests/fixtures/ModernSyntax/` melakukan hal serupa untuk fitur C# modern dan
 mencetak `checks=35 failures=0`.
