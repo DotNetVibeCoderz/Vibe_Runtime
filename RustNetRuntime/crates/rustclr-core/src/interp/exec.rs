@@ -370,22 +370,25 @@ impl Interpreter {
             Op::Ldsfld => {
                 let token = ins.operand.as_token().ok_or_else(|| self.bad_operand(ins))?;
                 let field = self.resolve_field(token)?;
-                self.ensure_cctor(self.loader.registry.field(field).declaring_type)?;
+                let field = self.static_in_construction(field);
+                self.ensure_cctor(self.static_owner(token, field))?;
                 let v = self.loader.static_value(field).clone();
                 self.push(v);
             }
             Op::Stsfld => {
                 let token = ins.operand.as_token().ok_or_else(|| self.bad_operand(ins))?;
                 let field = self.resolve_field(token)?;
-                self.ensure_cctor(self.loader.registry.field(field).declaring_type)?;
+                let field = self.static_in_construction(field);
+                self.ensure_cctor(self.static_owner(token, field))?;
                 let v = self.pop()?;
                 self.loader.set_static(field, v);
             }
             Op::Ldsflda => {
                 let token = ins.operand.as_token().ok_or_else(|| self.bad_operand(ins))?;
                 let field = self.resolve_field(token)?;
+                let field = self.static_in_construction(field);
                 let type_id = self.loader.registry.field(field).declaring_type;
-                self.ensure_cctor(type_id)?;
+                self.ensure_cctor(self.static_owner(token, field))?;
                 self.push(Value::Ref(ByRef::Static { type_id, slot: field.0 }));
             }
 
@@ -451,6 +454,35 @@ impl Interpreter {
                 let token = ins.operand.as_token().ok_or_else(|| self.bad_operand(ins))?;
                 let v = self.pop()?;
                 let type_id = self.resolve_type(token)?;
+                // Boxing a `Nullable<T>` boxes the `T`, or gives null when
+                // there is none (III.4.1). Without this `(object)(int?)5`
+                // was a box of the two-field struct and printed its type name.
+                if self.loader.registry.ty(type_id).full_name() == "System.Nullable`1" {
+                    let (has_value, inner) = match &v {
+                        Value::Struct(s) => (
+                            s.fields.first().map(|f| f.is_truthy()).unwrap_or(false),
+                            s.fields.get(1).cloned().unwrap_or(Value::Null),
+                        ),
+                        _ => (false, Value::Null),
+                    };
+                    if !has_value {
+                        self.push(Value::Null);
+                    } else {
+                        let underlying = self.nullable_argument(token).unwrap_or_else(|| match &inner {
+                            Value::I64(_) => self.loader.primitive_type(Primitive::Int64),
+                            Value::F(_) => self.loader.primitive_type(Primitive::Double),
+                            Value::Struct(s) => s.type_id,
+                            _ => self.loader.primitive_type(Primitive::Int32),
+                        });
+                        if self.loader.registry.ty(underlying).kind.is_value_like() {
+                            let h = self.box_value(underlying, inner);
+                            self.push(Value::Obj(h));
+                        } else {
+                            self.push(inner);
+                        }
+                    }
+                    return Ok(StepOutcome::Continue);
+                }
                 // Boxing a reference type is a no-op per III.4.1.
                 if self.loader.registry.ty(type_id).kind.is_value_like() {
                     let h = self.box_value(type_id, v);
@@ -784,9 +816,176 @@ impl Interpreter {
             return Ok(resolved);
         }
         let assembly = self.frame_ref().assembly;
+        // `(ComponentStore<T>)x` inside a generic method: a program's own
+        // generic type over the frame's type parameters is the construction
+        // those parameters name now, not the placeholder loading made.
+        if token.table() == Some(TableId::TypeSpec) {
+            let sig = self.loader.assembly(assembly).type_specs.get(&token.row());
+            if let Some(sig @ TypeSig::GenericInst { .. }) = sig.filter(|s| crate::loader::mentions_generic_parameter(s)) {
+                let sig = sig.clone();
+                if let Some(t) = self.frame_type_of_sig(&sig) {
+                    if self.loader.registry.ty(t).generic_definition.is_some_and(|d| !self.loader.is_framework_type(d)) {
+                        return Ok(t);
+                    }
+                }
+            }
+        }
         self.loader
             .resolve_type_token(self.loader.assembly(assembly), token)
             .ok_or(ExecutionError::UnresolvedToken { token, context: "type".into() })
+    }
+
+    /// The element type and rank when `token` names a member of `T[,]`.
+    fn md_array_ref(&self, token: Token) -> Option<(TypeId, u32)> {
+        if token.table() != Some(TableId::MemberRef) {
+            return None;
+        }
+        let assembly = self.frame_ref().assembly;
+        self.loader.assembly(assembly).md_array_refs.get(&token.row()).copied()
+    }
+
+    /// `newobj T[,]::.ctor(int, int)`: lengths, or (lower bound, length)
+    /// pairs when there are twice as many arguments as dimensions. Lower bounds
+    /// other than zero are refused rather than ignored.
+    fn md_array_newobj(&mut self, token: Token) -> ExecResult<Option<StepOutcome>> {
+        let Some((element, rank)) = self.md_array_ref(token) else { return Ok(None) };
+        let method = self.resolve_method(token)?;
+        let count = self.loader.registry.method(method).signature.params.len();
+        let mut args = Vec::with_capacity(count);
+        for _ in 0..count {
+            args.push(self.pop()?.as_i64().unwrap_or(0));
+        }
+        args.reverse();
+        let lengths: Vec<i64> = if count == 2 * rank as usize {
+            if args.iter().step_by(2).any(|lower| *lower != 0) {
+                return Err(ExecutionError::Unsupported("arrays with non-zero lower bounds".into()));
+            }
+            args.iter().skip(1).step_by(2).copied().collect()
+        } else {
+            args
+        };
+        if lengths.iter().any(|n| *n < 0) {
+            return Err(ExecutionError::exception(ClrExceptionKind::Overflow, "Arithmetic operation resulted in an overflow."));
+        }
+        let total: usize = lengths.iter().map(|n| *n as usize).product();
+        let array = self.alloc_array(element, total);
+        let dims: Vec<u32> = lengths.iter().map(|n| *n as u32).collect();
+        self.heap.with_mut::<ClrArray, _>(array, |a| a.dimensions = dims);
+        self.push(Value::Obj(array));
+        Ok(Some(StepOutcome::Continue))
+    }
+
+    /// `T[,]::Get`, `Set` and `Address`: row-major indexing.
+    fn md_array_call(&mut self, token: Token) -> ExecResult<Option<StepOutcome>> {
+        let Some((_, rank)) = self.md_array_ref(token) else { return Ok(None) };
+        let method = self.resolve_method(token)?;
+        let name = self.loader.registry.method(method).name.clone();
+        let rank = rank as usize;
+        let value = if name == "Set" { Some(self.pop()?) } else { None };
+        let mut indices = Vec::with_capacity(rank);
+        for _ in 0..rank {
+            indices.push(self.pop()?.as_i64().unwrap_or(0));
+        }
+        indices.reverse();
+        let array = self.pop()?.as_handle().filter(|h| !h.is_null()).ok_or_else(ExecutionError::null_reference)?;
+        let dims = self.heap.with::<ClrArray, _>(array, |a| a.dimensions.clone()).unwrap_or_default();
+        let mut flat: usize = 0;
+        for (n, index) in indices.iter().enumerate() {
+            let length = dims.get(n).copied().unwrap_or(0) as i64;
+            if *index < 0 || *index >= length {
+                return Err(ExecutionError::exception(ClrExceptionKind::IndexOutOfRange, "Index was outside the bounds of the array."));
+            }
+            flat = flat * length as usize + *index as usize;
+        }
+        match name.as_str() {
+            "Get" => {
+                let v = self.heap.with::<ClrArray, _>(array, |a| a.storage.get(flat)).flatten().unwrap_or(Value::Null);
+                self.push(v);
+            }
+            "Set" => {
+                let v = value.unwrap_or(Value::Null);
+                self.heap.with_mut::<ClrArray, _>(array, |a| {
+                    a.storage.set(flat, &v);
+                });
+            }
+            "Address" => self.push(Value::Ref(ByRef::ArrayElement { array, index: flat as u32 })),
+            _ => return Ok(None),
+        }
+        Ok(Some(StepOutcome::Continue))
+    }
+
+    /// The type whose class constructor guards a static field access: the
+    /// construction the token names (`Cache<int>::Count`), or the one the
+    /// running frame belongs to, or the declaring type.
+    fn static_owner(&self, token: Token, field: FieldId) -> TypeId {
+        if let Some(owner) = self.constructed_owner(token) {
+            return owner;
+        }
+        let declaring = self.loader.registry.field(field).declaring_type;
+        let ty = self.loader.registry.ty(declaring);
+        if ty.generic_param_count > 0 && ty.generic_args.is_empty() {
+            if let Some(c) = self.frames.last().and_then(|f| f.construction) {
+                return c;
+            }
+        }
+        declaring
+    }
+
+    /// A static field of an open generic definition, as the field of the
+    /// construction the current frame runs for.
+    ///
+    /// Inside `Cache<T>`, `Count` is named through `Cache<!0>`, which resolves
+    /// to the definition's field. Each construction has its own copy, so the
+    /// access is moved to the one belonging to `Cache<string>` -- known from
+    /// the frame's construction, or from the receiver of an instance method.
+    fn static_in_construction(&self, field: FieldId) -> FieldId {
+        let declaring = self.loader.registry.field(field).declaring_type;
+        let ty = self.loader.registry.ty(declaring);
+        if ty.generic_param_count == 0 || !ty.generic_args.is_empty() {
+            return field;
+        }
+        let Some(frame) = self.frames.last() else { return field };
+        let construction = frame.construction.or_else(|| {
+            let info = self.loader.registry.method(frame.method);
+            if !info.signature.has_this {
+                return None;
+            }
+            let h = frame.args.first()?.as_handle().filter(|h| !h.is_null())?;
+            self.type_of(h)
+        });
+        let Some(construction) = construction else { return field };
+        // Walk up from the receiver's type to the construction of this definition.
+        let mut candidate = Some(construction);
+        while let Some(c) = candidate {
+            let cty = self.loader.registry.ty(c);
+            if cty.generic_definition == Some(declaring) {
+                // By name: the reference may already be a clone, made for the
+                // `Cache<!0>` the IL names, rather than the definition's field.
+                let name = &self.loader.registry.field(field).name;
+                return cty
+                    .static_fields
+                    .iter()
+                    .copied()
+                    .find(|f| self.loader.registry.field(*f).name == *name)
+                    .unwrap_or(field);
+            }
+            candidate = cty.base;
+        }
+        field
+    }
+
+    /// The `T` of a `Nullable<T>` named by a `TypeSpec`. Framework generics
+    /// are erased, so the argument is read from the signature itself.
+    fn nullable_argument(&self, token: Token) -> Option<TypeId> {
+        if token.table() != Some(TableId::TypeSpec) {
+            return None;
+        }
+        let assembly = self.frame_ref().assembly;
+        let loaded = self.loader.assembly(assembly);
+        match loaded.type_specs.get(&token.row())? {
+            TypeSig::GenericInst { args, .. } => self.loader.resolve_type_sig(loaded, args.first()?),
+            _ => None,
+        }
     }
 
     /// Type arguments the call site's `TypeSpec` names, for a framework generic.
@@ -796,6 +995,55 @@ impl Interpreter {
             .member_ref_type_args(assembly, token)
             .map(|a| a.to_vec())
             .unwrap_or_default()
+    }
+
+    /// The construction a member reference names in terms of the executing
+    /// frame's own type parameters: `new ComponentStore<T>()` inside
+    /// `World.Store<T>()`. Loading bound such a reference to a placeholder
+    /// construction (`ComponentStore<object>`), whose `T[]` then held
+    /// references — so a struct stored into it read back as null. The real
+    /// arguments exist only now, in the frame.
+    fn frame_construction(&mut self, token: Token) -> Option<TypeId> {
+        if token.table() != Some(TableId::MemberRef) {
+            return None;
+        }
+        let assembly = self.frame_ref().assembly;
+        let loaded = self.loader.assembly(assembly);
+        let class = *loaded.member_ref_open_class.get(&token.row())?;
+        let sig = loaded.type_specs.get(&class.row())?.clone();
+        let constructed = self.frame_type_of_sig(&sig)?;
+        // Framework generics are erased by design; only a program's own
+        // generic types get a construction per argument list.
+        let open = self.loader.registry.ty(constructed).generic_definition?;
+        (!self.loader.is_framework_type(open)).then_some(constructed)
+    }
+
+    /// A signature resolved against the executing frame, `!n` and `!!n` included.
+    pub(super) fn frame_type_of_sig(&mut self, sig: &TypeSig) -> Option<TypeId> {
+        match sig.unwrap_modifiers() {
+            TypeSig::MVar(index) => {
+                let method = self.frame_ref().method;
+                self.loader.registry.method(method).generic_args.get(*index as usize).copied()
+            }
+            TypeSig::Var(index) => self.frame_class_argument(*index),
+            TypeSig::GenericInst { definition, args, .. } => {
+                let assembly = self.frame_ref().assembly;
+                let open = self.loader.resolve_type_token(self.loader.assembly(assembly), *definition)?;
+                let open = self.loader.registry.ty(open).generic_definition.unwrap_or(open);
+                if self.loader.is_framework_type(open) {
+                    return Some(open);
+                }
+                let mut resolved = Vec::with_capacity(args.len());
+                for a in args {
+                    resolved.push(self.frame_type_of_sig(a)?);
+                }
+                Some(self.loader.construct_generic(open, &resolved))
+            }
+            other => {
+                let assembly = self.frame_ref().assembly;
+                self.loader.resolve_type_sig(self.loader.assembly(assembly), other)
+            }
+        }
     }
 
     /// The closed construction a member reference names, if it names one.
@@ -827,7 +1075,7 @@ impl Interpreter {
     /// `None` when neither source has an answer — a `!N` in a static method on
     /// a generic type, where there is no receiver to ask, and a `!!N` reached
     /// without a `MethodSpec`. Both still refuse rather than guessing.
-    fn frame_generic_argument(&self, token: Token) -> Option<TypeId> {
+    fn frame_generic_argument(&mut self, token: Token) -> Option<TypeId> {
         if token.table() != Some(TableId::TypeSpec) {
             return None;
         }
@@ -844,41 +1092,84 @@ impl Interpreter {
                     .get(*index as usize)
                     .copied()
             }
-            TypeSig::Var(index) => {
-                // The receiver is argument 0 of an instance method.
-                let info = self.loader.registry.method(self.frame_ref().method);
-                if !info.signature.has_this {
-                    // A static method has no receiver, so the answer comes from
-                    // the construction the call site named. Still `None` when
-                    // the call site named the definition, which is the case
-                    // that has to keep refusing.
-                    let construction = self.frame_ref().construction?;
-                    return self
-                        .loader
-                        .registry
-                        .ty(construction)
-                        .generic_args
-                        .get(*index as usize)
-                        .copied();
-                }
-                let handle = self.frame_ref().args.first()?.as_handle()?;
-                if handle.is_null() {
-                    return None;
-                }
-                let receiver = self.type_of(handle)?;
-                self.loader
-                    .registry
-                    .ty(receiver)
-                    .generic_args
-                    .get(*index as usize)
-                    .copied()
-            }
+            TypeSig::Var(index) => self.frame_class_argument(*index),
             _ => None,
         }
     }
 
+    /// The `!index` class type argument in the executing frame: from the
+    /// receiver's construction, or for a static method from the construction
+    /// the call site named.
+    fn frame_class_argument(&mut self, index: u32) -> Option<TypeId> {
+        // The receiver is argument 0 of an instance method.
+        let info = self.loader.registry.method(self.frame_ref().method);
+        let declaring = info.declaring_type;
+        if !info.signature.has_this {
+            // A static method has no receiver, so the answer comes from
+            // the construction the call site named. Still `None` when
+            // the call site named the definition, which is the case
+            // that has to keep refusing.
+            let construction = self.frame_ref().construction?;
+            return self
+                .loader
+                .registry
+                .ty(construction)
+                .generic_args
+                .get(index as usize)
+                .copied();
+        }
+        // An instance method of a struct — every async state machine's
+        // `MoveNext` — receives `this` as a managed pointer, so the
+        // construction is read from the struct it points at.
+        let receiver = match self.frame_ref().args.first()?.clone() {
+            Value::Obj(h) if !h.is_null() => self.type_of(h)?,
+            Value::Struct(s) => s.type_id,
+            Value::Ref(r) => match self.load_indirect(r).ok()? {
+                Value::Struct(s) => s.type_id,
+                Value::Obj(h) if !h.is_null() => self.type_of(h)?,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        // The receiver may be a subclass of the construction: `C :
+        // B<string>` calling `B<T>.Init`. The arguments belong to the
+        // construction of the method's own declaring type, found by
+        // walking up from the receiver.
+        let mut current = Some(receiver);
+        while let Some(t) = current {
+            let ty = self.loader.registry.ty(t);
+            if t == declaring || ty.generic_definition == Some(declaring) {
+                return ty.generic_args.get(index as usize).copied();
+            }
+            current = ty.base;
+        }
+        self.loader
+            .registry
+            .ty(receiver)
+            .generic_args
+            .get(index as usize)
+            .copied()
+    }
+
     pub(super) fn resolve_method(&mut self, token: Token) -> ExecResult<MethodId> {
         let assembly = self.frame_ref().assembly;
+        // A generic call whose arguments are the caller's own type parameters
+        // is instantiated with what those parameters are in this frame;
+        // loading could only guess `object`.
+        if token.table() == Some(TableId::MethodSpec) {
+            if let Some((open, arguments)) = self.loader.assembly(assembly).method_spec_open.get(&token.row()).cloned() {
+                let mut resolved = Vec::with_capacity(arguments.len());
+                for a in &arguments {
+                    match self.frame_type_of_sig(a) {
+                        Some(t) => resolved.push(t),
+                        None => break,
+                    }
+                }
+                if resolved.len() == arguments.len() {
+                    return Ok(self.instantiate_like(open, &resolved));
+                }
+            }
+        }
         self.loader
             .resolve_method_token(self.loader.assembly(assembly), token)
             .ok_or(ExecutionError::UnresolvedToken { token, context: "method".into() })
@@ -970,15 +1261,23 @@ impl Interpreter {
     ) -> ExecResult<StepOutcome> {
         // Read before entering: these ask the *calling* frame which assembly
         // the token belongs to.
+        if let Some(outcome) = self.md_array_call(token)? {
+            return Ok(outcome);
+        }
         let construction = self.constructed_owner(token);
         let call_site_args = self.call_site_type_arguments(token);
 
         let declared = self.resolve_method(token)?;
+        // `Cache<string>.N()` resolves to the definition's method; the
+        // construction the call site named is the type to initialise.
+        if let Some(construction) = construction {
+            self.ensure_cctor(construction)?;
+        }
         let info = self.loader.registry.method(declared);
         let arg_count = info.arg_count();
         let has_this = info.signature.has_this;
 
-        let mut args = Vec::with_capacity(arg_count);
+        let mut args = self.frame_vec();
         for _ in 0..arg_count {
             args.push(self.pop()?);
         }
@@ -1115,6 +1414,50 @@ impl Interpreter {
         receiver: Handle,
         declared: MethodId,
     ) -> ExecResult<MethodId> {
+        let info = self.loader.registry.method(declared);
+        // `callvirt` on a method that is not virtual is a null check and a
+        // direct call (ECMA-335 III.4.2) -- C# emits it for every instance
+        // call. Searching the receiver's type by name would find a `new`
+        // method that hides this one, and for a generic method it would find
+        // the open definition and lose the instantiation `!!0` reads.
+        if matches!(info.kind, MethodKind::Il(_)) && !info.is_virtual() {
+            return Ok(declared);
+        }
+        let generic_args = info.generic_args.clone();
+        let target = self.resolve_virtual_definition(receiver, declared)?;
+        // A virtual generic method: the override found by dispatch is the open
+        // definition. Give it the call site's type arguments, or `typeof(T)`
+        // inside the override has nothing to read.
+        Ok(self.instantiate_like(target, &generic_args))
+    }
+
+    /// The override of `found` that the receiver's type actually runs.
+    ///
+    /// Interface dispatch matches by name and shape, and can match a base
+    /// class's virtual method before a derived override: the base sits in the
+    /// interface's assembly, so their tokens compare equal, where the override
+    /// in a program names the same parameter type with its own tokens. The
+    /// vtable was built with that comparison done properly, so a virtual match
+    /// is taken through its slot. Rustzor's renderer calls
+    /// `IComponent.SetParametersAsync(ParameterView)` this way, and a page's
+    /// override of it never ran.
+    fn most_derived(&self, actual_type: TypeId, found: MethodId) -> MethodId {
+        let info = self.loader.registry.method(found);
+        if !info.is_virtual() {
+            return found;
+        }
+        let Some(slot) = info.vtable_slot else { return found };
+        match self.loader.registry.ty(actual_type).vtable.get(slot as usize) {
+            Some(&m) if self.loader.registry.method(m).name == info.name => m,
+            _ => found,
+        }
+    }
+
+    fn resolve_virtual_definition(
+        &mut self,
+        receiver: Handle,
+        declared: MethodId,
+    ) -> ExecResult<MethodId> {
         let actual_type = match self.type_of(receiver) {
             Some(t) => t,
             None => return Ok(declared),
@@ -1131,18 +1474,47 @@ impl Interpreter {
             // has to be looked up through `MethodImpl` before matching by
             // shape — otherwise it is invisible.
             if let Some(m) = self.loader.explicit_implementation(actual_type, declared) {
-                return Ok(m);
+                return Ok(self.most_derived(actual_type, m));
             }
             if let Some(m) = self.loader.find_method_on_type(actual_type, &name, &sig) {
-                return Ok(m);
+                return Ok(self.most_derived(actual_type, m));
+            }
+            // The interface may be declared in another assembly than the
+            // implementation: `IEmbedder.EmbedAsync(IReadOnlyList<string>)`
+            // names its parameter with that assembly's tokens, so the
+            // structural comparison above cannot see the match.
+            let declared_in = info.assembly;
+            if let Some(from) = self.loader.assembly_opt(declared_in) {
+                if let Some(m) = self.loader.find_method_on_type_from(actual_type, &name, &sig, from) {
+                    return Ok(self.most_derived(actual_type, m));
+                }
             }
             // A natively implemented receiver has no managed method to find —
             // `List<T>` carries no IL at all. Bind to its native
             // implementation instead, so `IEnumerable<T>::GetEnumerator` on a
             // list reaches the list's own enumerator rather than the
             // interface's unimplemented stub.
-            if let Some(m) = self.native_override(actual_type, &name, &sig) {
-                return Ok(m);
+            //
+            // An explicit implementation comes first, under the name C# gives
+            // one — `IDictionary.GetEnumerator` on a dictionary yields
+            // `DictionaryEntry`, where its public `GetEnumerator` yields
+            // `KeyValuePair`.
+            //
+            // The receiver's bases are searched too: a program's own `class
+            // Props : Dictionary<string, object>` dispatches to the dictionary's
+            // native implementation.
+            let explicit = format!("{}.{name}", self.loader.registry.ty(declaring).full_name());
+            let chain: Vec<TypeId> = self.loader.registry.base_chain(actual_type).collect();
+            for owner in chain {
+                if self.loader.registry.ty(owner).full_name() == "System.Object" {
+                    break;
+                }
+                if let Some(m) = self.native_override(owner, &explicit, &sig) {
+                    return Ok(m);
+                }
+                if let Some(m) = self.native_override(owner, &name, &sig) {
+                    return Ok(m);
+                }
             }
             return Ok(declared);
         }
@@ -1185,20 +1557,39 @@ impl Interpreter {
         }
     }
 
+    /// `method` instantiated with `generic_args`, made once and remembered.
+    fn instantiate_like(&mut self, method: MethodId, generic_args: &[TypeId]) -> MethodId {
+        if generic_args.is_empty() || !self.loader.registry.method(method).generic_args.is_empty() {
+            return method;
+        }
+        let key = (method, generic_args.to_vec());
+        if let Some(&known) = self.virtual_instantiations.get(&key) {
+            return known;
+        }
+        let mut clone = self.loader.registry.method(method).clone();
+        clone.generic_args = generic_args.to_vec();
+        let id = self.loader.registry.add_method(clone);
+        self.virtual_instantiations.insert(key, id);
+        id
+    }
+
     /// Whether `ctor` can be skipped entirely, remembered after the first ask.
     ///
     /// The answer cannot change: it is a property of the IL, which is fixed
     /// once loaded.
     fn constructor_is_a_formality(&mut self, ctor: MethodId) -> bool {
-        if let Some(&known) = self.trivial_ctors.get(&ctor) {
+        if let Some(&known) = self.trivial_ctors.get(&(ctor.index() as u32)) {
             return known;
         }
         let answer = self.loader.constructor_does_nothing(ctor);
-        self.trivial_ctors.insert(ctor, answer);
+        self.trivial_ctors.insert(ctor.index() as u32, answer);
         answer
     }
 
     fn do_newobj(&mut self, token: Token) -> ExecResult<StepOutcome> {
+        if let Some(outcome) = self.md_array_newobj(token)? {
+            return Ok(outcome);
+        }
         // `new Span<int>(ptr, 4)` is a `newobj`, and the width of an element
         // is only in the `int`. Staged the same way a `call` stages it.
         let call_site_args = self.call_site_type_arguments(token);
@@ -1211,16 +1602,34 @@ impl Interpreter {
         // a type whose `T` is unknowable. The member reference remembers which
         // construction was named; prefer it.
         let type_id = self
-            .constructed_owner(token)
+            .frame_construction(token)
+            .or_else(|| self.constructed_owner(token))
             .unwrap_or_else(|| self.loader.registry.method(ctor).declaring_type);
+
+        let kind = self.loader.registry.ty(type_id).kind;
+
+        // For a class, everything that can run managed code or collect happens
+        // here, while the constructor's arguments are still on the evaluation
+        // stack. Once popped they live in a Rust `Vec` that no root reaches:
+        // collecting after the pop reclaimed a string built for the
+        // constructor (`new Tag("t" + i)`) before the constructor stored it.
+        let is_class = kind != TypeKind::Delegate && !kind.is_value_like();
+        if is_class {
+            self.ensure_cctor(type_id)?;
+            // A generic construction's declaring definition, which the
+            // trivial-constructor shortcut below would otherwise run late.
+            let declaring = self.loader.registry.method(ctor).declaring_type;
+            if declaring != type_id {
+                self.ensure_cctor(declaring)?;
+            }
+            self.maybe_collect();
+        }
 
         let mut args = Vec::with_capacity(param_count + 1);
         for _ in 0..param_count {
             args.push(self.pop()?);
         }
         args.reverse();
-
-        let kind = self.loader.registry.ty(type_id).kind;
 
         // Delegates are constructed by the runtime from (target, method).
         if kind == TypeKind::Delegate {
@@ -1251,11 +1660,19 @@ impl Interpreter {
             // Without this, a `record struct` or any struct with a real
             // constructor would silently yield its zero value.
             let zero = self.zero_of(type_id);
-            let object_type = self.loader.core().object;
-            let mut cell = ClrObject::new(object_type, 1);
-            cell.fields[0] = zero;
-            self.stats.allocations += 1;
-            let cell = self.heap.alloc(cell);
+            let cell = match self.struct_cells.pop() {
+                Some(cell) => {
+                    self.heap.with_mut::<ClrObject, _>(cell, |o| o.fields[0] = zero);
+                    cell
+                }
+                None => {
+                    let object_type = self.loader.core().object;
+                    let mut cell = ClrObject::new(object_type, 1);
+                    cell.fields[0] = zero;
+                    self.stats.allocations += 1;
+                    self.heap.alloc(cell)
+                }
+            };
 
             let mut call_args = Vec::with_capacity(param_count + 1);
             call_args.push(Value::Ref(ByRef::Field { object: cell, slot: 0 }));
@@ -1286,13 +1703,8 @@ impl Interpreter {
             }
         }
 
-        self.ensure_cctor(type_id)?;
-
-        // Collect before allocating. Between `alloc_object` and the frame that
-        // carries the instance there is no root pointing at it, so collecting
-        // there reclaims the object under construction — which then surfaces as
-        // a stale handle on the first field access.
-        self.maybe_collect();
+        // No collection between here and the constructor's frame: the new
+        // object and its arguments are rooted only once that frame exists.
         let handle = self.alloc_object(type_id);
 
         // A constructor that provably does nothing is not called.
@@ -1308,8 +1720,6 @@ impl Interpreter {
         // the constructed type, and this covers the declaring one, which differ
         // for a generic construction.
         if self.constructor_is_a_formality(ctor) {
-            let declaring = self.loader.registry.method(ctor).declaring_type;
-            self.ensure_cctor(declaring)?;
             self.push(Value::Obj(handle));
             return Ok(StepOutcome::Continue);
         }
@@ -1324,6 +1734,13 @@ impl Interpreter {
                 // The constructor returns void; the new object must end up on
                 // the caller's stack. Record it so `do_return` can push it.
                 self.frames.last_mut().expect("ctor frame").pending_newobj = Some(handle);
+                Ok(StepOutcome::Continue)
+            }
+            // A string is immutable and sized by its constructor, so
+            // `new string('*', 4)` is the native constructor's *result*, not
+            // the empty object `newobj` allocated for it.
+            Entered::Native(Some(v)) if kind == TypeKind::String => {
+                self.push(v);
                 Ok(StepOutcome::Continue)
             }
             Entered::Native(_) => {

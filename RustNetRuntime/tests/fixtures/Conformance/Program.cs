@@ -65,6 +65,71 @@ sealed class Marked
 }
 
 /// A type that genuinely overrides ToString, so dispatch to it can be checked.
+readonly record struct Point2(double X, double Y);
+
+sealed class TypedStore<T>
+{
+    private T[] _items = new T[2];
+    public int Count { get; private set; }
+    public void Add(T item)
+    {
+        if (Count == _items.Length) Array.Resize(ref _items, Count * 2);
+        _items[Count++] = item;
+    }
+    public T At(int i) => _items[i];
+}
+
+sealed class TypedRegistry
+{
+    private readonly Dictionary<Type, object> _stores = new();
+    public int Count => _stores.Count;
+    private TypedStore<T> Store<T>()
+    {
+        if (_stores.TryGetValue(typeof(T), out var s)) return (TypedStore<T>)s;
+        var created = new TypedStore<T>();
+        _stores[typeof(T)] = created;
+        return created;
+    }
+    public void Put<T>(T item) => Store<T>().Add(item);
+    public T Get<T>(int i) => Store<T>().At(i);
+}
+
+sealed class AsyncBox<T> where T : new()
+{
+    public async Task<string> DescribeAsync()
+    {
+        await Task.CompletedTask;
+        return typeof(T).Name + ":" + new T();
+    }
+}
+
+sealed class CodedException : Exception
+{
+    public CodedException(int code, string message) : base(message) => Code = code;
+    public int Code { get; }
+}
+
+sealed class NamedOperationException : InvalidOperationException
+{
+    public NamedOperationException(string operation, string message) : base(operation + ": " + message) => Operation = operation;
+    public string Operation { get; }
+}
+
+sealed class PropertyBag : Dictionary<string, object?> { }
+
+enum Shade { Light, Dark }
+
+/// <summary>What a serializer reads off a type to know what to build.</summary>
+sealed class Shapes
+{
+    public List<Tag> Tags { get; set; } = new();
+    public int[] Counts { get; set; } = new int[0];
+    public Dictionary<string, double> Weights { get; set; } = new();
+    public int? Maybe { get; set; }
+    public Shade Shade { get; set; }
+    public string this[int index] => index.ToString();
+}
+
 sealed class Tag
 {
     private readonly string text;
@@ -121,13 +186,29 @@ static class Tally<T>
     public static T Empty() { return default(T); }
 }
 
+/// Instance generic methods, which C# calls with `callvirt`. The call site
+/// names the instantiation; dispatch must not trade it for the open
+/// definition, or `typeof(T)` inside has nothing to read.
+class Registrar
+{
+    public string NameOf<T>() { return typeof(T).Name; }
+    public virtual string VirtualNameOf<T>() { return "base:" + typeof(T).Name; }
+    public string Hidden() { return "base"; }
+}
+
+sealed class DerivedRegistrar : Registrar
+{
+    public override string VirtualNameOf<T>() { return "derived:" + typeof(T).Name; }
+    public new string Hidden() { return "derived"; }
+}
+
 sealed class Node
 {
     public int Value;
     public Node Next;
 }
 
-static class Program
+static partial class Program
 {
     static int checks = 0;
     static int failures = 0;
@@ -1263,6 +1344,247 @@ static class Program
         return walked == live ? walked : -1;
     }
 
+    // What a business application asks of the base class library: format
+    // strings, dates as ticks, string overloads, enums by name, events,
+    // statics of generic types, Nullable boxing, multi-dimensional arrays.
+    // Found by diffing Rustzor's BclProbe on both runtimes.
+    enum Stage { Draft, Active, Closed }
+
+    sealed class Publisher
+    {
+        public event EventHandler<string>? Said;
+        public void Say(string s) => Said?.Invoke(this, s);
+    }
+
+    static class PerType<T> { public static int Length = typeof(T).Name.Length; }
+
+    readonly struct Handle { readonly object? _owner; public Handle(object o) { _owner = o; } public bool IsSet => _owner is not null; }
+    [AttributeUsage(AttributeTargets.Property)] sealed class TagPropAttribute : Attribute { public bool Flag { get; set; } }
+    class PropBag { [TagProp(Flag = true)] public int Shown { get; set; } [TagProp] private int Hidden { get; set; } public int Plain { get; set; } }
+    abstract class Root { private bool _fresh = true; protected int Count; protected Root() { _fresh = false; Count = 1; } public bool Fresh => _fresh; public int Counted => Count; }
+    abstract class Middle<T> : Root { public T? Value { get; set; } }
+    sealed class Closed : Middle<string> { }
+    sealed class Open<T> : Middle<T> { }
+    sealed class Injected { public readonly string Name; public readonly int Size; public Injected(string name, int size) { Name = name; Size = size; } }
+    abstract class Lifecycle { public string Run() => Init() + "," + Render(); protected virtual string Init() => "base-init"; protected virtual string Render() => "base-render"; }
+    abstract class TypedLifecycle<T> : Lifecycle { protected override string Init() => "init:" + typeof(T).Name; }
+    sealed class TextLifecycle : TypedLifecycle<string> { protected override string Render() => "render"; }
+    class Settings<T> { public T? Current { get; set; } private int Secret { get; set; } }
+    sealed class TextSettings : Settings<string> { }
+    class WithOptional { public double? Delta { get; set; } public int? Missing { get; set; } }
+    class HoldsHandle { private Handle _handle; public bool Ready => _handle.IsSet; public void Attach(object o) => _handle = new Handle(o); }
+
+    static string JoinSequence(IEnumerable<string> items)
+    {
+        var sb = new System.Text.StringBuilder();
+        foreach (var s in items)
+        {
+            if (sb.Length > 0) sb.Append(',');
+            sb.Append(s);
+        }
+        return sb.ToString();
+    }
+
+    static void BusinessLibrary()
+    {
+        var inv = System.Globalization.CultureInfo.InvariantCulture;
+        CheckStr("N2", 1234567.891.ToString("N2", inv), "1,234,567.89");
+        CheckStr("F2 rounds half to even", 0.125.ToString("F2", inv), "0.12");
+        CheckStr("custom rounds half away", 0.125.ToString("0.00", inv), "0.13");
+        CheckStr("D5", 42.ToString("D5"), "00042");
+        CheckStr("X", 255.ToString("X"), "FF");
+        CheckStr("P1", 0.256.ToString("P1", inv), "25.6 %");
+        CheckStr("#,##0", 1234567.5.ToString("#,##0", inv), "1,234,568");
+        CheckStr("interpolation specifier", $"{3.14159:F2}|{7,3}", "3.14|  7");
+        CheckStr("string.Format specifier", string.Format(inv, "{0:N1}", 12.345), "12.3");
+        CheckEq("int.TryParse", int.TryParse("77", out var parsed) ? parsed : -1, 77);
+        CheckStr("foreach over array as IEnumerable<T>", JoinSequence(new[] { "x", "y", "z" }), "x,y,z");
+        var untyped = new List<object>();
+        foreach (var o in (System.Collections.IEnumerable)new[] { 1, 2 }) untyped.Add(o);
+        CheckEq("foreach over array as IEnumerable", untyped.Count, 2);
+        object boxedList = new List<string> { "a" }, boxedMap = new Dictionary<string, int> { ["k"] = 1 }, boxedArray = new[] { "x" };
+        CheckStr("collections satisfy their interfaces",
+            $"{boxedList is System.Collections.IEnumerable}{boxedList is IList<string>}{boxedList is IReadOnlyList<string>}{boxedList is System.Collections.IDictionary}"
+            + $"{boxedMap is IDictionary<string, int>}{boxedMap is IReadOnlyDictionary<string, int>}{boxedMap is System.Collections.IDictionary}"
+            + $"{boxedArray is IEnumerable<string>}{boxedArray is System.Collections.IList}{boxedArray is IReadOnlyList<string>}",
+            "TrueTrueTrueFalseTrueTrueTrueTrueTrueTrue");
+        var entries = new List<string>();
+        if (boxedMap is System.Collections.IDictionary map)
+            foreach (System.Collections.DictionaryEntry e in map) entries.Add($"{e.Key}={e.Value}");
+        CheckStr("IDictionary yields DictionaryEntry", string.Join(",", entries), "k=1");
+        var kinds = new List<string>();
+        foreach (var o in (System.Collections.IEnumerable)new List<double> { 1.5 }) kinds.Add(o is double ? "double" : "?");
+        foreach (var o in (System.Collections.IEnumerable)new[] { true }) kinds.Add(o is bool ? "bool" : "?");
+        var shape = new { Price = 2.5, Count = 3, Ok = true };
+        foreach (var p in shape.GetType().GetProperties())
+        {
+            var v = p.GetValue(shape);
+            kinds.Add(v switch { bool => "bool", int => "int", double => "double", _ => "?" });
+        }
+        CheckStr("values typed as object are boxed", string.Join(",", kinds), "double,bool,double,int,bool");
+        var bag = new PropertyBag { ["a"] = 1 };
+        bag["b"] = 2;
+        var bagKeys = new List<string>();
+        if ((object)bag is System.Collections.IDictionary untypedBag)
+            foreach (System.Collections.DictionaryEntry e in untypedBag) bagKeys.Add($"{e.Key}{e.Value}");
+        foreach (var kv in (IEnumerable<KeyValuePair<string, object?>>)bag) bagKeys.Add(kv.Key);
+        CheckStr("a dictionary subclass is a dictionary", string.Join(",", bagKeys), "a1,b2,a,b");
+        var registry = new TypedRegistry();
+        registry.Put(new Point2(1, 2));
+        registry.Put(7);
+        registry.Put(new Point2(3, 4));
+        CheckStr("generic construction over a method type parameter",
+            $"{registry.Get<Point2>(0).X},{registry.Get<Point2>(1).Y},{registry.Get<int>(0)},{registry.Count}", "1,4,7,2");
+        var pt = new Point2(5, 6);
+        var built = new System.Text.StringBuilder("ab");
+        var snapshot = built.ToString();
+        for (var n = 0; n < 2000; n++) built.Append(n % 10);
+        built.Insert(0, "<").Append('>');
+        CheckStr("StringBuilder grows in place", $"{built.Length}|{snapshot}|{built.ToString().Substring(0, 6)}|{built.ToString()[^1]}", "2004|ab|<ab012|>");
+        var sbi = new System.Text.StringBuilder();
+        var who = "Rustzor";
+        sbi.Append($"[{who}:{42,4}]").Append($"{1.5:F2}");
+        var cloned = (int[])new[] { 1, 2, 3 }.Clone();
+        cloned[0] = 9;
+        CheckStr("interpolation and framework gaps",
+            $"{sbi}|{string.Create(System.Globalization.CultureInfo.InvariantCulture, $"{2.5:0.0}x")}|{string.Join(",", cloned)}|{Convert.ToByte("ff", 16)}|{1.5.CompareTo(2.0)}|{double.NaN.CompareTo(0.0)}",
+            "[Rustzor:  42]1.50|2.5x|9,2,3|255|-1|-1");
+        CheckStr("WebUtility", $"{System.Net.WebUtility.HtmlEncode("<a href=\"x\">&</a>")}|{System.Net.WebUtility.UrlEncode("a b&c")}|{System.Net.WebUtility.UrlDecode("a+b%26c")}", "&lt;a href=&quot;x&quot;&gt;&amp;&lt;/a&gt;|a+b%26c|a b&c");
+        var asyncBox = new AsyncBox<Point2>();
+        CheckStr("typeof(T) inside an async method of a generic class", asyncBox.DescribeAsync().GetAwaiter().GetResult(), "Point2:Point2 { X = 0, Y = 0 }");
+        string caught = "";
+        try { throw new CodedException(404, "HTTP 404"); } catch (CodedException ex) { caught = $"{ex.Code}:{ex.Message}"; }
+        try { throw new NamedOperationException("op", "denied"); } catch (InvalidOperationException ex) { caught += $"|{ex.Message}|{((NamedOperationException)ex).Operation}"; }
+        CheckStr("exception subclasses keep their message beside their own fields", caught, "404:HTTP 404|op: denied|op");
+        CheckStr("custom exponent formats",
+            $"{1.2345e-6.ToString("0.###e+0", inv)}|{123456.0.ToString("0.00E+00", inv)}|{(-0.00042).ToString("0.0e0", inv)}|{0.0.ToString("0e+0", inv)}|{9.9996.ToString("0.00e+0", inv)}",
+            "1.235e-6|1.23E+05|-4.2e-4|0e+0|1.00e+1");
+        CheckStr("negative values that round to zero keep the sign", $"{(-0.00042).ToString("#,##0.00", inv)}|{(-0.4).ToString("0", inv)}", "-0.00|-0");
+        var unixDto = DateTimeOffset.FromUnixTimeMilliseconds(1_700_000_000_123);
+        var plusSeven = new DateTimeOffset(2026, 3, 9, 14, 5, 0, TimeSpan.FromHours(7));
+        var utcDto = new DateTimeOffset(2026, 3, 9, 7, 5, 0, TimeSpan.Zero);
+        CheckStr("DateTimeOffset: unix time, formats and offsets",
+            $"{unixDto.ToString("o")}|{unixDto.ToUnixTimeMilliseconds()}|{unixDto.ToUnixTimeSeconds()}|{plusSeven.UtcDateTime.Hour}|{plusSeven == utcDto}|{utcDto:yyyy-MM-dd HH:mm zzz}",
+            "2023-11-14T22:13:20.1230000+00:00|1700000000123|1700000000|7|True|2026-03-09 07:05 +00:00");
+        var parsedDto = DateTimeOffset.Parse("2026-03-09T14:05:00+07:00");
+        var later = utcDto.AddDays(1.5).AddMinutes(30);
+        CheckStr("DateTimeOffset: parse, arithmetic and comparison",
+            $"{parsedDto.UtcTicks == utcDto.UtcTicks}|{(later - utcDto).TotalHours}|{later > utcDto}|{later.Day}|{utcDto.AddMonths(11).Year}|{DateTimeOffset.TryParse("not a date", out _)}|{(utcDto - TimeSpan.FromHours(8)).Day}",
+            "True|36.5|True|10|2027|False|8");
+        CheckStr("DateTimeOffset.UtcNow and the static fields", $"{DateTimeOffset.UtcNow >= DateTimeOffset.UnixEpoch}|{DateTimeOffset.UnixEpoch.ToUnixTimeSeconds()}|{DateTime.MinValue.Year}|{TimeSpan.Zero.Ticks}", "True|0|1|0");
+        var shapes = typeof(Shapes);
+        Type Prop(string name) => shapes.GetProperty(name)!.PropertyType;
+        CheckStr("reflection names framework generics and arrays exactly",
+            $"{Prop("Tags").GetGenericArguments()[0].Name}|{Prop("Counts").IsArray}|{Prop("Counts").GetElementType()!.Name}|{string.Join(",", Prop("Weights").GetGenericArguments().Select(t => t.Name))}|{Nullable.GetUnderlyingType(Prop("Maybe"))!.Name}|{Nullable.GetUnderlyingType(Prop("Shade")) == null}|{typeof(System.Collections.IList).IsAssignableFrom(Prop("Tags"))}|{Prop("Tags").GetGenericTypeDefinition() == typeof(List<>)}",
+            "Tag|True|Int32|String,Double|Int32|True|True|True");
+        CheckStr("indexers report their parameters", string.Join(",", shapes.GetProperties().Select(p => p.GetIndexParameters().Length)), "0,0,0,0,0,1");
+        var madeList = (System.Collections.IList)Activator.CreateInstance(Prop("Tags"))!;
+        madeList.Add(new Tag("a"));
+        madeList.Insert(0, new Tag("b"));
+        var madeArray = Array.CreateInstance(Prop("Counts").GetElementType()!, 3);
+        madeArray.SetValue(7, 1);
+        var madeDict = (System.Collections.IDictionary)Activator.CreateInstance(Prop("Weights"))!;
+        madeDict["w"] = 2.5;
+        var dictEntries = "";
+        foreach (System.Collections.DictionaryEntry e in madeDict) dictEntries += e.Value is double d ? $"{e.Key}={d}" : "unboxed";
+        CheckStr("values built from a Type through IList, Array and IDictionary",
+            $"{madeList.Count}|{madeList[0]}|{((int[])madeArray)[1]}|{madeArray.GetValue(1)}|{madeDict["w"]}|{dictEntries}|{Enum.ToObject(typeof(Shade), 1)}|{Convert.ToInt32(Shade.Dark)}",
+            "2|tag:b|7|7|2.5|w=2.5|Dark|1");
+        CheckStr("TimeSpan parsing",
+            $"{TimeSpan.Parse("1.02:03:04.5").TotalSeconds}|{TimeSpan.Parse("-00:30").TotalMinutes}|{TimeSpan.Parse("3").TotalHours}|{TimeSpan.TryParse("25:00", out _)}|{TimeSpan.Parse(TimeSpan.FromMinutes(90).ToString()).TotalMinutes}",
+            "93784.5|-30|72|False|90");
+        RegexChecks();
+        RandomChecks();
+        DecimalChecks();
+        EnumChecks();
+        ActivatorChecks();
+        TextChecks();
+        CancellationChecks();
+        CheckEq("LINQ callbacks that allocate", LinqUnderCollection(300), 3029);
+        var guid = Guid.Parse("{0F8FAD5B-D9CB-469F-A165-70867728950E}");
+        CheckStr("Guid formats and parsing",
+            $"{guid.ToString("N")}|{guid:B}|{guid == Guid.Parse("0f8fad5bd9cb469fa16570867728950e")}|{Guid.TryParse("nope", out _)}|{Guid.NewGuid().ToString("N").Length}|{guid != Guid.Empty}",
+            "0f8fad5bd9cb469fa16570867728950e|{0f8fad5b-d9cb-469f-a165-70867728950e}|True|False|32|True");
+        const string superscripts = "⁰¹²³⁴⁵⁶⁷⁸⁹";
+        CheckStr("string.Concat over sequences",
+            $"{string.Concat("2024".Select(c => superscripts[c - '0']))}|{string.Concat(new List<string> { "a", "b" })}|{string.Concat(Enumerable.Range(1, 3))}|{string.Concat((object)7)}",
+            "²⁰²⁴|ab|123|7");
+        CheckStr("TickCount64 is available", (Environment.TickCount64 >= 0).ToString(), "True");
+        CheckStr("record struct ToString in interpolation", $"{pt}|{(object)pt}", "Point2 { X = 5, Y = 6 }|Point2 { X = 5, Y = 6 }");
+
+        var date = new DateTime(2026, 3, 9, 14, 5, 7);
+        CheckStr("date format", date.ToString("yyyy-MM-dd HH:mm", inv), "2026-03-09 14:05");
+        CheckStr("date names", date.ToString("dddd, dd MMM", inv), "Monday, 09 Mar");
+        CheckStr("AddMonths clamps", new DateTime(2024, 1, 31).AddMonths(1).ToString("yyyy-MM-dd", inv), "2024-02-29");
+        CheckEq("date difference", (int)(date.AddDays(3) - date).TotalDays, 3);
+        CheckStr("TimeSpan", TimeSpan.FromSeconds(3725).ToString(), "01:02:05");
+        CheckEq("DayOfYear", date.DayOfYear, 68);
+
+        CheckEq("IndexOf ignore case", "Hello".IndexOf("LL", StringComparison.OrdinalIgnoreCase), 2);
+        CheckStr("PadLeft char", "7".PadLeft(3, '0'), "007");
+        CheckStr("Split options", string.Join("|", "a,,b, c".Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)), "a|b|c");
+        CheckStr("new string", new string('*', 3) + new string(new[] { 'a', 'b' }), "***ab");
+
+        CheckStr("enum name", Stage.Active.ToString(), "Active");
+        CheckStr("enum interpolated", $"{Stage.Closed}", "Closed");
+        CheckStr("Enum.Parse", Enum.Parse<Stage>("Closed").ToString(), "Closed");
+        CheckStr("Enum.GetValues", string.Join(",", Enum.GetValues<Stage>()), "Draft,Active,Closed");
+
+        var heard = "";
+        var pub = new Publisher();
+        EventHandler<string> handler = (_, m) => heard += m;
+        pub.Said += handler;
+        pub.Say("a");
+        pub.Said -= handler;
+        pub.Say("b");
+        CheckStr("event subscribe and unsubscribe", heard, "a");
+
+        var holder = new HoldsHandle();
+        var before = holder.Ready;
+        holder.Attach("x");
+        CheckStr("struct field starts zeroed", before + "|" + holder.Ready, "False|True");
+        var publicProps = typeof(PropBag).GetProperties().Select(p => p.Name).OrderBy(n => n);
+        CheckStr("GetProperties is public only", string.Join(",", publicProps), "Plain,Shown");
+        var marked = typeof(PropBag).GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+            .Where(p => p.GetCustomAttributes(typeof(TagPropAttribute), true).Length > 0).Select(p => p.Name).OrderBy(n => n);
+        CheckStr("property attributes", string.Join(",", marked), "Hidden,Shown");
+        CheckEq("Assembly equality", typeof(PropBag).Assembly == typeof(Program).Assembly ? 1 : 0, 1);
+        var closed = new Closed { Value = "v" };
+        var open = new Open<int> { Value = 4 };
+        CheckStr("base class through a construction", closed.Fresh + "|" + closed.Counted + "|" + closed.Value, "False|1|v");
+        CheckStr("base class over a type parameter", open.Fresh + "|" + open.Counted + "|" + open.Value, "False|1|4");
+        CheckStr("string.Empty", "[" + string.Empty + "]" + string.Empty.Length, "[]0");
+        var made = (Injected)typeof(Injected).GetConstructors()[0].Invoke(new object[] { "svc", 3 });
+        CheckStr("ConstructorInfo.Invoke", made.Name + made.Size, "svc3");
+        CheckStr("Join with a range", string.Join("-", new[] { "a", "b", "c", "d" }, 1, 2), "b-c");
+        CheckStr("virtuals through a constructed base", new TextLifecycle().Run(), "init:String,render");
+        var declaredOnBase = typeof(TextSettings).BaseType!.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly).Select(p => p.Name).OrderBy(n => n);
+        CheckStr("properties declared on a constructed base", string.Join(",", declaredOnBase), "Current,Secret");
+        CheckStr("base64 round trip", Convert.ToBase64String(new byte[] { 1, 2, 3, 250 }) + "|" + string.Join(",", Convert.FromBase64String("AQID+g==")), "AQID+g==|1,2,3,250");
+        CheckEq("BitConverter float bits", BitConverter.SingleToInt32Bits(1.5f), 1069547520);
+        CheckStr("BitConverter bytes", BitConverter.ToString(BitConverter.GetBytes(258)) + "|" + BitConverter.ToInt32(new byte[] { 2, 1, 0, 0 }, 0), "02-01-00-00|258");
+        var failing = new TaskCompletionSource<int>();
+        CheckStr("TrySetException once", failing.TrySetException(new InvalidOperationException("x")) + "|" + failing.TrySetException(new InvalidOperationException("y")) + "|" + failing.Task.IsFaulted, "True|False|True");
+        IReadOnlyList<double> asList = new double[] { 1.5, 2.5 };
+        IList<int> mutable = new List<int> { 1, 2 };
+        mutable[1] = 7;
+        CheckStr("collections behind interfaces", asList.Count + "|" + asList[1] + "|" + mutable[1] + "|" + mutable.IndexOf(7) + "|" + ((ICollection<int>)mutable).Contains(1), "2|2.5|7|1|True");
+        var optional = new WithOptional();
+        typeof(WithOptional).GetProperty("Delta")!.SetValue(optional, (double?)12.5);
+        typeof(WithOptional).GetProperty("Missing")!.SetValue(optional, null);
+        CheckStr("Nullable property set by reflection", optional.Delta.HasValue + "|" + optional.Delta + "|" + optional.Missing.HasValue, "True|12.5|False");
+        CheckEq("generic static constructor", PerType<string>.Length + PerType<int>.Length, 11);
+        int? some = 5;
+        int? none = null;
+        CheckStr("Nullable boxing", ((object?)some)?.ToString() + "|" + ((object?)none == null), "5|True");
+        var grid = new int[3, 4];
+        grid[1, 2] = 5;
+        grid[1, 2] += 2;
+        CheckEq("multi-dimensional array", grid[1, 2] + grid.GetLength(1) + grid.Length, 23);
+        CheckEq("Task.WhenAll params", Task.WhenAll(Task.FromResult(1), Task.FromResult(2)).Result.Sum(), 3);
+        CheckStr("inner exception", new InvalidOperationException("outer", new ArgumentException("inner")).InnerException!.Message, "inner");
+    }
+
     static void Main()
     {
         // arithmetic and control flow
@@ -1665,6 +1987,11 @@ static class Program
         // Generic methods know their type arguments.
         CheckStr("typeof(T) in a generic method", NameOfArg<int>(), "Int32");
         CheckStr("typeof(T) at a second instantiation", NameOfArg<string>(), "String");
+        var registrar = new Registrar();
+        CheckStr("typeof(T) in an instance generic method", registrar.NameOf<int>(), "Int32");
+        Registrar viaBase = new DerivedRegistrar();
+        CheckStr("typeof(T) in an overriding generic method", viaBase.VirtualNameOf<string>(), "derived:String");
+        CheckStr("callvirt on a non-virtual method ignores a `new` method", viaBase.Hidden(), "base");
         CheckEq("default(T) for a value type", DefaultOfArg<int>(), 0);
         CheckStr("default(T) for a reference type",
             DefaultOfArg<string>() == null ? "null" : "?", "null");
@@ -2172,6 +2499,7 @@ static class Program
         CheckEq("UTF-8 reports its usual code page",
             System.Text.Encoding.UTF8.CodePage, 65001);
 
+        BusinessLibrary();
         Console.WriteLine("checks=" + checks + " failures=" + failures);
     }
 

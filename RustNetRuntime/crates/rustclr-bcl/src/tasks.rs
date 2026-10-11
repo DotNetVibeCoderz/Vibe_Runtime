@@ -42,7 +42,7 @@
 //! The continuation path is real regardless: a `TaskCompletionSource` completed
 //! later genuinely suspends its awaiter and resumes it on completion.
 
-use crate::collections::{elements, field, field_handle, new_list, sequence_values, set_field};
+use crate::collections::{elements, field, field_handle, sequence_values, set_field};
 use crate::support::*;
 use rustclr_core::{
     ClrDelegate, ClrExceptionKind, ClrObject, ExecResult, ExecutionError, Interpreter, MethodId,
@@ -428,9 +428,15 @@ fn resume(interp: &mut Interpreter, cell: Handle) -> ExecResult<()> {
             interp.loader.registry.ty(type_id).full_name()
         )));
     };
-    // `this` is a pointer at the cell's slot, so the machine's own `stfld`
-    // writes land in the copy that will be resumed next time.
-    let this = Value::Ref(rustclr_core::ByRef::Field { object: cell, slot: 0 });
+    // A struct machine (release builds) resumes through a pointer at the
+    // cell's slot, so its own `stfld` writes land in the copy that will be
+    // resumed next time. A class machine (debug builds) is its own `this`, as
+    // in `start_state_machine`; a pointer to it reads every field as null.
+    let this = if interp.loader.registry.ty(type_id).kind.is_value_like() {
+        Value::Ref(rustclr_core::ByRef::Field { object: cell, slot: 0 })
+    } else {
+        machine
+    };
     interp.invoke(move_next, vec![this])?;
     Ok(())
 }
@@ -606,8 +612,19 @@ fn register_task(interp: &mut Interpreter) {
         // `WhenAll` over `Task<T>` yields the results; over `Task` it yields
         // nothing. Carrying the list is correct for both — an awaiter that
         // wants no value simply ignores it.
-        let list = new_list(i, results);
-        Ok(Some(Value::Obj(completed_task(i, list))))
+        // `WhenAll<T>` yields a `T[]`, which the caller indexes with `ldelem`
+        // and measures with `ldlen`; a list there is a null reference.
+        let element = i
+            .current_native_method()
+            .and_then(|m| i.loader.registry.method(m).generic_args.first().copied())
+            .unwrap_or(i.loader.core().object);
+        let array = i.alloc_array(element, results.len());
+        i.heap.with_mut::<rustclr_core::ClrArray, _>(array, |arr| {
+            for (n, v) in results.iter().enumerate() {
+                arr.storage.set(n, v);
+            }
+        });
+        Ok(Some(Value::Obj(completed_task(i, Value::Obj(array)))))
     });
     interp.register_native(key(&format!("{TASKS}.Task"), "WhenAny/1"), |i, a| {
         let source = arg(i, a, 0)?;
@@ -1371,6 +1388,25 @@ fn register_completion_source(interp: &mut Interpreter) {
             }
             let value = arg(i, a, 1)?;
             complete(i, task, value)?;
+            Ok(Some(Value::I32(1)))
+        });
+        interp.register_native(key(full, "TrySetException/1"), |i, a| {
+            let this = arg_handle(i, a, 0)?;
+            let task = field_handle(i, this, 0);
+            if status_of(i, task) != PENDING {
+                return Ok(Some(Value::I32(0)));
+            }
+            let exception = arg(i, a, 1)?;
+            fault(i, task, exception)?;
+            Ok(Some(Value::I32(1)))
+        });
+        interp.register_native(key(full, "TrySetResult()"), |i, a| {
+            let this = arg_handle(i, a, 0)?;
+            let task = field_handle(i, this, 0);
+            if status_of(i, task) != PENDING {
+                return Ok(Some(Value::I32(0)));
+            }
+            complete(i, task, Value::Null)?;
             Ok(Some(Value::I32(1)))
         });
         interp.register_native(key(full, "SetException/1"), |i, a| {

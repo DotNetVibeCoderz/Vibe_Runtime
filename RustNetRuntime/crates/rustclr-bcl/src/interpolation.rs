@@ -31,6 +31,40 @@ use crate::prelude::*;
 const TYPE: &str = "System.Runtime.CompilerServices.DefaultInterpolatedStringHandler";
 
 pub fn register(interp: &mut Interpreter) {
+    register_handler(interp, TYPE);
+}
+
+/// `StringBuilder.AppendInterpolatedStringHandler` has the same shape; its
+/// constructor also takes the builder, which `StringBuilder.Append(ref
+/// handler)` appends the accumulated text to. Full tier only.
+pub(crate) fn register_builder_handler(interp: &mut Interpreter) {
+    register_handler(interp, "System.Text.StringBuilder+AppendInterpolatedStringHandler");
+    // (literalLength, formattedCount, builder, provider)
+    interp.register_native("System.Text.StringBuilder+AppendInterpolatedStringHandler::.ctor/4", ctor);
+}
+
+/// The accumulated text of a handler passed by reference, cleared afterwards.
+pub(crate) fn take_handler_text(interp: &mut Interpreter, handler: &Value) -> ExecResult<String> {
+    let handle = match handler {
+        Value::Ref(r) => interp.load_indirect_public(r.clone())?,
+        other => other.clone(),
+    }
+    .as_handle()
+    .filter(|h| !h.is_null())
+    .ok_or_else(|| ExecutionError::InvalidProgram("the interpolated string handler was not constructed".into()))?;
+    let text = interp
+        .heap
+        .with_mut::<ClrString, _>(handle, |s| {
+            let t = String::from_utf16_lossy(&s.units);
+            s.units.clear();
+            t
+        })
+        .unwrap_or_default();
+    Ok(text)
+}
+
+fn register_handler(interp: &mut Interpreter, ty: &'static str) {
+    let key = |member: &str| -> &'static str { Box::leak(format!("{ty}::{member}").into_boxed_str()) };
     // Both constructor shapes: (literalLength, formattedCount) and the overload
     // that also takes an initial buffer capacity.
     interp.register_native(key(".ctor(int,int)"), ctor);
@@ -67,10 +101,6 @@ pub fn register(interp: &mut Interpreter) {
     interp.register_native(key("Clear()"), clear);
 }
 
-/// Leaks a stable key string; the native table holds it for the process life.
-fn key(member: &str) -> &'static str {
-    Box::leak(format!("{TYPE}::{member}").into_boxed_str())
-}
 
 /// Renders a value the way the interpolation hole should print it.
 ///
@@ -119,17 +149,32 @@ fn append_formatted(interp: &mut Interpreter, args: &[Value]) -> ExecResult<Opti
         .current_native_method()
         .map(|m| interp.loader.registry.method(m).qualified_name.clone())
         .unwrap_or_default();
-    let text = render(
-        interp,
-        &value,
-        bound.contains("AppendFormatted(bool"),
-        bound.contains("AppendFormatted(char"),
-    );
+    let type_hint = interp
+        .current_native_method()
+        .and_then(|m| interp.loader.registry.method(m).generic_args.first().copied());
 
-    // `AppendFormatted(value, alignment)` pads to a field width; a negative
-    // alignment left-justifies. The format-specifier overload is accepted but
-    // the specifier itself is ignored rather than misapplied.
-    let alignment = args.get(2).and_then(|v| v.as_i32()).unwrap_or(0);
+    // (value), (value, alignment), (value, format), (value, alignment, format).
+    let mut alignment = 0;
+    let mut spec = String::new();
+    for extra in args.iter().skip(2) {
+        match extra {
+            Value::I32(n) => alignment = *n,
+            Value::Obj(h) => spec = interp.string_value(*h).unwrap_or_default(),
+            _ => {}
+        }
+    }
+
+    let text = if bound.contains("AppendFormatted(bool") {
+        render(interp, &value, true, false)
+    } else if bound.contains("AppendFormatted(char") {
+        render(interp, &value, false, true)
+    } else if type_hint.is_some() || !spec.is_empty() {
+        // The type argument says what the slot holds: an enum prints its
+        // name, a DateTime its date, and `{x:N2}` applies the specifier.
+        crate::extras::format_value(interp, &value, type_hint, &spec)
+    } else {
+        render(interp, &value, false, false)
+    };
     let padded = pad(&text, alignment);
 
     append(interp, args, &padded)?;

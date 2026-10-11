@@ -106,7 +106,35 @@ pub fn display(interp: &mut Interpreter, v: &Value) -> String {
             Ok(inner) => display(interp, &inner),
             Err(_) => String::new(),
         },
-        Value::Struct(s) => interp.loader.registry.ty(s.type_id).full_name(),
+        // `int?` prints its value, or nothing when it has none.
+        Value::Struct(s) if interp.loader.registry.ty(s.type_id).full_name() == "System.Nullable`1" => {
+            if s.fields.first().map(|f| f.is_truthy()).unwrap_or(false) {
+                let inner = s.fields.get(1).cloned().unwrap_or(Value::Null);
+                display(interp, &inner)
+            } else {
+                String::new()
+            }
+        }
+        Value::Struct(_) if crate::decimal::is_decimal(interp, v) => crate::decimal::decode(v).plain(),
+        // A struct's own `ToString` — every `record struct` has one — runs
+        // with `this` pointing at a copy in a one-slot cell, as `newobj` does
+        // for a struct constructor.
+        Value::Struct(s) => {
+            let type_id = s.type_id;
+            if let Some(method) = find_to_string(interp, type_id) {
+                let object_type = interp.loader.core().object;
+                let mut cell = rustclr_core::ClrObject::new(object_type, 1);
+                cell.fields[0] = v.clone();
+                let cell = interp.heap.alloc(cell);
+                let this = Value::Ref(rustclr_core::ByRef::Field { object: cell, slot: 0 });
+                if let Ok(Some(Value::Obj(result))) = interp.invoke(method, vec![this]) {
+                    if let Some(text) = interp.string_value(result) {
+                        return text;
+                    }
+                }
+            }
+            interp.loader.registry.ty(type_id).full_name()
+        }
         Value::Obj(h) => display_handle(interp, *h),
     }
 }
@@ -125,7 +153,20 @@ fn display_handle(interp: &mut Interpreter, h: Handle) -> String {
         interp.heap.with::<ClrBox, _>(h, |b| (b.value.clone(), b.type_id))
     {
         if interp.loader.registry.ty(type_id).kind == TypeKind::Enum {
-            return inner.as_i64().unwrap_or(0).to_string();
+            return crate::extras::enum_name(interp, type_id, inner.as_i64().unwrap_or(0));
+        }
+        // Dates and durations are tick counts in a slot; print them as such.
+        match interp.loader.registry.ty(type_id).full_name().as_str() {
+            "System.DateTime" => return crate::format::format_date(inner.as_i64().unwrap_or(0), ""),
+            "System.TimeSpan" => return crate::format::format_timespan(inner.as_i64().unwrap_or(0), ""),
+            "System.DateTimeOffset" => return crate::extras::format_datetimeoffset(interp, inner.as_i64().unwrap_or(0), ""),
+            // A char and a bool share the int32 slot; the box says which.
+            // Half a surrogate pair has no Rust `char`, so it shows as U+FFFD.
+            "System.Char" => {
+                return char::from_u32(inner.as_i32().unwrap_or(0) as u32).unwrap_or('\u{fffd}').to_string();
+            }
+            "System.Boolean" => return if inner.is_truthy() { "True".into() } else { "False".into() },
+            _ => {}
         }
         return display(interp, &inner);
     }
@@ -142,6 +183,14 @@ fn display_handle(interp: &mut Interpreter, h: Handle) -> String {
 
     // A managed object may override ToString; call it when it does.
     if let Some(type_id) = interp.type_of(h) {
+        // A StringBuilder has no IL; its ToString is its text.
+        if interp.loader.registry.ty(type_id).full_name() == "System.Text.StringBuilder" {
+            let inner = interp.heap.with::<rustclr_core::ClrObject, _>(h, |o| o.fields.first().cloned()).flatten();
+            return match inner {
+                Some(Value::Obj(s)) if !s.is_null() => interp.string_value(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+        }
         if let Some(method) = find_to_string(interp, type_id) {
             if let Ok(Some(Value::Obj(result))) = interp.invoke(method, vec![Value::Obj(h)]) {
                 if let Some(s) = interp.string_value(result) {

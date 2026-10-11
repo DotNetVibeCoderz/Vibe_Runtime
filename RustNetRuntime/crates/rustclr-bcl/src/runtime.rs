@@ -30,14 +30,31 @@ fn register_object(interp: &mut Interpreter) {
         let s = display(i, &v);
         Ok(Some(string_value(i, &s)))
     });
+    // A boxed value (an enum, a struct without its own overrides) hashes and
+    // compares by what it holds, as ValueType and Enum do on .NET; anything
+    // else by identity.
     interp.register_native("System.Object::GetHashCode()", |i, a| {
         let h = arg_handle(i, a, 0)?;
-        Ok(Some(Value::I32(h.to_bits() as i32)))
+        let boxed = i.heap.with::<rustclr_core::ClrBox, _>(h, |b| b.value.clone());
+        Ok(Some(Value::I32(match boxed {
+            Some(Value::I32(v)) => v,
+            Some(Value::I64(v)) | Some(Value::NativeInt(v)) => (v as i32) ^ ((v >> 32) as i32),
+            Some(v) => crate::collections::value_hash(i, &v) as i32,
+            None => h.to_bits() as i32,
+        })))
     });
     interp.register_native("System.Object::Equals(object)", |i, a| {
         let x = arg_handle(i, a, 0)?;
         let y = arg_handle(i, a, 1)?;
-        Ok(Some(Value::I32((x == y) as i32)))
+        if x == y {
+            return Ok(Some(Value::I32(1)));
+        }
+        let left = i.heap.with::<rustclr_core::ClrBox, _>(x, |b| (b.type_id, b.value.clone()));
+        let right = i.heap.with::<rustclr_core::ClrBox, _>(y, |b| (b.type_id, b.value.clone()));
+        Ok(Some(Value::I32(match (left, right) {
+            (Some((tx, vx)), Some((ty, vy))) => (tx == ty && crate::collections::values_equal(i, &vx, &vy)) as i32,
+            _ => 0,
+        })))
     });
     interp.register_native("System.Object::ReferenceEquals(object,object)", |i, a| {
         let x = arg_handle(i, a, 0)?;
@@ -113,8 +130,62 @@ fn initialize_array(
         return Ok(None);
     };
 
-    interp.heap.with_mut::<ClrArray, _>(array, |a| copy_initial_data(&mut a.storage, &data));
+    // An enum array keeps its elements as stack values, so the blob is read
+    // at the width and sign of the enum's underlying type.
+    let element = interp.heap.with::<ClrArray, _>(array, |a| a.element_type);
+    let underlying = element.and_then(|t| enum_underlying(interp, t));
+    interp.heap.with_mut::<ClrArray, _>(array, |a| match (&mut a.storage, underlying) {
+        (rustclr_core::ArrayStorage::Values(values), Some(p)) => copy_enum_data(values, p, &data),
+        (storage, _) => copy_initial_data(storage, &data),
+    });
     Ok(None)
+}
+
+/// The integer type an enum is stored as: recorded for the framework's enums,
+/// read from the `value__` field's signature for the program's own.
+fn enum_underlying(interp: &Interpreter, ty: rustclr_core::types::TypeId) -> Option<rustclr_core::types::Primitive> {
+    use rustclr_core::metadata::TypeSig as T;
+    use rustclr_core::types::{Primitive as P, TypeKind};
+    let registry = &interp.loader.registry;
+    let runtime = registry.ty(ty);
+    if runtime.underlying.is_some() || runtime.kind != TypeKind::Enum {
+        return runtime.underlying;
+    }
+    let field = runtime.instance_fields.first()?;
+    Some(match registry.field(*field).signature.unwrap_modifiers() {
+        T::I1 => P::SByte,
+        T::U1 => P::Byte,
+        T::Boolean => P::Boolean,
+        T::I2 => P::Int16,
+        T::U2 => P::UInt16,
+        T::Char => P::Char,
+        T::U4 => P::UInt32,
+        T::I8 => P::Int64,
+        T::U8 => P::UInt64,
+        _ => P::Int32,
+    })
+}
+
+/// Writes little-endian image bytes into an enum array's value slots.
+fn copy_enum_data(values: &mut [Value], underlying: rustclr_core::types::Primitive, data: &[u8]) {
+    use rustclr_core::types::Primitive as P;
+    let width = match underlying {
+        P::SByte | P::Byte | P::Boolean => 1,
+        P::Int16 | P::UInt16 | P::Char => 2,
+        P::Int64 | P::UInt64 => 8,
+        _ => 4,
+    };
+    for (index, slot) in values.iter_mut().enumerate() {
+        let Some(c) = data.get(index * width..index * width + width) else { break };
+        *slot = match underlying {
+            P::SByte => Value::I32(c[0] as i8 as i32),
+            P::Byte | P::Boolean => Value::I32(c[0] as i32),
+            P::Int16 => Value::I32(i16::from_le_bytes([c[0], c[1]]) as i32),
+            P::UInt16 | P::Char => Value::I32(u16::from_le_bytes([c[0], c[1]]) as i32),
+            P::Int64 | P::UInt64 => Value::I64(i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])),
+            _ => Value::I32(i32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+        };
+    }
 }
 
 /// Writes little-endian image bytes into typed array storage.
@@ -154,7 +225,8 @@ fn copy_initial_data(storage: &mut rustclr_core::ArrayStorage, data: &[u8]) {
         S::F64(v) => fill!(v, 8, |c| f64::from_le_bytes([
             c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]
         ])),
-        // Reference and boxed element types are never initialised this way.
+        // Reference elements are never initialised this way; enum elements
+        // are handled by `copy_enum_data`.
         S::Refs(_) | S::Values(_) => {}
     }
 }
@@ -177,9 +249,18 @@ fn register_exceptions(interp: &mut Interpreter) {
             .unwrap_or_default();
         Ok(Some(string_value(i, &trace)))
     });
+    // "Type: message", then the stack where it was thrown, as .NET prints it.
+    // A page logging an unhandled exception is often all there is to go on.
     interp.register_native("System.Exception::ToString()", |i, a| {
         let v = arg(i, a, 0)?;
-        let s = display(i, &v);
+        let mut s = display(i, &v);
+        if let Some(h) = v.as_handle().filter(|h| !h.is_null()) {
+            let trace = i.heap.with::<ClrException, _>(h, |e| e.stack_trace.join("\n")).unwrap_or_default();
+            if !trace.is_empty() {
+                s.push('\n');
+                s.push_str(&trace);
+            }
+        }
         Ok(Some(string_value(i, &s)))
     });
 
@@ -267,6 +348,9 @@ fn register_environment(interp: &mut Interpreter) {
     });
     interp.register_native("System.Environment::get_TickCount()", |i, _a| {
         Ok(Some(Value::I32(i.host.monotonic_millis() as i32)))
+    });
+    interp.register_native("System.Environment::get_TickCount64()", |i, _a| {
+        Ok(Some(Value::I64(i.host.monotonic_millis() as i64)))
     });
     // An iterator method's state machine records the thread that created it, so
     // that enumerating it from another thread hands out a fresh instance. Now
@@ -454,31 +538,242 @@ fn register_time(interp: &mut Interpreter) {
 }
 
 fn register_random(interp: &mut Interpreter) {
-    // A deterministic xorshift generator seeded from the object identity, so a
-    // program's random sequence is reproducible across runs of the same build.
-    interp.register_native("System.Random::.ctor()", |_i, _a| Ok(None));
-    interp.register_native("System.Random::.ctor(int)", |_i, _a| Ok(None));
+    // `new Random(seed)` reproduces .NET's sequence exactly: the subtractive
+    // generator .NET keeps for seeded instances. Programs depend on that for
+    // reproducible simulations, procedural content and tests. `new Random()`
+    // uses the same generator from a clock-derived seed, so every run differs,
+    // as in .NET. Each instance keeps its own state in its first slot.
+    for ctor in ["System.Random::.ctor()", "System.Random::.ctor/0"] {
+        interp.register_native(ctor, |i, a| {
+            let h = arg_handle(i, a, 0)?;
+            let seed = clock_seed(i, h);
+            init_random(i, h, seed);
+            Ok(None)
+        });
+    }
+    for ctor in ["System.Random::.ctor(int)", "System.Random::.ctor/1"] {
+        interp.register_native(ctor, |i, a| {
+            let h = arg_handle(i, a, 0)?;
+            let seed = arg_i32(i, a, 1)?;
+            init_random(i, h, seed);
+            Ok(None)
+        });
+    }
+    interp.register_native("System.Random::get_Shared()", |i, _| {
+        let Some(ty) = i.loader.registry.find_type_by_name("System.Random") else { return Ok(Some(Value::Null)) };
+        let h = i.alloc_object(ty);
+        let seed = clock_seed(i, h);
+        init_random(i, h, seed);
+        Ok(Some(Value::Obj(h)))
+    });
     interp.register_native("System.Random::Next()", |i, a| {
         let h = arg_handle(i, a, 0)?;
-        Ok(Some(Value::I32((next_random(h.to_bits()) >> 1) as i32)))
+        Ok(Some(Value::I32(with_prng(i, h, |p| p.internal_sample()))))
     });
     interp.register_native("System.Random::Next(int)", |i, a| {
         let h = arg_handle(i, a, 0)?;
-        let bound = arg_i32(i, a, 1)?.max(1);
-        Ok(Some(Value::I32((next_random(h.to_bits()) % bound as u64) as i32)))
+        let max = arg_i32(i, a, 1)?;
+        if max < 0 {
+            return Err(random_range("'maxValue' must be greater than zero."));
+        }
+        Ok(Some(Value::I32((with_prng(i, h, |p| p.sample()) * max as f64) as i32)))
     });
     interp.register_native("System.Random::Next(int,int)", |i, a| {
         let h = arg_handle(i, a, 0)?;
-        let lo = arg_i32(i, a, 1)?;
-        let hi = arg_i32(i, a, 2)?.max(lo + 1);
-        let span = (hi - lo) as u64;
-        Ok(Some(Value::I32(lo + (next_random(h.to_bits()) % span) as i32)))
+        let (lo, hi) = (arg_i32(i, a, 1)?, arg_i32(i, a, 2)?);
+        if lo > hi {
+            return Err(random_range("'minValue' cannot be greater than maxValue."));
+        }
+        let range = hi as i64 - lo as i64;
+        let v = if range <= i32::MAX as i64 {
+            (with_prng(i, h, |p| p.sample()) * range as f64) as i32 + lo
+        } else {
+            ((with_prng(i, h, |p| p.large_range_sample()) * range as f64) as i64 + lo as i64) as i32
+        };
+        Ok(Some(Value::I32(v)))
     });
     interp.register_native("System.Random::NextDouble()", |i, a| {
         let h = arg_handle(i, a, 0)?;
-        let v = next_random(h.to_bits()) as f64 / u32::MAX as f64;
-        Ok(Some(Value::F(crate::fmath::fract(v))))
+        Ok(Some(Value::F(with_prng(i, h, |p| p.sample()))))
     });
+    interp.register_native("System.Random::NextSingle()", |i, a| {
+        let h = arg_handle(i, a, 0)?;
+        Ok(Some(Value::F(with_prng(i, h, |p| p.sample()) as f32 as f64)))
+    });
+    for name in ["System.Random::NextInt64()", "System.Random::NextInt64(long)", "System.Random::NextInt64(long,long)"] {
+        interp.register_native(name, |i, a| {
+            let h = arg_handle(i, a, 0)?;
+            let (lo, hi) = match a.len() {
+                1 => (0i64, i64::MAX),
+                2 => (0, arg_i64(i, a, 1)?),
+                _ => (arg_i64(i, a, 1)?, arg_i64(i, a, 2)?),
+            };
+            if lo > hi {
+                return Err(random_range("'minValue' cannot be greater than maxValue."));
+            }
+            let span = (hi as i128 - lo as i128) as f64;
+            let v = lo as i128 + (with_prng(i, h, |p| p.large_range_sample()) * span) as i128;
+            Ok(Some(Value::I64(v.clamp(lo as i128, (hi as i128 - 1).max(lo as i128)) as i64)))
+        });
+    }
+    interp.register_native("System.Random::NextBytes(byte[])", |i, a| {
+        let h = arg_handle(i, a, 0)?;
+        let buffer = arg_handle(i, a, 1)?;
+        let len = i.heap.with::<ClrArray, _>(buffer, |x| x.len()).unwrap_or(0);
+        let bytes: Vec<i32> = (0..len).map(|_| with_prng(i, h, |p| p.internal_sample()) % 256).collect();
+        i.heap.with_mut::<ClrArray, _>(buffer, |x| {
+            for (n, b) in bytes.iter().enumerate() {
+                x.storage.set(n, &Value::I32(*b));
+            }
+        });
+        Ok(None)
+    });
+}
+
+fn random_range(message: &str) -> rustclr_core::ExecutionError {
+    rustclr_core::ExecutionError::exception(rustclr_core::ClrExceptionKind::ArgumentOutOfRange, message)
+}
+
+/// .NET's seeded generator (Knuth's subtractive method, `Net5CompatSeedImpl`).
+struct Prng<'a> {
+    state: &'a mut [i32],
+}
+
+const MBIG: i32 = i32::MAX;
+const MSEED: i32 = 161_803_398;
+/// 56 seed slots, then `inext` and `inextp`.
+const PRNG_SLOTS: usize = 58;
+
+impl Prng<'_> {
+    fn seed(state: &mut [i32], seed: i32) {
+        let subtraction = if seed == i32::MIN { i32::MAX } else { seed.abs() };
+        let mut mj = MSEED - subtraction;
+        state[55] = mj;
+        let mut mk = 1i32;
+        let mut ii = 0usize;
+        for _ in 1..55 {
+            ii += 21;
+            if ii >= 55 {
+                ii -= 55;
+            }
+            state[ii] = mk;
+            mk = mj.wrapping_sub(mk);
+            if mk < 0 {
+                mk = mk.wrapping_add(MBIG);
+            }
+            mj = state[ii];
+        }
+        for _ in 1..5 {
+            for i in 1..56 {
+                let mut n = i + 30;
+                if n >= 55 {
+                    n -= 55;
+                }
+                state[i] = state[i].wrapping_sub(state[1 + n]);
+                if state[i] < 0 {
+                    state[i] = state[i].wrapping_add(MBIG);
+                }
+            }
+        }
+        state[56] = 0;
+        state[57] = 21;
+    }
+
+    fn internal_sample(&mut self) -> i32 {
+        let s = &mut *self.state;
+        let mut next = s[56] as usize + 1;
+        if next >= 56 {
+            next = 1;
+        }
+        let mut nextp = s[57] as usize + 1;
+        if nextp >= 56 {
+            nextp = 1;
+        }
+        let mut v = s[next].wrapping_sub(s[nextp]);
+        if v == MBIG {
+            v -= 1;
+        }
+        if v < 0 {
+            v = v.wrapping_add(MBIG);
+        }
+        s[next] = v;
+        s[56] = next as i32;
+        s[57] = nextp as i32;
+        v
+    }
+
+    fn sample(&mut self) -> f64 {
+        self.internal_sample() as f64 * (1.0 / MBIG as f64)
+    }
+
+    fn large_range_sample(&mut self) -> f64 {
+        let mut result = self.internal_sample();
+        if self.internal_sample() % 2 == 0 {
+            result = -result;
+        }
+        let d = result as f64 + (i32::MAX - 1) as f64;
+        d / (2.0 * i32::MAX as f64 - 1.0)
+    }
+}
+
+/// Gives the instance a state array seeded with `seed`.
+fn init_random(i: &mut Interpreter, h: Handle, seed: i32) {
+    let int_type = i.loader.primitive_type(rustclr_core::Primitive::Int32);
+    let array = i.alloc_array(int_type, PRNG_SLOTS);
+    i.heap.with_mut::<ClrArray, _>(array, |x| {
+        if let rustclr_core::ArrayStorage::I32(v) = &mut x.storage {
+            Prng::seed(v, seed);
+        }
+    });
+    i.heap.with_mut::<rustclr_core::ClrObject, _>(h, |o| {
+        if o.fields.is_empty() {
+            o.fields.push(Value::Obj(array));
+        } else {
+            o.fields[0] = Value::Obj(array);
+        }
+    });
+}
+
+/// Runs one generator step on the instance's state, seeding it first if a
+/// subclass constructor or reflection skipped `.ctor`.
+fn with_prng<R>(i: &mut Interpreter, h: Handle, f: impl FnOnce(&mut Prng) -> R) -> R {
+    let mut state = match field(i, h, 0) {
+        Value::Obj(s) => s,
+        _ => Handle::NULL,
+    };
+    if state.is_null() {
+        let seed = clock_seed(i, h);
+        init_random(i, h, seed);
+        if let Value::Obj(s) = field(i, h, 0) {
+            state = s;
+        }
+    }
+    let mut f = Some(f);
+    let mut out = None;
+    i.heap.with_mut::<ClrArray, _>(state, |x| {
+        if let rustclr_core::ArrayStorage::I32(v) = &mut x.storage {
+            if let Some(f) = f.take() {
+                out = Some(f(&mut Prng { state: v.as_mut_slice() }));
+            }
+        }
+    });
+    match out {
+        Some(v) => v,
+        None => {
+            // No usable state (a foreign object): a throwaway generator.
+            let mut v = [0i32; PRNG_SLOTS];
+            Prng::seed(&mut v, 0);
+            let f = f.take().expect("generator closure");
+            f(&mut Prng { state: &mut v })
+        }
+    }
+}
+
+/// A seed that differs per run and per instance, for `new Random()`.
+fn clock_seed(i: &mut Interpreter, h: Handle) -> i32 {
+    let t = i.host.wall_clock_millis() as u64;
+    let mixed = next_random(t ^ h.to_bits().rotate_left(29));
+    (mixed as u32 & 0x7FFF_FFFF) as i32
 }
 
 /// One step of a xorshift64* generator, keyed by the instance handle.

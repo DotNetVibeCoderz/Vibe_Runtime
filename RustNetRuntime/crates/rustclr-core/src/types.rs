@@ -583,7 +583,111 @@ impl TypeRegistry {
             }
             current = ty.base;
         }
-        false
+        // A program's own `class Props : Dictionary<string, object>` inherits
+        // what its native base implements.
+        self.base_chain(derived).any(|t| self.builtin_implements(t, base))
+    }
+
+    /// The interfaces arrays, strings and the natively implemented collections
+    /// satisfy without declaring them.
+    ///
+    /// `List<T>`, `Dictionary<K,V>` and the rest carry no metadata here, so no
+    /// interface list was ever read for them — and without this `list is
+    /// IEnumerable`, `(IDictionary)dict` or a serializer's `case IEnumerable`
+    /// all failed on the very objects they exist for. Type arguments are
+    /// checked when both sides carry them; a natively allocated array whose
+    /// element type was erased to `object` is accepted, since its elements
+    /// are whatever the program stored.
+    fn builtin_implements(&self, actual: TypeId, target: TypeId) -> bool {
+        let valid = |id: TypeId| id.is_valid() && id.index() < self.types.len();
+        if !valid(actual) || !valid(target) {
+            return false;
+        }
+        let t = self.ty(target);
+        if t.kind != TypeKind::Interface {
+            return false;
+        }
+        let tdef = t.generic_definition.filter(|d| valid(*d)).map(|d| self.ty(d)).unwrap_or(t);
+        let (ns, iface) = (tdef.namespace.as_str(), tdef.name.as_str());
+        let generic = match ns {
+            "System.Collections.Generic" => true,
+            "System.Collections" => false,
+            _ => return false,
+        };
+        let a = self.ty(actual);
+        let adef = a.generic_definition.filter(|d| valid(*d)).map(|d| self.ty(d)).unwrap_or(a);
+
+        const SEQUENCE: &[&str] = &["IEnumerable`1", "IReadOnlyCollection`1"];
+        const LIST: &[&str] =
+            &["IEnumerable`1", "IReadOnlyCollection`1", "ICollection`1", "IList`1", "IReadOnlyList`1"];
+        const UNTYPED: &[&str] = &["IEnumerable", "ICollection", "IList"];
+        let (typed, untyped): (&[&str], &[&str]) = match a.kind {
+            TypeKind::SzArray | TypeKind::Array => (LIST, UNTYPED),
+            // An array whose `T[]` type was never registered is typed as
+            // `System.Array`; its elements are checked by nothing, so neither
+            // is its type argument.
+            _ if a.namespace == "System" && a.name == "Array" => (LIST, UNTYPED),
+            TypeKind::String => (&["IEnumerable`1"], &["IEnumerable"]),
+            _ if a.namespace == "System.Text.RegularExpressions" && matches!(a.name.as_str(), "MatchCollection" | "GroupCollection") => (LIST, UNTYPED),
+            TypeKind::Interface => match adef.name.as_str() {
+                "IList`1" | "ICollection`1" => (&["IEnumerable`1", "ICollection`1"], &["IEnumerable"]),
+                "IReadOnlyList`1" | "IReadOnlyCollection`1" => (SEQUENCE, &["IEnumerable"]),
+                "IDictionary`2" | "IReadOnlyDictionary`2" => (&["IEnumerable`1"], &["IEnumerable"]),
+                "ISet`1" => (&["IEnumerable`1", "ICollection`1"], &["IEnumerable"]),
+                "IEnumerable`1" => (&[], &["IEnumerable"]),
+                "IList" | "IDictionary" => (&[], &["IEnumerable", "ICollection"]),
+                "ICollection" => (&[], &["IEnumerable"]),
+                _ => return false,
+            },
+            _ if adef.namespace == "System.Collections.Generic" => match adef.name.as_str() {
+                "List`1" => (LIST, UNTYPED),
+                "HashSet`1" => (&["IEnumerable`1", "IReadOnlyCollection`1", "ICollection`1", "ISet`1"], &["IEnumerable"]),
+                "Queue`1" | "Stack`1" => (SEQUENCE, &["IEnumerable", "ICollection"]),
+                "Dictionary`2" => (
+                    &["IEnumerable`1", "IReadOnlyCollection`1", "ICollection`1", "IDictionary`2", "IReadOnlyDictionary`2"],
+                    &["IEnumerable", "ICollection", "IDictionary"],
+                ),
+                "Dictionary`2+KeyCollection" | "Dictionary`2+ValueCollection" => {
+                    (&["IEnumerable`1", "IReadOnlyCollection`1", "ICollection`1"], &["IEnumerable", "ICollection"])
+                }
+                n if n.ends_with("+Enumerator") => (&[], &["IEnumerator"]),
+                _ => return false,
+            },
+            _ => return false,
+        };
+        if !(if generic { typed } else { untyped }).contains(&iface) {
+            return false;
+        }
+        if !generic || t.generic_args.is_empty() {
+            return true;
+        }
+        // The element type, where the receiver records one.
+        let element = match a.kind {
+            TypeKind::SzArray | TypeKind::Array => a.element_type,
+            TypeKind::String => self.find_type_by_name("System.Char"),
+            _ if adef.name == "Dictionary`2" => {
+                // IDictionary<K,V> and IReadOnlyDictionary<K,V> name both
+                // arguments; the sequence interfaces name KeyValuePair<K,V>.
+                if iface.contains("Dictionary") && a.generic_args.len() == 2 && t.generic_args.len() == 2 {
+                    return a.generic_args == t.generic_args;
+                }
+                return true;
+            }
+            _ => a.generic_args.first().copied(),
+        };
+        let (Some(element), Some(&wanted)) = (element, t.generic_args.first()) else {
+            return true;
+        };
+        if element == wanted || !valid(element) || !valid(wanted) {
+            return true;
+        }
+        let e = self.ty(element);
+        if e.namespace == "System" && e.name == "Object" {
+            return true;
+        }
+        // Covariance: a string[] is an IEnumerable<object>, an int[] is not.
+        let by_reference = |ty: &RuntimeType| !matches!(ty.kind, TypeKind::ValueType | TypeKind::Enum | TypeKind::Primitive);
+        by_reference(e) && by_reference(self.ty(wanted)) && matches!(iface, "IEnumerable`1" | "IReadOnlyCollection`1" | "IReadOnlyList`1") && self.is_assignable_to(element, wanted)
     }
 
     /// Walks the inheritance chain from `id` up to `System.Object`.

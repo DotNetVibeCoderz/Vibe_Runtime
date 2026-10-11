@@ -63,7 +63,7 @@ impl GcObject for ClrObject {
 /// Arrays of primitives are stored unboxed. A `byte[1_000_000]` costs a
 /// megabyte here rather than the 24 MB a `Vec<Value>` would need, which matters
 /// on the memory-constrained targets this runtime supports.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ArrayStorage {
     Bool(Vec<bool>),
     I8(Vec<i8>),
@@ -229,7 +229,7 @@ impl ArrayStorage {
 }
 
 /// An array instance.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ClrArray {
     pub array_type: TypeId,
     pub element_type: TypeId,

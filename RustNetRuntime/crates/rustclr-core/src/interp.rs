@@ -33,19 +33,32 @@ pub struct CompiledMethod {
     pub method: MethodId,
     pub instructions: Vec<Instruction>,
     /// IL offset to instruction index; branch targets are IL offsets.
-    pub index_of_offset: HashMap<u32, usize>,
+    ///
+    /// A flat table indexed by offset rather than a map: every taken branch
+    /// consults it, and a hash lookup there cost more than the branch itself.
+    /// Offsets that start no instruction hold `u32::MAX`.
+    pub index_of_offset: Vec<u32>,
     pub max_stack: u16,
     pub local_types: Vec<TypeSig>,
     pub exception_clauses: Vec<ExceptionClause>,
     pub init_locals: bool,
     pub arg_count: usize,
+    /// Each local's starting value. It depends only on the local's signature
+    /// and the method's assembly, so it is resolved once here rather than on
+    /// every call.
+    pub local_defaults: Vec<Value>,
+    /// Struct locals of a generic type over the method's own type parameters
+    /// — an async method's state machine, `Pair<T>` — which only the frame can
+    /// zero properly, since their construction depends on the call.
+    pub generic_struct_locals: Vec<(usize, TypeSig)>,
 }
 
 impl CompiledMethod {
     fn index_for(&self, offset: u32) -> ExecResult<usize> {
-        self.index_of_offset.get(&offset).copied().ok_or_else(|| {
-            ExecutionError::InvalidProgram(format!("branch to invalid IL offset {offset:#x}"))
-        })
+        match self.index_of_offset.get(offset as usize) {
+            Some(&i) if i != u32::MAX => Ok(i as usize),
+            _ => Err(ExecutionError::InvalidProgram(format!("branch to invalid IL offset {offset:#x}"))),
+        }
     }
 }
 
@@ -232,13 +245,22 @@ pub struct Interpreter {
     pub limits: Limits,
     pub stats: ExecutionStats,
     natives: HashMap<String, NativeFn>,
+    /// The native bound to each method, by method index, once looked up:
+    /// `Some(None)` records a method with no native.
+    native_cache: Vec<Option<Option<NativeFn>>>,
+    /// Spare frame vectors; see `frame_vec`.
+    vec_pool: Vec<Vec<Value>>,
+    /// One-slot cells a struct constructor ran against, kept for the next
+    /// `newobj` of a value type. Rooted, so the collector leaves them alone.
+    pub(crate) struct_cells: Vec<Handle>,
     /// Optional native code generator. `None` means everything is interpreted.
     pub native_tier: Option<Box<dyn NativeTier>>,
     /// Frame depth below which a `ret` is returning out of the current
     /// invocation rather than into a managed caller. Zero at the top level;
     /// raised while a native method calls back into managed code.
     frame_floor: usize,
-    code_cache: HashMap<MethodId, Arc<CompiledMethod>>,
+    /// Decoded methods by method index.
+    code_cache: Vec<Option<Arc<CompiledMethod>>>,
     /// The starting field values for each type, remembered per type.
     ///
     /// Every instance of a type begins identically, and working that out means
@@ -246,12 +268,16 @@ pub struct Interpreter {
     /// field. Doing it per *allocation* made `alloc` the slowest row in the
     /// benchmark table by a distance; doing it per type makes an allocation one
     /// vector clone.
-    field_defaults: HashMap<TypeId, Vec<Value>>,
+    field_defaults: crate::rowmap::RowMap<Vec<Value>>,
     /// The flattened instance-field list for each type, remembered per type.
     ///
     /// The registry stores each type's *own* fields; this is that list
     /// concatenated base-first, which is what slot numbers are relative to.
     instance_field_cache: HashMap<TypeId, Arc<Vec<FieldId>>>,
+    /// State a native library keeps for itself, by name: compiled regular
+    /// expressions, for one. Native bindings are plain function pointers with
+    /// nowhere else to put a cache that outlives a call.
+    pub native_state: alloc::collections::BTreeMap<&'static str, Box<dyn core::any::Any + Send>>,
     /// The slot each instance field occupies, remembered per field.
     ///
     /// A field's position does not depend on the receiver's runtime type. The
@@ -260,7 +286,7 @@ pub struct Interpreter {
     /// this cacheable by field alone, and what lets a field access skip
     /// reading the object's type at all. That read was a second trip through
     /// the heap's lock for every `ldfld` and `stfld` in the program.
-    field_slots: HashMap<FieldId, usize>,
+    field_slots: crate::rowmap::RowMap<usize>,
     /// How a thread this program starts gets its console.
     ///
     /// `None` means real stdio, which is right for `rustnet run` and wrong for
@@ -345,6 +371,13 @@ pub struct Interpreter {
     /// nests inside the one already running. Each entry is a root until its
     /// dispatch finishes.
     dispatching: Vec<Handle>,
+    /// Values a running native holds only in Rust: its arguments, and what the
+    /// managed code it calls back into returns. A native's arguments are popped
+    /// off the caller's stack before it runs, so without this a collection
+    /// triggered inside a callback (a LINQ predicate that allocates) freed the
+    /// very delegate being called, or results a `Select` had gathered so far.
+    native_roots: Vec<Value>,
+    native_depth: usize,
     /// Whether each constructor provably does nothing, remembered per method.
     ///
     /// [`Loader::constructor_does_nothing`] decodes IL to answer, which is far
@@ -353,7 +386,10 @@ pub struct Interpreter {
     /// than on the loader because a loader is finished before the first
     /// instruction runs and every thread holds its own copy of it; this is
     /// per-interpreter state and belongs with the other per-interpreter caches.
-    trivial_ctors: HashMap<MethodId, bool>,
+    trivial_ctors: crate::rowmap::RowMap<bool>,
+    /// Overrides of virtual generic methods, instantiated per call-site
+    /// type arguments. See `resolve_virtual_target`.
+    virtual_instantiations: HashMap<(MethodId, Vec<TypeId>), MethodId>,
     frames: Vec<Frame>,
     next_frame_id: u32,
     /// `ldstr` results, keyed by assembly index and `#US` offset.
@@ -431,13 +467,19 @@ impl Interpreter {
             limits: Limits::default(),
             stats: ExecutionStats::default(),
             natives: HashMap::new(),
+            native_cache: Vec::new(),
+            vec_pool: Vec::new(),
+            struct_cells: Vec::new(),
             native_tier: None,
             frame_floor: 0,
-            code_cache: HashMap::new(),
-            trivial_ctors: HashMap::new(),
-            field_defaults: HashMap::new(),
-            field_slots: HashMap::new(),
+            code_cache: Vec::new(),
+            trivial_ctors: crate::rowmap::RowMap::new(),
+            virtual_instantiations: HashMap::new(),
+            field_defaults: crate::rowmap::RowMap::new(),
+            field_slots: crate::rowmap::RowMap::new(),
             dispatching: Vec::new(),
+            native_roots: Vec::new(),
+            native_depth: 0,
             board: None,
             canvas: None,
             #[cfg(feature = "std")]
@@ -452,6 +494,7 @@ impl Interpreter {
             stepping: None,
             announced_entry: false,
             instance_field_cache: HashMap::new(),
+            native_state: alloc::collections::BTreeMap::new(),
             frames: Vec::new(),
             next_frame_id: 1,
             literal_cache: HashMap::new(),
@@ -477,6 +520,8 @@ impl Interpreter {
     /// Registers a native implementation under a binding key.
     pub fn register_native(&mut self, key: impl Into<String>, f: NativeFn) {
         self.natives.insert(key.into(), f);
+        // A binding added later can satisfy a method an earlier lookup missed.
+        self.native_cache.clear();
     }
 
     pub fn native_count(&self) -> usize {
@@ -485,6 +530,11 @@ impl Interpreter {
 
     pub fn has_native(&self, key: &str) -> bool {
         self.natives.contains_key(key)
+    }
+
+    /// The native registered under a binding key, to call it directly.
+    pub fn native(&self, key: &str) -> Option<NativeFn> {
+        self.natives.get(key).copied()
     }
 
     /// Every binding key currently registered.
@@ -621,16 +671,17 @@ impl Interpreter {
 
     /// The value each instance field of `type_id` starts at.
     fn field_defaults(&mut self, type_id: TypeId) -> &[Value] {
-        if !self.field_defaults.contains_key(&type_id) {
+        if !self.field_defaults.contains_key(&(type_id.index() as u32)) {
             let fields = self.instance_fields(type_id);
             let mut defaults = Vec::with_capacity(fields.len());
             for field in fields.iter() {
-                let sig = self.loader.registry.field(*field).signature.clone();
-                defaults.push(self.default_value_for(&sig));
+                // A struct-typed field starts as a zeroed struct, not a
+                // placeholder: it is read through before anything assigns it.
+                defaults.push(self.loader.zero_of_field(*field, 0));
             }
-            self.field_defaults.insert(type_id, defaults);
+            self.field_defaults.insert(type_id.index() as u32, defaults);
         }
-        &self.field_defaults[&type_id]
+        &self.field_defaults[&(type_id.index() as u32)]
     }
 
     /// Instance fields of a type, base-first so slots are stable in subclasses.
@@ -666,7 +717,7 @@ impl Interpreter {
     /// `type_id` is the receiver's type when the caller knows it and is only
     /// consulted on a miss — the answer is a property of the field.
     fn field_slot(&mut self, type_id: TypeId, field: FieldId) -> Option<usize> {
-        if let Some(&slot) = self.field_slots.get(&field) {
+        if let Some(&slot) = self.field_slots.get(&(field.index() as u32)) {
             return Some(slot);
         }
         // Resolve against the field's own declaring type rather than the
@@ -684,7 +735,7 @@ impl Interpreter {
             slot = self.slot_within(type_id, field);
         }
         let slot = slot?;
-        self.field_slots.insert(field, slot);
+        self.field_slots.insert(field.index() as u32, slot);
         Some(slot)
     }
 
@@ -906,6 +957,10 @@ impl Interpreter {
             }
         }
         out.extend(self.dispatching.iter().copied());
+        for v in &self.native_roots {
+            v.trace_handles(&mut out);
+        }
+        out.extend(self.struct_cells.iter().copied());
         self.loader.static_roots(&mut out);
         out.extend(self.interned.values().copied());
         out.extend(self.literal_cache.values().copied());
@@ -1310,7 +1365,7 @@ impl Interpreter {
     // -- compilation ---------------------------------------------------------
 
     pub fn compile(&mut self, method: MethodId) -> ExecResult<Arc<CompiledMethod>> {
-        if let Some(c) = self.code_cache.get(&method) {
+        if let Some(Some(c)) = self.code_cache.get(method.index()) {
             return Ok(c.clone());
         }
         let info = self.loader.registry.method(method);
@@ -1322,16 +1377,39 @@ impl Interpreter {
         };
 
         let instructions = decode_all(&body.il)?;
-        let mut index_of_offset = HashMap::new();
+        let end = instructions.last().map(|l| l.next_offset() as usize).unwrap_or(0);
+        let mut index_of_offset = vec![u32::MAX; end + 1];
         for (i, ins) in instructions.iter().enumerate() {
-            index_of_offset.insert(ins.offset, i);
+            index_of_offset[ins.offset as usize] = i as u32;
         }
-        if let Some(last) = instructions.last() {
-            // Branching to the end of the method falls out of it.
-            index_of_offset.insert(last.next_offset(), instructions.len());
-        }
+        // Branching to the end of the method falls out of it.
+        index_of_offset[end] = instructions.len() as u32;
 
+        let assembly = info.assembly;
+        let init_locals = body.init_locals;
+        let local_sigs = body.locals.clone();
+        let local_defaults: Vec<Value> = local_sigs
+            .iter()
+            .map(|t| if init_locals { self.default_local(assembly, t) } else { Value::Null })
+            .collect();
+        let info = self.loader.registry.method(method);
+        let MethodKind::Il(body) = &info.kind else { unreachable!("checked above") };
+        let generic_struct_locals: Vec<(usize, TypeSig)> = if init_locals {
+            local_sigs
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| {
+                    matches!(t.unwrap_modifiers(), TypeSig::GenericInst { is_value_type: true, .. })
+                        && crate::loader::mentions_generic_parameter(t)
+                })
+                .map(|(i, t)| (i, t.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let compiled = Arc::new(CompiledMethod {
+            local_defaults,
+            generic_struct_locals,
             method,
             instructions,
             index_of_offset,
@@ -1341,7 +1419,10 @@ impl Interpreter {
             init_locals: body.init_locals,
             arg_count: info.arg_count(),
         });
-        self.code_cache.insert(method, compiled.clone());
+        if method.index() >= self.code_cache.len() {
+            self.code_cache.resize(method.index() + 1, None);
+        }
+        self.code_cache[method.index()] = Some(compiled.clone());
         Ok(compiled)
     }
 
@@ -1361,6 +1442,43 @@ impl Interpreter {
             Err(e) => Err(e),
         };
         self.frame_floor = previous_floor;
+        self.root_callback_result(&result);
+        result
+    }
+
+    /// A value managed code hands back to a running native lives only in that
+    /// native's Rust locals until it returns, so it is kept as a root until then.
+    fn root_callback_result(&mut self, result: &ExecResult<Option<Value>>) {
+        if self.native_depth > 0 {
+            if let Ok(Some(v)) = result {
+                // Structs carry handles too; tracing ignores what holds none.
+                self.native_roots.push(v.clone());
+            }
+        }
+    }
+
+    /// [`Self::invoke`], with the frame told which generic construction it
+    /// runs for.
+    fn invoke_in_construction(
+        &mut self,
+        method: MethodId,
+        args: Vec<Value>,
+        construction: Option<TypeId>,
+    ) -> ExecResult<Option<Value>> {
+        let base = self.frames.len();
+        let previous_floor = core::mem::replace(&mut self.frame_floor, base);
+        let result = match self.enter(method, args) {
+            Ok(Entered::Native(v)) => Ok(v),
+            Ok(Entered::Frame) => {
+                if construction.is_some() {
+                    self.frame().construction = construction;
+                }
+                self.run_until(base)
+            }
+            Err(e) => Err(e),
+        };
+        self.frame_floor = previous_floor;
+        self.root_callback_result(&result);
         result
     }
 
@@ -1414,8 +1532,9 @@ impl Interpreter {
 
         let kind_is_il = matches!(self.loader.registry.method(method).kind, MethodKind::Il(_));
         if !kind_is_il {
-            let value = self.call_non_il(method, &args)?;
-            return Ok(Entered::Native(value));
+            let value = self.call_non_il(method, &args);
+            self.recycle(args);
+            return Ok(Entered::Native(value?));
         }
 
         // Offer the call to the code generator before building a frame. A
@@ -1432,6 +1551,7 @@ impl Interpreter {
             let loader = &self.loader;
             let interned = &self.interned;
             let literals = &self.literal_cache;
+            let cells = &self.struct_cells;
             let type_objects = &self.type_objects;
             let mut roots = || {
                 let mut out = Vec::new();
@@ -1443,6 +1563,7 @@ impl Interpreter {
                 loader.static_roots(&mut out);
                 out.extend(interned.values().copied());
                 out.extend(literals.values().copied());
+                out.extend(cells.iter().copied());
                 out.extend(type_objects.values().copied());
                 out
             };
@@ -1471,23 +1592,15 @@ impl Interpreter {
         let mut args = args;
         args.resize(code.arg_count.max(args.len()), Value::Null);
 
-        // Value-type locals need their real zero, which means resolving the
-        // local signature against the declaring assembly rather than guessing
-        // from the signature shape alone.
-        let local_types = code.local_types.clone();
-        let locals: Vec<Value> = local_types
-            .iter()
-            .map(|t| {
-                if code.init_locals {
-                    self.default_local(assembly, t)
-                } else {
-                    Value::Null
-                }
-            })
-            .collect();
+        // Value-type locals need their real zero, resolved once per method
+        // when it was compiled.
+        let mut locals = self.frame_vec();
+        locals.extend_from_slice(&code.local_defaults);
+        let stack = self.frame_vec();
 
         let id = self.next_frame_id;
         self.next_frame_id = self.next_frame_id.wrapping_add(1).max(1);
+        let generic_locals = if code.generic_struct_locals.is_empty() { None } else { Some(code.generic_struct_locals.clone()) };
 
         self.frames.push(Frame {
             method,
@@ -1496,7 +1609,7 @@ impl Interpreter {
             code,
             args,
             locals,
-            stack: Vec::with_capacity(8),
+            stack,
             pc: 0,
             pending_finallies: Vec::new(),
             finally_resume: None,
@@ -1508,6 +1621,20 @@ impl Interpreter {
             is_filter: false,
         });
         self.stats.max_frame_depth = self.stats.max_frame_depth.max(self.frames.len());
+        // Zero generic struct locals as the construction this call names, so
+        // a state machine's `MoveNext` can answer `typeof(T)`.
+        if let Some(generic_locals) = generic_locals {
+            for (index, sig) in generic_locals {
+                let Some(t) = self.frame_type_of_sig(&sig) else { continue };
+                if self.loader.registry.ty(t).generic_definition.is_none() {
+                    continue;
+                }
+                let zero = self.zero_of(t);
+                if let Some(slot) = self.frames.last_mut().and_then(|f| f.locals.get_mut(index)) {
+                    *slot = zero;
+                }
+            }
+        }
         if let Some(profiler) = self.profiler.as_mut() {
             profiler.entered(method);
         }
@@ -1525,18 +1652,42 @@ impl Interpreter {
 
     fn call_non_il(&mut self, method: MethodId, args: &[Value]) -> ExecResult<Option<Value>> {
         let info = self.loader.registry.method(method);
-        let qualified = info.qualified_name.clone();
 
         match &info.kind {
             MethodKind::InternalCall | MethodKind::RuntimeProvided | MethodKind::Abstract => {
                 self.stats.native_calls += 1;
-                for key in self.loader.native_keys(method) {
-                    if let Some(f) = self.natives.get(&key).copied() {
+                // The binding for a method never changes once found, so it is
+                // looked up by name once and then by index: building both key
+                // strings and searching a string-keyed table on every call
+                // cost more than most of the natives themselves.
+                let slot = method.index();
+                let cached = match self.native_cache.get(slot).copied().flatten() {
+                    Some(found) => found,
+                    None => {
+                        let found = self
+                            .loader
+                            .native_keys(method)
+                            .into_iter()
+                            .find_map(|key| self.natives.get(&key).copied());
+                        if slot >= self.native_cache.len() {
+                            self.native_cache.resize(slot + 1, None);
+                        }
+                        self.native_cache[slot] = Some(found);
+                        found
+                    }
+                };
+                {
+                    if let Some(f) = cached {
                         let previous = self.current_native.replace(method);
                         let previous_args = core::mem::take(&mut self.pending_type_args);
                         let previous_args =
                             core::mem::replace(&mut self.current_native_type_args, previous_args);
+                        let mark = self.native_roots.len();
+                        self.native_roots.extend(args.iter().cloned());
+                        self.native_depth += 1;
                         let result = f(self, args);
+                        self.native_depth -= 1;
+                        self.native_roots.truncate(mark);
                         self.current_native = previous;
                         self.current_native_type_args = previous_args;
                         return result;
@@ -1547,7 +1698,7 @@ impl Interpreter {
                 if let Some(v) = self.try_runtime_intrinsic(method, args)? {
                     return Ok(v);
                 }
-                Err(ExecutionError::MissingImplementation(qualified))
+                Err(ExecutionError::MissingImplementation(self.loader.registry.method(method).qualified_name.clone()))
             }
             MethodKind::PInvoke { library, entry_point, .. } => {
                 let key = format!("pinvoke:{library}!{entry_point}");
@@ -1609,6 +1760,12 @@ impl Interpreter {
             return Ok(());
         }
         let ty = self.loader.registry.ty(type_id);
+        // An open generic definition is never initialised by itself: each
+        // construction has its own statics and runs the constructor for
+        // them, which `do_call` arranges from the call site.
+        if ty.generic_param_count > 0 && ty.generic_args.is_empty() {
+            return Ok(());
+        }
         match ty.cctor_state {
             CctorState::Done | CctorState::Running => return Ok(()),
             CctorState::Failed => {
@@ -1624,7 +1781,12 @@ impl Interpreter {
         self.loader.registry.ty_mut(type_id).cctor_state = CctorState::Running;
 
         if let Some(cctor) = cctor {
-            match self.invoke(cctor, Vec::new()) {
+            // A generic type's static constructor runs once per construction
+            // and has no receiver, so the frame is told which construction it
+            // is initialising -- otherwise `static int N = typeof(T).Name.Length`
+            // has nothing to read `T` from.
+            let construction = (!self.loader.registry.ty(type_id).generic_args.is_empty()).then_some(type_id);
+            match self.invoke_in_construction(cctor, Vec::new(), construction) {
                 Ok(_) => {}
                 Err(e) => {
                     self.loader.registry.ty_mut(type_id).cctor_state = CctorState::Failed;
@@ -1817,12 +1979,10 @@ impl Interpreter {
 
     fn step(&mut self) -> ExecResult<StepOutcome> {
         let top = self.frames.len() - 1;
-        let (code, pc) = {
-            let f = &self.frames[top];
-            (f.code.clone(), f.pc)
-        };
-
-        let Some(instruction) = code.instructions.get(pc).cloned() else {
+        let pc = self.frames[top].pc;
+        // Borrow the instruction rather than the method: cloning the `Arc`
+        // here was an atomic increment and decrement on every instruction.
+        let Some(instruction) = self.frames[top].code.instructions.get(pc).cloned() else {
             // Falling off the end without `ret` is invalid IL; return void
             // rather than spinning.
             return self.do_return(None);
@@ -1893,24 +2053,53 @@ impl Interpreter {
 
     // -- returning -----------------------------------------------------------
 
+    /// A vector for a frame's arguments, locals or evaluation stack, reused
+    /// from a returned frame when one is spare: a call used to cost three
+    /// allocations before its first instruction ran.
+    #[inline]
+    pub(crate) fn frame_vec(&mut self) -> Vec<Value> {
+        self.vec_pool.pop().unwrap_or_else(|| Vec::with_capacity(8))
+    }
+
+    #[inline]
+    fn recycle(&mut self, mut v: Vec<Value>) {
+        if self.vec_pool.len() < 256 && v.capacity() <= 256 {
+            v.clear();
+            self.vec_pool.push(v);
+        }
+    }
+
     fn do_return(&mut self, value: Option<Value>) -> ExecResult<StepOutcome> {
         let finished = self.frames.pop();
         let below_floor = self.frames.len() <= self.frame_floor;
         // A `.ctor` returns void, but `newobj` must leave the new instance on
         // the caller's stack.
-        let value = value.or_else(|| match finished {
+        let value = value.or_else(|| match &finished {
             Some(frame) => match (frame.pending_newobj, frame.pending_newobj_is_cell) {
                 // A value type was constructed into a temporary cell; hand the
                 // caller the constructed value, not the cell.
-                (Some(cell), true) => self
-                    .heap
-                    .with::<ClrObject, _>(cell, |o| o.fields.first().cloned())
-                    .flatten(),
+                (Some(cell), true) => {
+                    let v = self
+                        .heap
+                        .with_mut::<ClrObject, _>(cell, |o| o.fields.first_mut().map(|f| core::mem::replace(f, Value::Null)))
+                        .flatten();
+                    // Nothing can hold the cell now — C# cannot let `this`
+                    // escape a struct constructor — so it serves the next one.
+                    if self.struct_cells.len() < 64 {
+                        self.struct_cells.push(cell);
+                    }
+                    v
+                }
                 (Some(handle), false) => Some(Value::Obj(handle)),
                 _ => None,
             },
             None => None,
         });
+        if let Some(frame) = finished {
+            self.recycle(frame.args);
+            self.recycle(frame.locals);
+            self.recycle(frame.stack);
+        }
         // Returning to or below the floor hands the value back to whoever
         // started this invocation — the top-level runner, or a native method
         // that called into managed code.

@@ -151,6 +151,11 @@ fn key_not_found(interp: &mut Interpreter, k: &Value) -> ExecutionError {
 pub fn values_equal(interp: &Interpreter, a: &Value, b: &Value) -> bool {
     let a = unbox(interp, a);
     let b = unbox(interp, b);
+    if crate::decimal::is_decimal(interp, &a) || crate::decimal::is_decimal(interp, &b) {
+        return crate::decimal::is_decimal(interp, &a)
+            && crate::decimal::is_decimal(interp, &b)
+            && crate::decimal::decode(&a).cmp(&crate::decimal::decode(&b)).is_eq();
+    }
     match (&a, &b) {
         (Value::Null, Value::Null) => true,
         (Value::Null, _) | (_, Value::Null) => false,
@@ -213,6 +218,9 @@ fn unbox(interp: &Interpreter, v: &Value) -> Value {
 /// as that integer.
 pub fn value_hash(interp: &Interpreter, v: &Value) -> u64 {
     let v = unbox(interp, v);
+    if crate::decimal::is_decimal(interp, &v) {
+        return mix(crate::decimal::decode(&v).hash() as u32 as u64);
+    }
     match &v {
         Value::Null => 0,
         Value::F(f) => {
@@ -252,15 +260,15 @@ fn mix(mut x: u64) -> u64 {
 // -- List<T> -----------------------------------------------------------------
 
 /// Slot 0 of a `List<T>`: the backing array, whose length *is* the count.
-const LIST_ITEMS: usize = 0;
+pub(crate) const LIST_ITEMS: usize = 0;
 
-fn list_items(interp: &Interpreter, this: Handle) -> Handle {
+pub(crate) fn list_items(interp: &Interpreter, this: Handle) -> Handle {
     field_handle(interp, this, LIST_ITEMS)
 }
 
 /// Ensures the receiver has storage, so a `List<T>` reached before its
 /// constructor ran still behaves as an empty list rather than throwing.
-fn ensure_list(interp: &mut Interpreter, this: Handle) -> Handle {
+pub(crate) fn ensure_list(interp: &mut Interpreter, this: Handle) -> Handle {
     let existing = list_items(interp, this);
     if !existing.is_null() {
         return existing;
@@ -440,7 +448,7 @@ fn register_list(interp: &mut Interpreter) {
     });
 }
 
-fn index_of(interp: &Interpreter, array: Handle, item: &Value) -> Option<usize> {
+pub(crate) fn index_of(interp: &Interpreter, array: Handle, item: &Value) -> Option<usize> {
     let values = elements(interp, array);
     values.iter().position(|v| values_equal(interp, v, item))
 }
@@ -507,7 +515,7 @@ fn sort_in_place(interp: &mut Interpreter, array: Handle) -> ExecResult<Option<V
 /// on something .NET does not promise — but the two runtimes can disagree
 /// there, and that is the one place this is not byte-identical by construction.
 /// `OrderBy`, which .NET *does* document as stable, agrees exactly.
-fn merge_sort_by(
+pub(crate) fn merge_sort_by(
     interp: &mut Interpreter,
     values: Vec<Value>,
     compare: &mut dyn FnMut(&mut Interpreter, &Value, &Value) -> ExecResult<core::cmp::Ordering>,
@@ -551,7 +559,7 @@ fn merge_sort_by(
 /// by which overload was called: a `Comparison<T>` is a delegate, and an
 /// `IComparer<T>` is an object with a `Compare` method. Binding by arity means
 /// both arrive at the same native, so the distinction has to be made here.
-fn comparison_from(
+pub(crate) fn comparison_from(
     interp: &mut Interpreter,
     comparer: Value,
 ) -> ExecResult<Box<dyn FnMut(&mut Interpreter, &Value, &Value) -> ExecResult<core::cmp::Ordering>>>
@@ -607,7 +615,7 @@ fn ordering_from(sign: i32) -> core::cmp::Ordering {
 }
 
 /// `List<T>.Sort(comparer)` and `Array.Sort(array, comparer)`.
-fn sort_with_comparer(
+pub(crate) fn sort_with_comparer(
     interp: &mut Interpreter,
     array: Handle,
     comparer: Value,
@@ -636,12 +644,25 @@ pub fn sequence_values(interp: &mut Interpreter, source: &Value) -> Vec<Value> {
     if interp.heap.with::<ClrArray, _>(h, |_| ()).is_some() {
         return elements(interp, h);
     }
+    // A string is a sequence of its UTF-16 code units: `"abc".Select(...)`.
+    if let Some(units) = interp.heap.with::<rustclr_core::ClrString, _>(h, |s| s.units.clone()) {
+        return units.into_iter().map(|u| Value::I32(u as i32)).collect();
+    }
     let Some(type_id) = interp.type_of(h) else { return Vec::new() };
-    let name = interp.loader.registry.ty(type_id).full_name();
+    // A program's own `class Props : Dictionary<string, object>` stores its
+    // entries in the slots its native base laid out, so it reads as that base.
+    let registry = &interp.loader.registry;
+    let native_base = registry.base_chain(type_id).find(|t| {
+        let ty = registry.ty(*t);
+        ty.namespace == GENERIC && matches!(ty.name.as_str(), "List`1" | "Queue`1" | "Stack`1" | "HashSet`1" | "Dictionary`2")
+    });
+    let name = registry.ty(native_base.unwrap_or(type_id)).full_name();
     match name.rsplit_once('.').map(|(_, n)| n).unwrap_or(&name) {
         "List`1" | "Queue`1" | "Stack`1" => elements(interp, field_handle(interp, h, 0)),
         "HashSet`1" => elements(interp, field_handle(interp, h, HASHSET_ITEMS)),
         "Grouping`2" => elements(interp, field_handle(interp, h, 1)),
+        // `System.Text.RegularExpressions`: an array of matches or groups.
+        "MatchCollection" | "GroupCollection" => elements(interp, field_handle(interp, h, 0)),
         "Dictionary`2" => {
             let keys = elements(interp, field_handle(interp, h, DICT_KEYS));
             let values = elements(interp, field_handle(interp, h, DICT_VALUES));
@@ -651,6 +672,9 @@ pub fn sequence_values(interp: &mut Interpreter, source: &Value) -> Vec<Value> {
                 .collect()
         }
         "OrderedEnumerable`1" => crate::linq::ordered_values(interp, h),
+        // .NET 9 binds `params` to `ReadOnlySpan<T>` overloads, so
+        // `Task.WhenAll(a, b)` and `string.Join(",", x, y)` arrive as one.
+        "Span`1" | "ReadOnlySpan`1" => crate::spans::values(interp, source).unwrap_or_default(),
         _ => drive_enumerator(interp, h).unwrap_or_default(),
     }
 }
@@ -694,7 +718,7 @@ const ENUMERATION_LIMIT: usize = 100_000_000;
 /// `System.Collections.Generic.IEnumerator<int>.get_Current` — so the match is
 /// on the final segment too. Every `yield return` state machine looks like
 /// that, and matching only the bare name would miss all of them.
-fn find_member(
+pub(crate) fn find_member(
     interp: &mut Interpreter,
     type_id: TypeId,
     name: &str,
@@ -937,7 +961,7 @@ pub(crate) fn dictionary_set(interp: &mut Interpreter, this: Handle, k: Value, v
 }
 
 /// Installs empty bucket, chain and entry arrays on a hash-backed collection.
-fn reset_table(
+pub(crate) fn reset_table(
     interp: &mut Interpreter,
     this: Handle,
     buckets_slot: usize,
@@ -982,6 +1006,17 @@ fn push_int(interp: &mut Interpreter, array: Handle, value: i32) {
 }
 
 /// Finds the entry index for `k`, or `None`.
+/// Whether a dictionary holds `k`.
+pub(crate) fn dict_contains(interp: &mut Interpreter, this: Handle, k: &Value) -> bool {
+    dict_find(interp, this, k).is_some()
+}
+
+/// The value stored under `k`, if any.
+pub(crate) fn dict_get(interp: &mut Interpreter, this: Handle, k: &Value) -> Option<Value> {
+    let index = dict_find(interp, this, k)?;
+    element_at(interp, field_handle(interp, this, DICT_VALUES), index)
+}
+
 fn dict_find(interp: &mut Interpreter, this: Handle, k: &Value) -> Option<usize> {
     table_find(interp, this, DICT_BUCKETS, DICT_NEXT, DICT_KEYS, k)
 }
@@ -1029,7 +1064,7 @@ fn dict_insert(interp: &mut Interpreter, this: Handle, k: Value, v: Value) {
 
 /// Appends `k` to the key array and links it into the bucket table, growing
 /// the table when the load factor passes one.
-fn table_insert(
+pub(crate) fn table_insert(
     interp: &mut Interpreter,
     this: Handle,
     buckets_slot: usize,
@@ -1082,9 +1117,9 @@ fn rehash(
 
 // -- HashSet<T> --------------------------------------------------------------
 
-const HASHSET_BUCKETS: usize = 0;
-const HASHSET_NEXT: usize = 1;
-const HASHSET_ITEMS: usize = 2;
+pub(crate) const HASHSET_BUCKETS: usize = 0;
+pub(crate) const HASHSET_NEXT: usize = 1;
+pub(crate) const HASHSET_ITEMS: usize = 2;
 
 fn register_hash_set(interp: &mut Interpreter) {
     for ctor in [".ctor()", ".ctor(int)", ".ctor/0", ".ctor/1"] {
@@ -1152,7 +1187,7 @@ fn register_hash_set(interp: &mut Interpreter) {
     });
 }
 
-fn set_find(interp: &mut Interpreter, this: Handle, item: &Value) -> Option<usize> {
+pub(crate) fn set_find(interp: &mut Interpreter, this: Handle, item: &Value) -> Option<usize> {
     table_find(interp, this, HASHSET_BUCKETS, HASHSET_NEXT, HASHSET_ITEMS, item)
 }
 
@@ -1439,10 +1474,58 @@ fn register_enumerators(interp: &mut Interpreter) {
     register_enumerator_tail(interp, "Dictionary`2+Enumerator");
 }
 
+/// `value` as it must look where the signature says `object`: a primitive or a
+/// struct boxed, a reference left alone.
+///
+/// Compiled code boxes with an explicit `box` before handing a value type to
+/// an `object` slot, but natives that answer an `object`-returning member —
+/// the non-generic `IEnumerator.Current`, `PropertyInfo.GetValue` — hold the
+/// bare value. Left unboxed, `o is double d` and `case int i` see no type at
+/// all and fail. `hint` names the value's type when the caller knows it; a
+/// bare 32-bit integer is otherwise taken to be an `int`.
+pub(crate) fn box_for_object(interp: &mut Interpreter, value: Value, hint: Option<TypeId>) -> Value {
+    let registry = &interp.loader.registry;
+    let hint = hint.filter(|t| t.is_valid() && registry.ty(*t).kind.is_value_like());
+    let named = |name: &str| registry.find_type_by_name(name);
+    let type_id = match &value {
+        Value::Struct(s) => {
+            // A boxed `T?` is the boxed `T`, or null.
+            if registry.ty(s.type_id).full_name() == "System.Nullable`1" {
+                return match s.fields.first().and_then(Value::as_i32) {
+                    Some(0) | None => Value::Null,
+                    _ => {
+                        let inner = s.fields.get(1).cloned().unwrap_or(Value::Null);
+                        box_for_object(interp, inner, None)
+                    }
+                };
+            }
+            Some(s.type_id)
+        }
+        Value::I32(_) => hint.or_else(|| named("System.Int32")),
+        Value::I64(_) => hint.or_else(|| named("System.Int64")),
+        Value::F(_) => hint.or_else(|| named("System.Double")),
+        Value::NativeInt(_) => hint.or_else(|| named("System.IntPtr")),
+        _ => None,
+    };
+    match type_id {
+        Some(t) => Value::Obj(interp.box_value(t, value)),
+        None => value,
+    }
+}
+
 fn register_enumerator_tail(interp: &mut Interpreter, type_name: &str) {
     interp.register_native(key(type_name, "get_Current()"), |i, a| {
         let this = receiver(i, a)?;
         Ok(Some(field(i, this, ENUM_CURRENT)))
+    });
+    // The non-generic `IEnumerator.Current` returns `object`, so a value type
+    // comes out boxed — typed by the array it was read from, when it was.
+    interp.register_native(key(type_name, "System.Collections.IEnumerator.get_Current()"), |i, a| {
+        let this = receiver(i, a)?;
+        let current = field(i, this, ENUM_CURRENT);
+        let source = field_handle(i, this, ENUM_SOURCE);
+        let element = i.heap.with::<ClrArray, _>(source, |arr| arr.element_type);
+        Ok(Some(box_for_object(i, current, element)))
     });
     interp.register_native(key(type_name, "Reset()"), |i, a| {
         let this = receiver(i, a)?;
@@ -1523,7 +1606,7 @@ fn default_comparer(interp: &mut Interpreter, type_name: &str) -> Value {
 /// generated `Equals`, not by reference. Structural comparison alone would
 /// report two equal nested records as different, so a managed override is
 /// called when the receiver declares one.
-fn equals_dispatch(interp: &mut Interpreter, x: &Value, y: &Value) -> ExecResult<bool> {
+pub(crate) fn equals_dispatch(interp: &mut Interpreter, x: &Value, y: &Value) -> ExecResult<bool> {
     if let Value::Obj(h) = x {
         if !h.is_null() && interp.heap.with::<ClrString, _>(*h, |_| ()).is_none() {
             if let Some(type_id) = interp.type_of(*h) {
@@ -1555,7 +1638,11 @@ fn find_equals(interp: &Interpreter, type_id: TypeId) -> Option<MethodId> {
 
 /// Ordering for `Comparer<T>.Default`: numeric for numbers, ordinal for
 /// strings. Anything else is refused rather than ordered arbitrarily.
-fn compare_values(interp: &mut Interpreter, x: &Value, y: &Value) -> ExecResult<i32> {
+pub(crate) fn compare_values(interp: &mut Interpreter, x: &Value, y: &Value) -> ExecResult<i32> {
+    if crate::decimal::is_decimal(interp, x) || crate::decimal::is_decimal(interp, y) {
+        let (a, b) = (crate::decimal::to_dec(interp, x)?, crate::decimal::to_dec(interp, y)?);
+        return Ok(a.cmp(&b) as i32);
+    }
     if let (Some(a), Some(b)) = (as_number(x), as_number(y)) {
         return Ok(match a.partial_cmp(&b) {
             Some(core::cmp::Ordering::Less) => -1,

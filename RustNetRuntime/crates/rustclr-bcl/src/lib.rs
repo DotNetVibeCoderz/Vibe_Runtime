@@ -117,6 +117,8 @@ pub(crate) mod fmath {
 }
 
 pub mod collections;
+pub mod format;
+pub mod extras;
 pub mod graphics;
 pub mod media;
 pub mod net;
@@ -130,11 +132,15 @@ pub mod marshal;
 pub mod numerics;
 pub mod ranges;
 pub mod reflection;
+pub mod decimal;
+pub mod regex;
+pub mod regex_engine;
 pub mod runtime;
 pub mod spans;
 pub mod strings;
 pub mod tasks;
 pub mod threading;
+pub mod cancellation;
 pub mod support;
 
 use rustclr_core::Interpreter;
@@ -162,6 +168,13 @@ pub fn install(interp: &mut Interpreter) {
     security::register(interp);
     graphics::register(interp);
     media::register(interp);
+    regex::register(interp);
+    // Last, so its corrections replace the older bindings with the same key.
+    extras::register(interp);
+    extras::register_surrogates(interp);
+    cancellation::register(interp);
+    // After extras: its `Math.Round/2` and friends dispatch decimal and double.
+    decimal::register(interp);
     #[cfg(feature = "std")]
     net::register(interp);
     // On a board there are no sockets, but there may well be a radio, and

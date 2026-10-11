@@ -115,10 +115,21 @@ fn register_convert(interp: &mut Interpreter) {
     interp.register_native("System.Convert::ToInt32(double)", |i, a| {
         Ok(Some(Value::I32(round_half_even(arg_f64(i, a, 0)?, 0) as i32)))
     });
+    // A boxed number (an enum among them) converts by value; only text is
+    // parsed. Formatting first turned a boxed enum into its *name*.
     interp.register_native("System.Convert::ToInt32(object)", |i, a| {
         let v = arg(i, a, 0)?;
-        let text = display(i, &v);
-        parse_i32(&text).map(|v| Some(Value::I32(v)))
+        let v = crate::extras::unbox_value(i, &v);
+        match v {
+            Value::Null => Ok(Some(Value::I32(0))),
+            Value::I32(n) => Ok(Some(Value::I32(n))),
+            Value::I64(n) => Ok(Some(Value::I32(n as i32))),
+            Value::F(x) => Ok(Some(Value::I32(round_half_even(x, 0) as i32))),
+            other => {
+                let text = display(i, &other);
+                parse_i32(&text).map(|v| Some(Value::I32(v)))
+            }
+        }
     });
     interp.register_native("System.Convert::ToInt64(string)", |i, a| {
         let s = arg_string_or_empty(i, a, 0)?;

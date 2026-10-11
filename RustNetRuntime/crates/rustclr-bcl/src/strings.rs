@@ -8,11 +8,18 @@ use rustclr_gc::Handle;
 use crate::prelude::*;
 
 pub fn register(interp: &mut Interpreter) {
+    register_empty(interp);
     register_encoding(interp);
     // -- String --------------------------------------------------------------
+    // Length and indexing read the stored UTF-16 units in place. Converting the
+    // whole string per call made `for (i = 0; i < s.Length; i++) s[i]`
+    // quadratic: a 90 KB JSON parse took a minute.
     interp.register_native("System.String::get_Length()", |i, a| {
-        let s = arg_string_or_empty(i, a, 0)?;
-        Ok(Some(Value::I32(s.encode_utf16().count() as i32)))
+        let len = match arg(i, a, 0)? {
+            Value::Obj(h) if !h.is_null() => i.heap.with::<ClrString, _>(h, |s| s.units.len()).unwrap_or(0),
+            _ => return Err(rustclr_core::ExecutionError::null_reference()),
+        };
+        Ok(Some(Value::I32(len as i32)))
     });
 
     interp.register_native("System.String::get_Chars(int)", |i, a| {
@@ -85,25 +92,51 @@ pub fn register(interp: &mut Interpreter) {
         // `ReadOnlySpan<string>` window (.NET 9 and later), a `string[]`, or a
         // single value. A span is a window rather than an array, so it is read
         // through `spans`, which owns that layout.
+        // `Concat<T>(IEnumerable<T>)` and `Concat(IEnumerable<string>)` reach
+        // here too, with a list or a LINQ result: those are enumerated, and a
+        // `char` element is a character, not its code.
+        let element = i
+            .current_native_method()
+            .and_then(|m| i.loader.registry.method(m).generic_args.first().copied())
+            .map(|t| i.loader.registry.ty(t).full_name());
+        let takes_sequence = element.is_some()
+            || i.current_native_method().is_some_and(|m| {
+                matches!(
+                    i.loader.registry.method(m).signature.params.first().map(|p| p.unwrap_modifiers()),
+                    Some(rustclr_core::metadata::TypeSig::GenericInst { .. })
+                )
+            });
         let parts = crate::spans::window_values(i, value.clone())
             .or_else(|| match &value {
                 Value::Obj(h) if !h.is_null() => {
                     let values = array_values(i, *h);
-                    if values.is_empty() { None } else { Some(values) }
+                    if !values.is_empty() {
+                        Some(values)
+                    } else if takes_sequence {
+                        Some(crate::collections::sequence_values(i, &value))
+                    } else {
+                        None
+                    }
                 }
                 _ => None,
             });
-        let out = match parts {
+        let as_chars = element.as_deref() == Some("System.Char");
+        // Code units throughout, so a surrogate pair split across two chars
+        // joins back into one character.
+        let units: Vec<u16> = match parts {
             Some(values) => {
-                let mut out = String::new();
+                let mut out = Vec::new();
                 for part in values {
-                    out.push_str(&display(i, &part));
+                    match (&part, as_chars) {
+                        (Value::I32(code), true) => out.push(*code as u16),
+                        _ => out.extend(display(i, &part).encode_utf16()),
+                    }
                 }
                 out
             }
-            None => display(i, &value),
+            None => display(i, &value).encode_utf16().collect(),
         };
-        Ok(Some(string_value(i, &out)))
+        Ok(Some(Value::Obj(i.alloc_clr_string(rustclr_core::ClrString { units }))))
     });
 
     interp.register_native("System.String::Concat(object[])", |i, a| {
@@ -116,26 +149,30 @@ pub fn register(interp: &mut Interpreter) {
         Ok(Some(string_value(i, &out)))
     });
 
+    // Substrings copy only the slice they return.
     interp.register_native("System.String::Substring(int)", |i, a| {
-        let s = arg_string_or_empty(i, a, 0)?;
+        let h = arg_handle(i, a, 0)?;
         let start = arg_i32(i, a, 1)?;
-        let units: Vec<u16> = s.encode_utf16().collect();
-        if start < 0 || start as usize > units.len() {
-            return Err(out_of_range("startIndex"));
+        let slice = i.heap.with::<ClrString, _>(h, |s| {
+            (start >= 0 && start as usize <= s.units.len()).then(|| s.units[start as usize..].to_vec())
+        });
+        match slice.flatten() {
+            Some(units) => Ok(Some(Value::Obj(i.alloc_clr_string(ClrString { units })))),
+            None => Err(out_of_range("startIndex")),
         }
-        let out = String::from_utf16_lossy(&units[start as usize..]);
-        Ok(Some(string_value(i, &out)))
     });
     interp.register_native("System.String::Substring(int,int)", |i, a| {
-        let s = arg_string_or_empty(i, a, 0)?;
+        let h = arg_handle(i, a, 0)?;
         let start = arg_i32(i, a, 1)?;
         let len = arg_i32(i, a, 2)?;
-        let units: Vec<u16> = s.encode_utf16().collect();
-        if start < 0 || len < 0 || (start as usize).saturating_add(len as usize) > units.len() {
-            return Err(out_of_range("length"));
+        let slice = i.heap.with::<ClrString, _>(h, |s| {
+            let ok = start >= 0 && len >= 0 && (start as usize).saturating_add(len as usize) <= s.units.len();
+            ok.then(|| s.units[start as usize..start as usize + len as usize].to_vec())
+        });
+        match slice.flatten() {
+            Some(units) => Ok(Some(Value::Obj(i.alloc_clr_string(ClrString { units })))),
+            None => Err(out_of_range("length")),
         }
-        let out = String::from_utf16_lossy(&units[start as usize..start as usize + len as usize]);
-        Ok(Some(string_value(i, &out)))
     });
 
     interp.register_native("System.String::IndexOf(string)", |i, a| {
@@ -346,9 +383,13 @@ pub fn register(interp: &mut Interpreter) {
     });
 
     // -- Char ------------------------------------------------------------------
+    // Built from the code unit, not through a Rust `char`: half of a
+    // surrogate pair is a valid .NET string of length 1, and dropping it
+    // loses emoji whenever text is rebuilt one char at a time.
     interp.register_native("System.Char::ToString()", |i, a| {
         let c = arg_i32(i, a, 0)?;
-        Ok(Some(string_value(i, &char_from(c))))
+        let units = vec![c as u16];
+        Ok(Some(Value::Obj(i.alloc_clr_string(rustclr_core::ClrString { units }))))
     });
     interp.register_native("System.Char::IsDigit(char)", |i, a| {
         let c = arg_i32(i, a, 0)?;
@@ -495,9 +536,15 @@ fn register_string_builder(interp: &mut Interpreter) {
         Ok(None)
     });
 
+    // Copied as code units, so half of a surrogate pair is not lost.
     interp.register_native("System.Text.StringBuilder::Append(string)", |i, a| {
-        let addition = arg_string_or_empty(i, a, 1)?;
-        append_builder(i, a, &addition)
+        let this = builder_handle(i, a)?;
+        let units = match arg(i, a, 1)? {
+            Value::Obj(h) if !h.is_null() => i.heap.with::<ClrString, _>(h, |s| s.units.clone()).unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        builder_append_units(i, this, &units);
+        Ok(Some(Value::Obj(this)))
     });
     interp.register_native("System.Text.StringBuilder::Append(object)", |i, a| {
         let v = arg(i, a, 1)?;
@@ -508,9 +555,13 @@ fn register_string_builder(interp: &mut Interpreter) {
         let v = arg_i32(i, a, 1)?;
         append_builder(i, a, &v.to_string())
     });
+    // The code unit goes in as is, so a surrogate pair appended one half at a
+    // time arrives whole.
     interp.register_native("System.Text.StringBuilder::Append(char)", |i, a| {
         let v = arg_i32(i, a, 1)?;
-        append_builder(i, a, &char_from(v))
+        let this = builder_handle(i, a)?;
+        builder_append_units(i, this, &[v as u16]);
+        Ok(Some(Value::Obj(this)))
     });
     interp.register_native("System.Text.StringBuilder::AppendLine(string)", |i, a| {
         let addition = arg_string_or_empty(i, a, 1)?;
@@ -524,8 +575,8 @@ fn register_string_builder(interp: &mut Interpreter) {
         Ok(Some(string_value(i, &current)))
     });
     interp.register_native("System.Text.StringBuilder::get_Length()", |i, a| {
-        let current = get_builder(i, a)?;
-        Ok(Some(Value::I32(current.encode_utf16().count() as i32)))
+        let this = builder_handle(i, a)?;
+        Ok(Some(Value::I32(builder_len(i, this) as i32)))
     });
     interp.register_native("System.Text.StringBuilder::Clear()", |i, a| {
         set_builder(i, a, String::new())?;
@@ -566,12 +617,48 @@ fn append_builder(
     args: &[Value],
     addition: &str,
 ) -> ExecResult<Option<Value>> {
-    let mut current = get_builder(interp, args)?;
-    current.push_str(addition);
-    set_builder(interp, args, current)?;
-    // `Append` returns the builder so calls can chain.
     let this = builder_handle(interp, args)?;
+    builder_append(interp, this, addition);
+    // `Append` returns the builder so calls can chain.
     Ok(Some(Value::Obj(this)))
+}
+
+/// Appends to a builder's text in place.
+///
+/// A builder's backing string is its own — `ToString` hands out a copy and
+/// nothing else can reach it — so growing it in place is safe, and makes an
+/// append amortised constant time. Reading the whole text, appending and
+/// allocating a fresh string on every call made building a string quadratic:
+/// a few thousand appends took seconds.
+pub(crate) fn builder_append(interp: &mut Interpreter, this: Handle, addition: &str) {
+    let units: Vec<u16> = addition.encode_utf16().collect();
+    builder_append_units(interp, this, &units);
+}
+
+/// [`builder_append`] for raw UTF-16 code units.
+pub(crate) fn builder_append_units(interp: &mut Interpreter, this: Handle, addition: &[u16]) {
+    let inner = interp.heap.with::<ClrObject, _>(this, |o| o.fields.first().cloned()).flatten();
+    if let Some(Value::Obj(h)) = inner {
+        if !h.is_null() && interp.heap.with_mut::<ClrString, _>(h, |s| s.units.extend_from_slice(addition)).is_some() {
+            return;
+        }
+    }
+    let handle = interp.alloc_clr_string(ClrString { units: addition.to_vec() });
+    interp.heap.with_mut::<ClrObject, _>(this, |o| {
+        if o.fields.is_empty() {
+            o.fields.push(Value::Obj(handle));
+        } else {
+            o.fields[0] = Value::Obj(handle);
+        }
+    });
+}
+
+/// The builder's length in UTF-16 code units, without copying its text.
+pub(crate) fn builder_len(interp: &mut Interpreter, this: Handle) -> usize {
+    match interp.heap.with::<ClrObject, _>(this, |o| o.fields.first().cloned()).flatten() {
+        Some(Value::Obj(h)) if !h.is_null() => interp.heap.with::<ClrString, _>(h, |s| s.units.len()).unwrap_or(0),
+        _ => 0,
+    }
 }
 
 // -- helpers ----------------------------------------------------------------
@@ -667,6 +754,42 @@ pub fn format_composite(format: &str, args: &[String]) -> String {
         }
     }
     out
+}
+
+
+/// `string.Empty` is a static field. Its value is made by a native class
+/// constructor on first use, because the loader that declares the slot has no
+/// heap to allocate the empty string in.
+fn register_empty(interp: &mut Interpreter) {
+    let string = interp.loader.core().string;
+    let signature = rustclr_core::metadata::MethodSig {
+        calling_convention: 0,
+        has_this: false,
+        explicit_this: false,
+        generic_param_count: 0,
+        return_type: rustclr_core::metadata::TypeSig::Void,
+        params: Vec::new(),
+        sentinel_at: None,
+    };
+    let cctor = interp.loader.intern_internal_call(string, ".cctor", signature, "System.String::.cctor()".into());
+    interp.loader.registry.ty_mut(string).cctor = Some(cctor);
+    interp.loader.registry.ty_mut(string).cctor_state = rustclr_core::CctorState::NotRun;
+    interp.register_native("System.String::.cctor()", |i, _| {
+        let string = i.loader.core().string;
+        let field = i
+            .loader
+            .registry
+            .ty(string)
+            .static_fields
+            .iter()
+            .copied()
+            .find(|f| i.loader.registry.field(*f).name == "Empty");
+        if let Some(field) = field {
+            let empty = i.alloc_string("");
+            i.loader.set_static(field, Value::Obj(empty));
+        }
+        Ok(None)
+    });
 }
 
 #[cfg(test)]
@@ -912,9 +1035,8 @@ fn register_encoding(interp: &mut Interpreter) {
         Ok(Some(Value::Obj(array)))
     });
 
-    interp.register_native("System.Text.Encoding::GetString(byte[])", |i, a| {
-        let bytes = arg_bytes(i, a, 1)?;
-        let text = if code_page_of(i, a) == ASCII {
+    fn decode(interp: &mut Interpreter, args: &[Value], bytes: &[u8]) -> Value {
+        let text = if code_page_of(interp, args) == ASCII {
             bytes
                 .iter()
                 .map(|b| if *b < 0x80 { *b as char } else { '?' })
@@ -924,9 +1046,27 @@ fn register_encoding(interp: &mut Interpreter) {
             // becomes U+FFFD rather than throwing. `Encoding.UTF8` with
             // `throwOnInvalidBytes` is the strict one, and it is not offered
             // here rather than being offered and quietly behaving like this.
-            String::from_utf8_lossy(&bytes).into_owned()
+            String::from_utf8_lossy(bytes).into_owned()
         };
-        Ok(Some(string_value(i, &text)))
+        string_value(interp, &text)
+    }
+
+    interp.register_native("System.Text.Encoding::GetString(byte[])", |i, a| {
+        let bytes = arg_bytes(i, a, 1)?;
+        Ok(Some(decode(i, a, &bytes)))
+    });
+    // A slice of a buffer: what a protocol reader decodes a field with.
+    interp.register_native("System.Text.Encoding::GetString(byte[],int,int)", |i, a| {
+        let bytes = arg_bytes(i, a, 1)?;
+        let (start, count) = (arg_i32(i, a, 2)?, arg_i32(i, a, 3)?);
+        if start < 0 || count < 0 || start as usize + count as usize > bytes.len() {
+            return Err(ExecutionError::exception(
+                rustclr_core::ClrExceptionKind::ArgumentOutOfRange,
+                "Index and count must refer to a location within the buffer.",
+            ));
+        }
+        let slice = &bytes[start as usize..start as usize + count as usize];
+        Ok(Some(decode(i, a, slice)))
     });
 
     interp.register_native("System.Text.Encoding::GetByteCount(string)", |i, a| {

@@ -11,6 +11,7 @@
 //! working without CoreLib: the *contract* is unchanged, the implementation is
 //! Rust.
 
+use crate::rowmap::RowMap;
 use crate::error::{ExecResult, ExecutionError};
 use crate::statics::SharedStatics;
 use rustclr_gc::Handle;
@@ -68,17 +69,17 @@ pub struct LoadedAssembly {
     /// Copy of the `#US` heap, so `ldstr` needs no live metadata borrow.
     pub user_strings: Vec<u8>,
     /// `TypeDef` row to registry id.
-    pub type_by_row: HashMap<u32, TypeId>,
+    pub type_by_row: RowMap<TypeId>,
     /// `MethodDef` row to registry id.
-    pub method_by_row: HashMap<u32, MethodId>,
+    pub method_by_row: RowMap<MethodId>,
     /// `Field` row to registry id.
-    pub field_by_row: HashMap<u32, FieldId>,
+    pub field_by_row: RowMap<FieldId>,
     /// Resolved `TypeRef` rows.
-    pub type_ref_by_row: HashMap<u32, TypeId>,
+    pub type_ref_by_row: RowMap<TypeId>,
     /// Resolved `MemberRef` rows.
-    pub member_ref_by_row: HashMap<u32, MethodId>,
+    pub member_ref_by_row: RowMap<MethodId>,
     /// `Property` table row to registry id.
-    pub property_by_row: HashMap<u32, PropertyId>,
+    pub property_by_row: RowMap<PropertyId>,
     /// `StandAloneSig` rows that parse as *method* signatures.
     ///
     /// That table holds two unrelated things: the local-variable signature of
@@ -87,10 +88,14 @@ pub struct LoadedAssembly {
     /// and would misparse as a method signature.
     pub call_sites: HashMap<u32, MethodSig>,
     /// `MemberRef` rows that name a field rather than a method.
-    pub field_ref_by_row: HashMap<u32, FieldId>,
+    pub field_ref_by_row: RowMap<FieldId>,
     /// Resolved `MethodSpec` rows — a generic instantiation mapped to the open
     /// definition, because this build erases generics.
-    pub method_spec_by_row: HashMap<u32, MethodId>,
+    pub method_spec_by_row: RowMap<MethodId>,
+    /// `MethodSpec` rows whose type arguments name the caller's own type
+    /// parameters — `Store<T>()` called from inside `Set<T>()` — with the open
+    /// method and the argument signatures. The frame resolves these per call.
+    pub method_spec_open: RowMap<(MethodId, Vec<TypeSig>)>,
     /// `MemberRef` rows that could not be resolved, mapped to `Type::Member`.
     ///
     /// These never become methods, so nothing downstream can see them — which
@@ -113,7 +118,7 @@ pub struct LoadedAssembly {
     /// table is the only thing that records the link.
     pub method_impls: HashMap<(TypeId, MethodId), MethodId>,
     /// Signature blobs of `TypeSpec` rows, kept for generic instantiation.
-    pub type_specs: HashMap<u32, TypeSig>,
+    pub type_specs: RowMap<TypeSig>,
     /// `TypeSpec` rows that name a closed construction of a generic type
     /// declared in this assembly, mapped to the type built for it.
     ///
@@ -128,7 +133,16 @@ pub struct LoadedAssembly {
     /// body serves every construction — so the method alone cannot say which
     /// construction was named. `newobj Box<int>::.ctor()` needs that, or the
     /// instance it builds is a `Box<T>` and its `T` is unknowable.
-    pub member_ref_owner: HashMap<u32, TypeId>,
+    pub member_ref_owner: RowMap<TypeId>,
+    /// `MemberRef` rows whose declaring `TypeSpec` names a type parameter of
+    /// the code that uses it — `new ComponentStore<T>()` inside a generic
+    /// method — keyed to that `TypeSpec`. No load-time construction can be
+    /// right for these; the executing frame supplies the arguments.
+    pub member_ref_open_class: RowMap<Token>,
+    /// `MemberRef` rows whose owner is a multi-dimensional array type
+    /// (`int[,]`): the element type and the rank. Their `.ctor`, `Get`, `Set`
+    /// and `Address` are provided by the interpreter, as on CoreCLR.
+    pub md_array_refs: RowMap<(TypeId, u32)>,
     /// Type arguments the `TypeSpec` behind a member reference names.
     ///
     /// Separate from `member_ref_owner`, and populated for *framework*
@@ -138,7 +152,7 @@ pub struct LoadedAssembly {
     /// still spells its arguments out, and some implementations need them.
     /// `new Span<int>(ptr, 4)` is the case that forced this: the element width
     /// lives in `T` and nowhere else.
-    pub member_ref_type_args: HashMap<u32, Vec<TypeId>>,
+    pub member_ref_type_args: RowMap<Vec<TypeId>>,
     /// Initial data for fields with an RVA (array initialisers).
     pub field_data: HashMap<u32, Vec<u8>>,
     /// Entry point token, if this assembly is executable.
@@ -205,6 +219,8 @@ pub struct Loader {
     /// One runtime type per closed construction, keyed by definition and
     /// arguments, so `Box<int>` named twice is one type.
     generic_constructions: HashMap<(TypeId, Vec<TypeId>), TypeId>,
+    /// `T[]` as reflection names it, one per element type. See `array_type_of`.
+    array_types: HashMap<TypeId, TypeId>,
 }
 
 impl Loader {
@@ -236,6 +252,7 @@ impl Loader {
             statics: SharedStatics::default(),
             interned_calls: HashMap::new(),
             generic_constructions: HashMap::new(),
+            array_types: HashMap::new(),
         };
         loader.install_core_types();
         loader
@@ -379,22 +396,25 @@ impl Loader {
             #[cfg(feature = "std")]
             path: None,
             user_strings: Vec::new(),
-            type_by_row: HashMap::new(),
-            method_by_row: HashMap::new(),
-            field_by_row: HashMap::new(),
-            type_ref_by_row: HashMap::new(),
-            member_ref_by_row: HashMap::new(),
-            property_by_row: HashMap::new(),
+            type_by_row: RowMap::new(),
+            method_by_row: RowMap::new(),
+            field_by_row: RowMap::new(),
+            type_ref_by_row: RowMap::new(),
+            member_ref_by_row: RowMap::new(),
+            property_by_row: RowMap::new(),
             call_sites: HashMap::new(),
-            field_ref_by_row: HashMap::new(),
-            method_spec_by_row: HashMap::new(),
+            field_ref_by_row: RowMap::new(),
+            method_spec_by_row: RowMap::new(),
+            method_spec_open: RowMap::new(),
             unresolved_members: HashMap::new(),
             method_impls: HashMap::new(),
             attributes: HashMap::new(),
-            type_specs: HashMap::new(),
+            type_specs: RowMap::new(),
             generic_instances: HashMap::new(),
-            member_ref_owner: HashMap::new(),
-            member_ref_type_args: HashMap::new(),
+            member_ref_owner: RowMap::new(),
+            member_ref_open_class: RowMap::new(),
+            md_array_refs: RowMap::new(),
+            member_ref_type_args: RowMap::new(),
             field_data: HashMap::new(),
             entry_point: None,
             references: Vec::new(),
@@ -418,6 +438,8 @@ impl Loader {
             self.add_native_type("System", "Enum", TypeKind::Class, Some(value_type), synth());
         let string =
             self.add_native_type("System", "String", TypeKind::String, Some(object), synth());
+        // `string.Empty`: a static slot RustBCL fills from a native class constructor.
+        self.add_native_static_field(string, "Empty", synth());
         let array =
             self.add_native_type("System", "Array", TypeKind::Class, Some(object), synth());
         let void =
@@ -431,8 +453,20 @@ impl Loader {
             Some(delegate),
             synth(),
         );
-        let exception =
-            self.add_native_type("System", "Exception", TypeKind::Class, Some(object), synth());
+        // The message is a real slot, so a program's own exception type lays
+        // its fields out after it. Without the slot, the message and the
+        // subclass's first field shared slot 0, and `e.Message` read back
+        // whatever the constructor assigned last — an int, an empty string.
+        let bcl = self.bcl;
+        let exception = self.add_native_type_with_fields_of_kind(
+            "System",
+            "Exception",
+            TypeKind::Class,
+            Some(object),
+            synth(),
+            &["_message"],
+            bcl,
+        );
         let type_handle = self.add_native_type(
             "System",
             "RuntimeTypeHandle",
@@ -572,6 +606,8 @@ impl Loader {
             ("System.Threading", "ThreadPool"),
             // The type C# 10+ compiles every interpolated string through.
             ("System.Runtime.CompilerServices", "DefaultInterpolatedStringHandler"),
+            // `sb.Append($"...")` appends through this nested handler.
+            ("System.Text", "StringBuilder+AppendInterpolatedStringHandler"),
             // Ranges and indices: `a[^1]` and `a[1..4]`.
             ("System", "Index"),
             ("System", "Range"),
@@ -582,6 +618,7 @@ impl Loader {
                     | "TimeSpan"
                     | "Guid"
                     | "DefaultInterpolatedStringHandler"
+                    | "StringBuilder+AppendInterpolatedStringHandler"
                     | "Index"
                     | "Range"
             ) {
@@ -1073,11 +1110,20 @@ impl Loader {
 
         self.add_native_type(TASKS, "TaskFactory", TypeKind::Class, Some(object), synth());
         self.add_native_type(TASKS, "Parallel", TypeKind::Class, Some(object), synth());
+        // `catch (OperationCanceledException)` must also catch a task's
+        // cancellation, as on .NET.
+        let canceled = self.add_native_type(
+            "System",
+            "OperationCanceledException",
+            TypeKind::Class,
+            Some(self.core.exception),
+            synth(),
+        );
         self.add_native_type(
             TASKS,
             "TaskCanceledException",
             TypeKind::Class,
-            Some(self.core.exception),
+            Some(canceled),
             synth(),
         );
         self.add_native_type(
@@ -1094,11 +1140,22 @@ impl Loader {
             Some(value_type),
             synth(),
         );
-        self.add_native_type(
+        // A source holds whether it was cancelled and the callbacks waiting
+        // for it; a token is one slot holding its source (null for `None`).
+        self.add_native_type_with_fields_of_kind(
             "System.Threading",
             "CancellationTokenSource",
             TypeKind::Class,
             Some(object),
+            synth(),
+            &["_canceled", "_callbacks"],
+            self.bcl,
+        );
+        self.add_native_type(
+            "System.Threading",
+            "CancellationTokenRegistration",
+            TypeKind::ValueType,
+            Some(value_type),
             synth(),
         );
 
@@ -1319,7 +1376,9 @@ impl Loader {
             kind,
             base,
             interfaces: Vec::new(),
-            instance_fields: Vec::new(),
+            // A native type inherits its native base's slots — the built-in
+            // exceptions share `Exception`'s message slot.
+            instance_fields: base.map(|b| self.registry.ty(b).instance_fields.clone()).unwrap_or_default(),
             static_fields: Vec::new(),
             methods: Vec::new(),
             properties: Vec::new(),
@@ -1433,22 +1492,25 @@ impl Loader {
             #[cfg(feature = "std")]
             path: image.path().map(|p| p.to_path_buf()),
             user_strings: md.user_strings.0.to_vec(),
-            type_by_row: HashMap::new(),
-            method_by_row: HashMap::new(),
-            field_by_row: HashMap::new(),
-            type_ref_by_row: HashMap::new(),
-            member_ref_by_row: HashMap::new(),
-            property_by_row: HashMap::new(),
+            type_by_row: RowMap::new(),
+            method_by_row: RowMap::new(),
+            field_by_row: RowMap::new(),
+            type_ref_by_row: RowMap::new(),
+            member_ref_by_row: RowMap::new(),
+            property_by_row: RowMap::new(),
             call_sites: HashMap::new(),
-            field_ref_by_row: HashMap::new(),
-            method_spec_by_row: HashMap::new(),
+            field_ref_by_row: RowMap::new(),
+            method_spec_by_row: RowMap::new(),
+            method_spec_open: RowMap::new(),
             unresolved_members: HashMap::new(),
             method_impls: HashMap::new(),
             attributes: HashMap::new(),
-            type_specs: HashMap::new(),
+            type_specs: RowMap::new(),
             generic_instances: HashMap::new(),
-            member_ref_owner: HashMap::new(),
-            member_ref_type_args: HashMap::new(),
+            member_ref_owner: RowMap::new(),
+            member_ref_open_class: RowMap::new(),
+            md_array_refs: RowMap::new(),
+            member_ref_type_args: RowMap::new(),
             field_data: HashMap::new(),
             entry_point: image.entry_point(),
             references,
@@ -1789,7 +1851,7 @@ impl Loader {
         let spec_rows: Vec<(u32, TypeSig)> = assembly
             .type_specs
             .iter()
-            .map(|(row, sig)| (*row, sig.clone()))
+            .map(|(row, sig)| (row, sig.clone()))
             .collect();
         for (row, sig) in spec_rows {
             let TypeSig::GenericInst { definition, args, .. } = sig.unwrap_modifiers() else {
@@ -1811,10 +1873,60 @@ impl Loader {
             assembly.generic_instances.insert(row, constructed);
         }
 
+        // --- pass 7c: bases that are constructions -----------------------------
+        // `class C : B<string>` names its base through a TypeSpec, and the
+        // construction only exists after pass 7b. Pass 6 could not resolve it
+        // and fell back to `object`, which cut every field and virtual of `B`
+        // and its own bases out of `C` -- a Razor `InputText : InputBase<T>`
+        // lost `ComponentBase` entirely.
+        for type_row in 1..=type_count {
+            let td = md.type_def(type_row).map_err(ExecutionError::Metadata)?;
+            if td.extends.table() != Some(TableId::TypeSpec) {
+                continue;
+            }
+            let type_id = assembly.type_by_row[&type_row];
+            // `D<T> : B<T>` names a construction over its own parameter, which
+            // has no single runtime type; the open `B` has the same layout and
+            // methods, because generics are erased for execution.
+            let base = self.resolve_type_token(&assembly, td.extends).or_else(|| {
+                match assembly.type_specs.get(&td.extends.row())? {
+                    TypeSig::GenericInst { definition, .. } => self.resolve_type_token(&assembly, *definition),
+                    _ => None,
+                }
+            });
+            if let Some(base) = base {
+                self.registry.ty_mut(type_id).base = Some(base);
+            }
+        }
+        // Constructions made in pass 7b copied their definition before its
+        // base was corrected; give them the corrected one.
+        let constructions: Vec<(TypeId, TypeId)> = self
+            .generic_constructions
+            .values()
+            .filter_map(|c| self.registry.ty(*c).generic_definition.map(|d| (*c, d)))
+            .collect();
+        for (construction, definition) in constructions {
+            let base = self.registry.ty(definition).base;
+            self.registry.ty_mut(construction).base = base;
+        }
+
         // --- pass 8: MemberRefs -----------------------------------------------
         for row in 1..=md.row_count(TableId::MemberRef) {
             let mr = md.member_ref(row).map_err(ExecutionError::Metadata)?;
-            let Some(parent) = self.resolve_type_token(&assembly, mr.class) else {
+            // A member of `EventCallback<!!0>` -- a generic type over a
+            // *method* type parameter -- has no single construction to bind
+            // to. Its open definition has the same members and layout, since
+            // generics are erased for execution, so the reference binds there.
+            let resolved_parent = self.resolve_type_token(&assembly, mr.class).or_else(|| {
+                if mr.class.table() != Some(TableId::TypeSpec) {
+                    return None;
+                }
+                match assembly.type_specs.get(&mr.class.row())? {
+                    TypeSig::GenericInst { definition, .. } => self.resolve_type_token(&assembly, *definition),
+                    _ => None,
+                }
+            });
+            let Some(parent) = resolved_parent else {
                 // The declaring type is not loaded, so this reference cannot be
                 // bound. Record it: a caller reaching it at run time gets
                 // "could not resolve token", and `verify` should have said so
@@ -1834,10 +1946,24 @@ impl Loader {
                 assembly.member_ref_owner.insert(row, parent);
             }
 
+            if mr.class.table() == Some(TableId::TypeSpec)
+                && assembly.type_specs.get(&mr.class.row()).is_some_and(mentions_generic_parameter)
+            {
+                assembly.member_ref_open_class.insert(row, mr.class);
+            }
+
             // The arguments the reference itself names, whether or not the
             // definition got a runtime type per construction.
             if let Some(args) = self.type_spec_arguments(&assembly, mr.class) {
                 assembly.member_ref_type_args.insert(row, args);
+            }
+
+            if mr.class.table() == Some(TableId::TypeSpec) {
+                if let Some(TypeSig::Array { element, rank, .. }) = assembly.type_specs.get(&mr.class.row()).cloned() {
+                    if let Some(element) = self.resolve_type_sig(&assembly, &element) {
+                        assembly.md_array_refs.insert(row, (element, rank));
+                    }
+                }
             }
 
             // A member ref signature starting with FIELD names a field.
@@ -1916,6 +2042,9 @@ impl Loader {
             // what lets a native implementation render `True` rather than `1`.
             let specialised = match SignatureParser::new(spec.instantiation).parse_method_spec() {
                 Ok(arguments) if !arguments.is_empty() => {
+                    if arguments.iter().any(mentions_generic_parameter) {
+                        assembly.method_spec_open.insert(row, (method, arguments.clone()));
+                    }
                     let base = self.registry.method(method);
                     let declaring = self.registry.ty(base.declaring_type).full_name();
                     let concrete = MethodSig {
@@ -2106,8 +2235,14 @@ impl Loader {
         ordered.sort_by_key(|id| self.registry.base_chain(*id).count());
 
         for type_id in ordered {
+            // A base that is a construction (`InputText : InputBase<string>`)
+            // was copied from its definition before any vtable existed, so the
+            // definition's is the one to inherit.
             let base_vtable = match self.registry.ty(type_id).base {
-                Some(b) => self.registry.ty(b).vtable.clone(),
+                Some(b) => {
+                    let source = self.registry.ty(b).generic_definition.unwrap_or(b);
+                    self.registry.ty(source).vtable.clone()
+                }
                 None => Vec::new(),
             };
             let mut vtable = base_vtable;
@@ -2121,13 +2256,28 @@ impl Loader {
                 let is_newslot = m.flags & method_attributes::NEW_SLOT != 0;
                 let name = m.name.clone();
                 let sig = m.signature.clone();
+                let defined_in = m.assembly;
 
+                // An override and the method it overrides are often written in
+                // different assemblies -- a component's
+                // `BuildRenderTree(RenderTreeBuilder)` against its base class --
+                // and a type token means something only in the tables that wrote
+                // it. Comparing the raw tokens gave the override a new slot, so
+                // the base's empty method ran instead.
                 let existing = if is_newslot {
                     None
                 } else {
                     vtable.iter().position(|slot| {
                         let s = self.registry.method(*slot);
-                        s.name == name && signatures_match(&s.signature, &sig)
+                        if s.name != name {
+                            return false;
+                        }
+                        match (self.assembly_opt(s.assembly), self.assembly_opt(defined_in)) {
+                            (Some(a), Some(b)) if a.id != b.id => {
+                                self.signatures_match_across(&s.signature, a, &sig, b)
+                            }
+                            _ => signatures_match(&s.signature, &sig),
+                        }
                     })
                 };
 
@@ -2145,6 +2295,26 @@ impl Loader {
             }
 
             self.registry.ty_mut(type_id).vtable = vtable;
+        }
+
+        // Constructions copied their definition's (then empty) vtable; give
+        // them the finished one, or a virtual call on a `List<T>`-shaped user
+        // type would find no slot.
+        let constructions: Vec<(TypeId, TypeId)> = self
+            .generic_constructions
+            .values()
+            .filter_map(|c| self.registry.ty(*c).generic_definition.map(|d| (*c, d)))
+            .collect();
+        for (construction, definition) in constructions {
+            let vtable = self.registry.ty(definition).vtable.clone();
+            if !vtable.is_empty() {
+                self.registry.ty_mut(construction).vtable = vtable;
+            }
+            // Properties are registered after constructions are made, too.
+            let properties = self.registry.ty(definition).properties.clone();
+            if !properties.is_empty() {
+                self.registry.ty_mut(construction).properties = properties;
+            }
         }
     }
 
@@ -2218,7 +2388,10 @@ impl Loader {
         b: &MethodSig,
         b_from: &LoadedAssembly,
     ) -> bool {
-        if a.params.len() != b.params.len() || a.has_this != b.has_this {
+        // `On(string, Action<T[]>)` and `On<T1>(string, Action<T1>)` differ
+        // only in generic arity, and a method type parameter matches any
+        // type below, so the arity has to agree first.
+        if a.params.len() != b.params.len() || a.has_this != b.has_this || a.generic_param_count != b.generic_param_count {
             return false;
         }
         a.params.iter().zip(&b.params).all(|(x, y)| {
@@ -2252,6 +2425,30 @@ impl Loader {
                     _ => type_sigs_match(a, b),
                 }
             }
+            // `Action<string>` written in two assemblies: the definitions are
+            // tokens in each one's own tables, so resolve them, then compare
+            // the arguments the same way. Comparing the raw definition tokens
+            // said "different" for every generic parameter of a method called
+            // across an assembly reference, which left overloads that differ
+            // only there -- `CreateBinder(Action<string>)` and
+            // `CreateBinder(Action<bool>)` -- unresolvable.
+            (
+                GenericInst { definition: d1, args: a1, .. },
+                GenericInst { definition: d2, args: a2, .. },
+            ) => {
+                let same_definition = match (
+                    self.resolve_type_token(a_from, *d1),
+                    self.resolve_type_token(b_from, *d2),
+                ) {
+                    (Some(x), Some(y)) => x == y,
+                    _ => d1 == d2,
+                };
+                same_definition
+                    && a1.len() == a2.len()
+                    && a1.iter().zip(a2).all(|(x, y)| {
+                        self.type_sigs_match_across(x.unwrap_modifiers(), a_from, y.unwrap_modifiers(), b_from)
+                    })
+            }
             (SzArray(x), SzArray(y)) | (ByRef(x), ByRef(y)) | (Ptr(x), Ptr(y)) => self
                 .type_sigs_match_across(
                     x.unwrap_modifiers(),
@@ -2282,6 +2479,160 @@ impl Loader {
             return None;
         }
         assembly.call_sites.get(&token.row()).cloned()
+    }
+
+    /// The framework types a business application expects beyond the core:
+    /// event payloads and `EventHandler<T>`, `Lazy<T>`, cultures (formatting
+    /// is invariant), URIs, string comparers, `HashCode`, and the enums that
+    /// appear in their signatures.
+    ///
+    /// Registered by RustBCL's full install rather than here in `new`: the
+    /// minimal tier runs on boards with 200 KB of RAM, and these types push the
+    /// registry past a power of two, which doubles its maps -- measured at
+    /// 99 KB on the console subset, for types a board never uses.
+    pub fn register_business_types(&mut self) {
+        if self.registry.find_type_by_name("System.EventArgs").is_some() {
+            return;
+        }
+        // A range of synthetic tokens no type registered in `new` reaches.
+        let mut next_token = 0x00E0_0000u32;
+        let mut synth = move || {
+            next_token += 1;
+            Token::new(TableId::TypeDef, next_token)
+        };
+        let object = self.core.object;
+        let value_type = self.core.value_type;
+        let enum_type = self.core.enum_type;
+        let multicast = self.core.multicast_delegate;
+
+        // What every culture-taking overload names: `x.ToString("N2", culture)`.
+        self.add_native_type("System", "IFormatProvider", TypeKind::Interface, None, synth());
+
+        // Framework enums that appear in signatures and as values. They are
+        // enums so a boxed `DayOfWeek` prints its name; RustBCL knows the names.
+        for (ns, name) in [
+            ("System", "DayOfWeek"),
+            ("System", "StringComparison"),
+            ("System", "StringSplitOptions"),
+            ("System", "MidpointRounding"),
+            ("System", "DateTimeKind"),
+            ("System.Globalization", "NumberStyles"),
+            ("System.Globalization", "DateTimeStyles"),
+        ] {
+            let id = self.add_native_type(ns, name, TypeKind::Enum, Some(enum_type), synth());
+            self.registry.ty_mut(id).underlying = Some(Primitive::Int32);
+        }
+
+        for (ns, name) in [
+            ("System", "EventArgs"),
+            ("System", "Uri"),
+            ("System", "StringComparer"),
+            ("System.Globalization", "CultureInfo"),
+            ("System.Globalization", "NumberFormatInfo"),
+            // `dictionary.GetValueOrDefault(key)` is an extension method here.
+            ("System.Collections.Generic", "CollectionExtensions"),
+            // HTML and URL escaping, which every SVG or HTML generator needs.
+            ("System.Net", "WebUtility"),
+        ] {
+            self.add_native_type(ns, name, TypeKind::Class, Some(object), synth());
+        }
+        self.add_native_type("System", "HashCode", TypeKind::ValueType, Some(value_type), synth());
+        // One 64-bit slot, like `DateTime`: the instant as UTC ticks, plus a
+        // bit saying whether it reads in the host's offset. RustBCL has the rest.
+        self.add_native_type("System", "DateTimeOffset", TypeKind::ValueType, Some(value_type), synth());
+        // Money. Its value lives in a struct RustBCL's decimal module owns.
+        self.add_native_type("System", "Decimal", TypeKind::ValueType, Some(value_type), synth());
+        self.add_native_type("System", "BitConverter", TypeKind::Class, Some(object), synth());
+        // `Nullable.GetUnderlyingType(type)`, which serializers ask of every property.
+        self.add_native_type("System", "Nullable", TypeKind::Class, Some(object), synth());
+
+        // `EventArgs.Empty` is a static field; RustBCL fills it at install.
+        if let Some(event_args) = self.registry.find_type_by_name("System.EventArgs") {
+            self.add_native_static_field(event_args, "Empty", synth());
+        }
+        // So are `TimeSpan.Zero`, `DateTime.MinValue` and `Guid.Empty`: fields
+        // in .NET, read with `ldsfld`. RustBCL fills these at install too.
+        for (ty, names) in [
+            ("System.TimeSpan", &["Zero", "MinValue", "MaxValue"][..]),
+            ("System.DateTime", &["MinValue", "MaxValue", "UnixEpoch"][..]),
+            ("System.DateTimeOffset", &["MinValue", "MaxValue", "UnixEpoch"][..]),
+            ("System.Guid", &["Empty"][..]),
+            ("System.Decimal", &["Zero", "One", "MinusOne", "MaxValue", "MinValue"][..]),
+        ] {
+            if let Some(type_id) = self.registry.find_type_by_name(ty) {
+                for name in names {
+                    self.add_native_static_field(type_id, name, synth());
+                }
+            }
+        }
+
+        // `event EventHandler<T>` is the shape every .NET event takes.
+        let handler = self.add_native_type("System", "EventHandler`1", TypeKind::Delegate, Some(multicast), synth());
+        self.registry.ty_mut(handler).generic_param_count = 1;
+
+        // `Lazy<T>`: the factory, the value, and whether it has run.
+        let lazy = self.add_native_type_with_fields_of_kind(
+            "System",
+            "Lazy`1",
+            TypeKind::Class,
+            Some(object),
+            synth(),
+            &["factory", "value", "created"],
+            self.bcl,
+        );
+        self.registry.ty_mut(lazy).generic_param_count = 1;
+
+        // The non-generic dictionary surface, which serializers and other
+        // reflection-driven code test for: `case IDictionary d: foreach
+        // (DictionaryEntry e in d)`. `DictionaryEntry` is a class here, for the
+        // reason `KeyValuePair` is: `foreach` reads it through `get_Key` and
+        // `get_Value`, which cannot tell the difference.
+        for name in ["IDictionary", "IDictionaryEnumerator"] {
+            self.add_native_type("System.Collections", name, TypeKind::Interface, None, synth());
+        }
+        self.add_native_type_with_fields_of_kind(
+            "System.Collections",
+            "DictionaryEntry",
+            TypeKind::Class,
+            Some(object),
+            synth(),
+            &["key", "value"],
+            self.bcl,
+        );
+    }
+
+    /// `System.Text.RegularExpressions`: the types RustBCL's regex bindings
+    /// return. Their state lives in fixed slots the bindings own, so only the
+    /// field count matters here.
+    pub fn register_regex_types(&mut self) {
+        const NS: &str = "System.Text.RegularExpressions";
+        if self.registry.find_type_by_name("System.Text.RegularExpressions.Regex").is_some() {
+            return;
+        }
+        let mut next_token = 0x00E8_0000u32;
+        let mut synth = move || {
+            next_token += 1;
+            Token::new(TableId::TypeDef, next_token)
+        };
+        let object = self.core.object;
+        let enum_type = self.core.enum_type;
+        let multicast = self.core.multicast_delegate;
+        let bcl = self.bcl;
+        let options = self.add_native_type(NS, "RegexOptions", TypeKind::Enum, Some(enum_type), synth());
+        self.registry.ty_mut(options).underlying = Some(Primitive::Int32);
+        self.add_native_type_with_fields_of_kind(NS, "Regex", TypeKind::Class, Some(object), synth(), &["pattern", "options"], bcl);
+        let capture = self.add_native_type(NS, "Capture", TypeKind::Class, Some(object), synth());
+        let group = self.add_native_type(NS, "Group", TypeKind::Class, Some(capture), synth());
+        self.add_native_type(NS, "Match", TypeKind::Class, Some(group), synth());
+        self.add_native_type(NS, "GroupCollection", TypeKind::Class, Some(object), synth());
+        self.add_native_type(NS, "MatchCollection", TypeKind::Class, Some(object), synth());
+        self.add_native_type(NS, "MatchEvaluator", TypeKind::Delegate, Some(multicast), synth());
+    }
+
+    /// Whether a type is the framework's own (native or RustBCL), as opposed to
+    /// one a loaded program declared.
+    pub fn is_framework_type(&self, type_id: TypeId) -> bool {
+        self.registry.ty(type_id).assembly == self.bcl
     }
 
     /// Builds — or returns — the runtime type for one closed construction.
@@ -2331,6 +2682,64 @@ impl Loader {
         let id = self.registry.add_constructed_type(constructed);
         self.generic_constructions.insert((open, args.to_vec()), id);
         id
+    }
+
+    /// `T[]` as a type reflection can name: `System.Array` with an element type.
+    ///
+    /// Executing code never needs it, since an array on the heap records its
+    /// element type, so signatures erase arrays to `System.Array`. A serializer
+    /// does: it reads `PropertyType` to learn what to build. It is not
+    /// registered by name, so it shadows nothing.
+    pub fn array_type_of(&mut self, element: TypeId) -> TypeId {
+        if let Some(existing) = self.array_types.get(&element) {
+            return *existing;
+        }
+        let array = self.core.array;
+        let (name, namespace) = {
+            let e = self.registry.ty(element);
+            (format!("{}[]", e.name), e.namespace.clone())
+        };
+        let mut ty = self.registry.ty(array).clone();
+        ty.name = name;
+        ty.namespace = namespace;
+        ty.kind = TypeKind::SzArray;
+        ty.element_type = Some(element);
+        ty.base = Some(array);
+        ty.static_fields = Vec::new();
+        let id = self.registry.add_constructed_type(ty);
+        self.array_types.insert(element, id);
+        id
+    }
+
+    /// A signature's type as reflection reports it.
+    ///
+    /// `resolve_type_sig` erases framework generics and arrays, because that is
+    /// all execution needs. `PropertyType`, `FieldType` and friends answer with
+    /// the full type instead: `List<Item>` as a construction whose
+    /// `GetGenericArguments()` is `[Item]`, and `int[]` with an element type.
+    /// Neither changes how an instance is allocated; see `Activator`.
+    pub fn reflect_type_sig(&mut self, assembly: AssemblyId, sig: &TypeSig) -> Option<TypeId> {
+        match sig.unwrap_modifiers() {
+            TypeSig::GenericInst { definition, args, .. } => {
+                let open = self.resolve_type_token(self.assembly(assembly), *definition)?;
+                let open = self.registry.ty(open).generic_definition.unwrap_or(open);
+                let args = args.clone();
+                let mut resolved = Vec::with_capacity(args.len());
+                for a in &args {
+                    resolved.push(self.reflect_type_sig(assembly, a)?);
+                }
+                Some(self.construct_generic(open, &resolved))
+            }
+            TypeSig::SzArray(inner) => {
+                let inner = (**inner).clone();
+                let element = self.reflect_type_sig(assembly, &inner)?;
+                Some(self.array_type_of(element))
+            }
+            other => {
+                let other = other.clone();
+                self.resolve_type_sig(self.assembly(assembly), &other)
+            }
+        }
     }
 
     /// The resolved type arguments of a `TypeSpec`, if it names a construction.
@@ -2551,10 +2960,51 @@ impl Loader {
         let mut out = Vec::new();
         for owner in chain {
             for field in &self.registry.ty(owner).instance_fields {
-                out.push(self.zero_for(&self.registry.field(*field).signature));
+                out.push(self.zero_of_field(*field, 0));
             }
         }
         out
+    }
+
+    /// The zero of a field, including a struct-typed field, which is a zeroed
+    /// struct rather than null: `private RenderHandle _handle;` in a class has
+    /// to be readable (`_handle.IsInitialized`) before anything assigns it.
+    pub fn zero_of_field(&self, field: FieldId, depth: u32) -> Value {
+        let info = self.registry.field(field);
+        let zero = self.zero_for(&info.signature);
+        if !matches!(zero, Value::Null) || depth > 8 {
+            return zero;
+        }
+        // Resolved in the declaring type's own assembly: a `ValueType` in a
+        // signature is a token, meaningful only in the tables that wrote it.
+        let ty = if info.field_type.is_valid() {
+            info.field_type
+        } else {
+            let sig = info.signature.unwrap_modifiers();
+            if !matches!(sig, TypeSig::ValueType(_) | TypeSig::GenericInst { .. }) {
+                return zero;
+            }
+            let owner = self.registry.ty(info.declaring_type).assembly;
+            match self.assembly_opt(owner).and_then(|a| self.resolve_type_sig(a, sig)) {
+                Some(t) => t,
+                None => return zero,
+            }
+        };
+        let runtime = self.registry.ty(ty);
+        if runtime.kind != TypeKind::ValueType || runtime.primitive.is_some() {
+            return if runtime.kind == TypeKind::Enum { Value::I32(0) } else { zero };
+        }
+        let mut fields = Vec::new();
+        for owner in self.registry.base_chain(ty).collect::<Vec<_>>().into_iter().rev() {
+            for f in &self.registry.ty(owner).instance_fields {
+                fields.push(self.zero_of_field(*f, depth + 1));
+            }
+        }
+        if fields.is_empty() {
+            // A native value type with no fields (DateTime, TimeSpan) is one slot.
+            return Value::I32(0);
+        }
+        Value::Struct(Box::new(crate::value::StructValue { type_id: ty, fields }))
     }
 
     /// The zero of a field signature, for the kinds a field can hold.
@@ -2871,6 +3321,17 @@ fn describe_member_scope(md: &rustclr_metadata::Metadata<'_>, class: Token) -> S
             })
             .unwrap_or_else(|| "<generic instantiation>".to_string()),
         _ => class.to_string(),
+    }
+}
+
+/// Whether a signature names `!n` or `!!n` anywhere inside it.
+pub(crate) fn mentions_generic_parameter(sig: &TypeSig) -> bool {
+    match sig {
+        TypeSig::Var(_) | TypeSig::MVar(_) => true,
+        TypeSig::SzArray(inner) | TypeSig::ByRef(inner) | TypeSig::Ptr(inner) => mentions_generic_parameter(inner),
+        TypeSig::Modified { inner, .. } => mentions_generic_parameter(inner),
+        TypeSig::GenericInst { args, .. } => args.iter().any(mentions_generic_parameter),
+        _ => false,
     }
 }
 

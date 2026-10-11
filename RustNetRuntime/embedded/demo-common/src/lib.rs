@@ -56,7 +56,14 @@ use rustclr_metadata::{Image, TableId};
 /// builds without it and gets `BTreeMap`, which costs less per entry. So this
 /// is an **upper bound** on what a chip pays, which is the safe direction for
 /// a threshold to be wrong in.
-pub const FULL_BCL_BYTES: usize = 385_070;
+/// Raised from 385,070 (measured 512,221, rounded up) when the business-application bindings landed
+/// (formatting, dates, enums by name, events, the collection and LINQ gaps):
+/// about 300 bindings and 17 types, which only the full tier installs.
+/// Raised again to 640,000 (measured 636,625) for `System.Text.RegularExpressions`
+/// and `DateTimeOffset`: the regex bindings tip the host's binding `HashMap`
+/// over a capacity step, and the peak counts the old and new tables together.
+/// A chip's `BTreeMap` has no such step, so it pays less than this.
+pub const FULL_BCL_BYTES: usize = 640_000;
 
 /// Peak allocation with only the bindings a console program needs.
 ///
@@ -65,8 +72,13 @@ pub const FULL_BCL_BYTES: usize = 385_070;
 /// than the full set, which is the difference between running and not running
 /// on a board with 278 KB of usable RAM.
 ///
-/// Measured the same way and guarded by the same test.
-pub const MINIMAL_BCL_BYTES: usize = 252_092;
+/// Measured the same way and guarded by the same test. Raised from 253,700
+/// (measured 253,915) when `Random` became .NET's seeded generator with
+/// `NextInt64`, `NextSingle`, `NextBytes` and `Random.Shared`. Raised to
+/// 254,400 (measured 254,128) when `OperationCanceledException`,
+/// `CancellationTokenRegistration` and the source's two slots joined the
+/// types every tier registers.
+pub const MINIMAL_BCL_BYTES: usize = 254_400;
 
 /// What a board's memory budget allows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

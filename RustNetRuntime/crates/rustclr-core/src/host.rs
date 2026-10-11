@@ -21,6 +21,15 @@ pub trait Host: Send {
     /// Unix epoch milliseconds, for `DateTime.Now`.
     fn wall_clock_millis(&mut self) -> i64;
 
+    /// Minutes the local time zone is ahead of UTC, for `DateTime.Now`.
+    ///
+    /// Zero by default, which makes `Now` equal `UtcNow`: correct on a board
+    /// with no time zone and on a server running in UTC. A browser host knows
+    /// the real offset and overrides it.
+    fn utc_offset_minutes(&mut self) -> i32 {
+        0
+    }
+
     /// Monotonic nanoseconds, for the profiler.
     ///
     /// Milliseconds by default, scaled — correct but coarse, which is the

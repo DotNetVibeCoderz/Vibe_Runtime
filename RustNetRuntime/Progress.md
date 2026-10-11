@@ -19,6 +19,37 @@ PrimeSieve     IDENTICAL   (written by Jack from a prompt)
 SensorGateway  IDENTICAL   (edited by Jack from a prompt)
 ```
 
+## 2026-10-11 — fixes found by Rustzor's apps
+
+Rustzor (C# web apps on this runtime in WebAssembly) drove these out with real
+apps; each has a check that runs on .NET and here.
+
+**Verified:** `cargo test --workspace` → 471 passed, 0 failed. Conformance
+`checks=463 failures=0` on .NET and on RustCLR. Cross-assembly fixture
+`checks=8 failures=0`. `bash tests/embedded.sh` → all targets built without `std`.
+
+- New: `System.Decimal` (`decimal.rs`), `System.Text.RegularExpressions`
+  (`regex_engine.rs`, `regex.rs`), `DateTimeOffset`, `TimeSpan.Parse`, Guid
+  formats, `CancellationToken`/`CancellationTokenSource` (`cancellation.rs`),
+  `OperationCanceledException`, surrogate helpers on `char`,
+  `Enumerable.AsEnumerable`, `Encoding.GetString(byte[], int, int)`,
+  `Enum.CompareTo`, non-generic `IList`/`IDictionary`, reflection over
+  framework generics.
+- Fixed: `await` in a Debug build resumed a class state machine through a
+  pointer; interface dispatch skipped an override taking a library struct;
+  quadratic `string.Length`/`Substring`; GC holes around `newobj` arguments,
+  native arguments and callback results; `Random(seed)` ignored the seed;
+  enum arrays from an image blob came back as zeros; boxed enums, chars and
+  bools compared, hashed or printed by reference or as numbers; half a
+  surrogate pair vanished in `char.ToString` and `StringBuilder`;
+  `Activator.CreateInstance` skipped a framework collection's native
+  constructor; overloads that differ only in generic arity bound to the wrong
+  one across assemblies.
+- New tests: `tests/gc_natives.rs`, `tests/cross_assembly.rs` (fixture in
+  `tests/fixtures/CrossAssembly`), and conformance files `RegexChecks`,
+  `RandomChecks`, `DecimalChecks`, `GcChecks`, `EnumChecks`,
+  `ActivatorChecks`, `TextChecks`, `CancellationChecks`.
+
 ---
 
 ## Done — Rust runtime

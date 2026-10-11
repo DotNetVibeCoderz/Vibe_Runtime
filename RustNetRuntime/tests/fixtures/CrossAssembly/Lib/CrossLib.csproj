@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>CrossLib</AssemblyName>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- Unoptimised, like a library built by `dotnet build`: closures and state machines take their debug shapes. -->
+    <Optimize>false</Optimize>
+  </PropertyGroup>
+</Project>

@@ -192,6 +192,17 @@ fn register_type(interp: &mut Interpreter) {
         Ok(Some(Value::I32(open as i32)))
     });
 
+    // `int[]` as `PropertyType` names it (see `Loader::array_type_of`).
+    interp.register_native(key(TYPE, "GetElementType()"), |i, a| {
+        let id = described(i, a, 0)?;
+        match i.loader.registry.ty(id).element_type {
+            Some(element) => {
+                let handle = i.type_object(element);
+                Ok(Some(Value::Obj(handle)))
+            }
+            None => Ok(Some(Value::Null)),
+        }
+    });
     interp.register_native(key(TYPE, "GetGenericArguments()"), |i, a| {
         let id = described(i, a, 0)?;
         let ty = i.loader.registry.ty(id);
@@ -334,11 +345,41 @@ fn register_type(interp: &mut Interpreter) {
     // means knowing that `get_X` and `set_X` are halves of one member. The
     // loader reconstructs that from `PropertyMap` and `MethodSemantics` rather
     // than guessing it from method names.
+    // `GetProperties()` is public instance and static; `GetProperties(flags)`
+    // filters by BindingFlags. A private property of a base class is never
+    // returned, as on .NET -- Razor's `@inject` makes private properties, and
+    // a component reads them with NonPublic | Instance.
     for member in ["GetProperties()", "GetProperties/1"] {
         interp.register_native(key(TYPE, member), |i, a| {
             let declaring = described(i, a, 0)?;
-            let ids: Vec<u32> =
-                i.loader.registry.properties_of(declaring).iter().map(|p| p.0).collect();
+            const DECLARED_ONLY: i32 = 2;
+            const INSTANCE: i32 = 4;
+            const STATIC: i32 = 8;
+            const PUBLIC: i32 = 16;
+            const NON_PUBLIC: i32 = 32;
+            let flags = if a.len() > 1 { arg_i32(i, a, 1)? } else { INSTANCE | STATIC | PUBLIC };
+            let registry = &i.loader.registry;
+            let ids: Vec<u32> = registry
+                .properties_of(declaring)
+                .iter()
+                .filter(|p| {
+                    let info = registry.property(**p);
+                    let accessors = [info.getter, info.setter];
+                    let public = accessors.iter().flatten().any(|m| registry.method(*m).flags & 0x7 == 6);
+                    let is_static = info.is_static(registry);
+                    // A construction (`InputBase<string>`) shares its definition's
+                    // properties, which record the definition as their declarer.
+                    let declared_here = info.declaring_type == declaring
+                        || registry.ty(declaring).generic_definition == Some(info.declaring_type);
+                    let visibility = if public { PUBLIC } else { NON_PUBLIC };
+                    let binding = if is_static { STATIC } else { INSTANCE };
+                    flags & visibility != 0
+                        && flags & binding != 0
+                        && (flags & DECLARED_ONLY == 0 || declared_here)
+                        && (public || declared_here)
+                })
+                .map(|p| p.0)
+                .collect();
             Ok(Some(id_array(i, "PropertyInfo", declaring, &ids)))
         });
     }
@@ -457,7 +498,7 @@ fn type_flag(
     let ty = interp.loader.registry.ty(id);
     let answer = match test {
         TypeTest::ValueType => ty.kind.is_value_like(),
-        TypeTest::Class => matches!(ty.kind, TypeKind::Class | TypeKind::String),
+        TypeTest::Class => matches!(ty.kind, TypeKind::Class | TypeKind::String | TypeKind::SzArray | TypeKind::Array),
         TypeTest::Interface => ty.kind == TypeKind::Interface,
         TypeTest::Enum => ty.kind == TypeKind::Enum,
         TypeTest::Array => ty.is_array(),
@@ -471,6 +512,11 @@ fn type_flag(
 /// Whether a value of type `source` can be assigned to `target`.
 fn assignable(interp: &Interpreter, target: TypeId, source: TypeId) -> bool {
     if target == source {
+        return true;
+    }
+    // The natively implemented collections and arrays declare no interfaces;
+    // the registry knows which they satisfy (`typeof(IList).IsAssignableFrom`).
+    if interp.loader.registry.is_assignable_to(source, target) {
         return true;
     }
     for base in interp.loader.registry.base_chain(source) {
@@ -571,7 +617,24 @@ fn member_attributes(interp: &mut Interpreter, args: &[Value]) -> ExecResult<Vec
         .ok_or_else(ExecutionError::null_reference)?;
     let id = field(interp, handle, 0).as_i32().unwrap_or(0) as u32;
     let Some(kind) = interp.type_of(handle) else { return Ok(Vec::new()) };
-    let is_field = interp.loader.registry.ty(kind).full_name() == "System.Reflection.FieldInfo";
+    let kind_name = interp.loader.registry.ty(kind).full_name();
+    // A property's attributes hang off its `Property` row, which the registry
+    // records per assembly; its id is not a method id.
+    if kind_name == "System.Reflection.PropertyInfo" {
+        let declaring = interp.loader.registry.property(PropertyId(id)).declaring_type;
+        let assembly = interp.loader.registry.ty(declaring).assembly;
+        let row = interp
+            .loader
+            .assembly(assembly)
+            .property_by_row
+            .iter()
+            .find(|(_, p)| p.0 == id)
+            .map(|(row, _)| row);
+        let Some(row) = row else { return Ok(Vec::new()) };
+        let token = rustclr_core::metadata::Token::new(rustclr_core::metadata::TableId::Property, row);
+        return attribute_instances(interp, assembly, token);
+    }
+    let is_field = kind_name == "System.Reflection.FieldInfo";
 
     let (assembly, token) = if is_field {
         let info = interp.loader.registry.field(FieldId(id));
@@ -713,7 +776,7 @@ fn register_members(interp: &mut Interpreter) {
             let signature = info.signature.return_type.clone();
             let resolved = i
                 .loader
-                .resolve_type_sig(i.loader.assembly(assembly), &signature)
+                .reflect_type_sig(assembly, &signature)
                 .unwrap_or_else(|| i.loader.core().object);
             let handle = i.type_object(resolved);
             Ok(Some(Value::Obj(handle)))
@@ -742,6 +805,25 @@ fn register_members(interp: &mut Interpreter) {
         });
     }
 
+    // An indexer's parameters are its getter's, or its setter's less the value.
+    // Serializers ask every property, to skip `this[int]`.
+    let property_info: &'static str = Box::leak(format!("{REFLECT}.PropertyInfo").into_boxed_str());
+    interp.register_native(key(property_info, "GetIndexParameters()"), |i, a| {
+        let id = PropertyId(member_id(i, a)?);
+        let property = i.loader.registry.property(id);
+        let declaring = property.declaring_type;
+        let (method, count) = match (property.getter, property.setter) {
+            (Some(getter), _) => (Some(getter), i.loader.registry.method(getter).signature.params.len()),
+            (None, Some(setter)) => (Some(setter), i.loader.registry.method(setter).signature.params.len().saturating_sub(1)),
+            (None, None) => (None, 0),
+        };
+        let ids: Vec<u32> = match method {
+            Some(m) => (0..count).map(|n| pack_parameter(m, n)).collect(),
+            None => Vec::new(),
+        };
+        Ok(Some(id_array(i, "ParameterInfo", declaring, &ids)))
+    });
+
     let parameter: &'static str = Box::leak(format!("{REFLECT}.ParameterInfo").into_boxed_str());
     interp.register_native(key(parameter, "get_Position()"), |i, a| {
         let (_, position) = unpack_parameter(member_id(i, a)?);
@@ -758,7 +840,7 @@ fn register_members(interp: &mut Interpreter) {
         let assembly = info.assembly;
         let signature = info.signature.params.get(position).cloned();
         let resolved = signature
-            .and_then(|sig| i.loader.resolve_type_sig(i.loader.assembly(assembly), &sig))
+            .and_then(|sig| i.loader.reflect_type_sig(assembly, &sig))
             .unwrap_or_else(|| i.loader.core().object);
         let handle = i.type_object(resolved);
         Ok(Some(Value::Obj(handle)))
@@ -799,18 +881,20 @@ fn register_members(interp: &mut Interpreter) {
         let property = i.loader.registry.property(id);
         // The type comes from whichever accessor exists: a getter's return
         // type, or a setter's last parameter.
+        // `reflect_type_sig` keeps type arguments and array element types, so
+        // a serializer can tell what a `List<Item>` property holds.
         let resolved = match (property.getter, property.setter) {
             (Some(getter), _) => {
                 let info = i.loader.registry.method(getter);
                 let assembly = info.assembly;
                 let sig = info.signature.return_type.clone();
-                i.loader.resolve_type_sig(i.loader.assembly(assembly), &sig)
+                i.loader.reflect_type_sig(assembly, &sig)
             }
             (None, Some(setter)) => {
                 let info = i.loader.registry.method(setter);
                 let assembly = info.assembly;
                 let sig = info.signature.params.last().cloned();
-                sig.and_then(|s| i.loader.resolve_type_sig(i.loader.assembly(assembly), &s))
+                sig.and_then(|s| i.loader.reflect_type_sig(assembly, &s))
             }
             (None, None) => None,
         };
@@ -829,8 +913,21 @@ fn register_members(interp: &mut Interpreter) {
             };
             let is_static = i.loader.registry.method(getter).is_static();
             let target = arg(i, a, 1).unwrap_or(Value::Null);
+            // `GetValue` returns `object`: a value-typed property comes back
+            // boxed, typed by the getter's signature.
+            let receiver_type = target.as_handle().filter(|h| !h.is_null()).and_then(|h| i.type_of(h));
             let args = if is_static { Vec::new() } else { vec![target] };
-            i.invoke(getter, args)
+            let value = i.invoke(getter, args)?.unwrap_or(Value::Null);
+            let info = i.loader.registry.method(getter);
+            let (ret, owner) = (info.signature.return_type.clone(), info.assembly);
+            // `!n` — an anonymous type's every property — is the receiver's
+            // n-th type argument.
+            let hint = match ret.unwrap_modifiers() {
+                rustclr_core::metadata::TypeSig::Var(n) => receiver_type
+                    .and_then(|t| i.loader.registry.ty(t).generic_args.get(*n as usize).copied()),
+                _ => i.loader.resolve_type_sig(i.loader.assembly(owner), &ret),
+            };
+            Ok(Some(crate::collections::box_for_object(i, value, hint)))
         });
     }
     for member in ["SetValue(object,object)", "SetValue/2", "SetValue/3"] {
@@ -853,6 +950,11 @@ fn register_members(interp: &mut Interpreter) {
             // that takes one, or every later read comes back zero — the same
             // trap `MethodInfo.Invoke` fell into.
             value = unbox(i, value);
+            // A `T?` setter takes a Nullable struct, not the bare value.
+            if let Some(param) = i.loader.registry.method(setter).signature.params.first().cloned() {
+                let owner = i.loader.registry.method(setter).assembly;
+                value = wrap_nullable(i, &param, owner, value);
+            }
             let args = if is_static { vec![value] } else { vec![target, value] };
             i.invoke(setter, args)?;
             Ok(None)
@@ -871,6 +973,15 @@ fn register_members(interp: &mut Interpreter) {
         let id = FieldId(member_id(i, a)?);
         Ok(Some(Value::I32(i.loader.registry.field(id).is_static as i32)))
     });
+    interp.register_native(key(field_type, "get_FieldType()"), |i, a| {
+        let id = FieldId(member_id(i, a)?);
+        let info = i.loader.registry.field(id);
+        let (sig, declaring) = (info.signature.clone(), info.declaring_type);
+        let assembly = i.loader.registry.ty(declaring).assembly;
+        let resolved = i.loader.reflect_type_sig(assembly, &sig).unwrap_or_else(|| i.loader.core().object);
+        let handle = i.type_object(resolved);
+        Ok(Some(Value::Obj(handle)))
+    });
     interp.register_native(key(field_type, "get_DeclaringType()"), |i, a| {
         let id = FieldId(member_id(i, a)?);
         let declaring = i.loader.registry.field(id).declaring_type;
@@ -880,15 +991,21 @@ fn register_members(interp: &mut Interpreter) {
     interp.register_native(key(field_type, "GetValue(object)"), |i, a| {
         let id = FieldId(member_id(i, a)?);
         let info = i.loader.registry.field(id);
-        if info.is_static {
-            return Ok(Some(i.loader.static_value(id).clone()));
-        }
-        let target = arg(i, a, 1)?
-            .as_handle()
-            .filter(|h| !h.is_null())
-            .ok_or_else(ExecutionError::null_reference)?;
-        let slot = field_slot(i, target, id)?;
-        Ok(Some(field(i, target, slot)))
+        let sig = info.signature.clone();
+        let owner = i.loader.registry.ty(info.declaring_type).assembly;
+        let value = if info.is_static {
+            i.loader.static_value(id).clone()
+        } else {
+            let target = arg(i, a, 1)?
+                .as_handle()
+                .filter(|h| !h.is_null())
+                .ok_or_else(ExecutionError::null_reference)?;
+            let slot = field_slot(i, target, id)?;
+            field(i, target, slot)
+        };
+        // `GetValue` returns `object`, so a value-typed field comes back boxed.
+        let hint = i.loader.resolve_type_sig(i.loader.assembly(owner), &sig);
+        Ok(Some(crate::collections::box_for_object(i, value, hint)))
     });
     interp.register_native(key(field_type, "SetValue(object,object)"), |i, a| {
         let id = FieldId(member_id(i, a)?);
@@ -897,6 +1014,9 @@ fn register_members(interp: &mut Interpreter) {
         // later read of that field return zero.
         let value = arg(i, a, 2)?;
         let value = unbox(i, value);
+        let field_sig = i.loader.registry.field(id).signature.clone();
+        let owner = i.loader.registry.ty(i.loader.registry.field(id).declaring_type).assembly;
+        let value = wrap_nullable(i, &field_sig, owner, value);
         if i.loader.registry.field(id).is_static {
             i.loader.set_static(id, value);
             return Ok(None);
@@ -962,6 +1082,33 @@ fn invoke_method(interp: &mut Interpreter, args: &[Value]) -> ExecResult<Option<
 }
 
 /// Unwraps a boxed primitive, leaving anything else alone.
+/// A value written into a `Nullable<T>` slot through reflection arrives as
+/// the bare `T` (or null, from a boxed `T?` without a value). The slot holds
+/// the two-field struct, so wrap it; without this `HasValue` reads false for a
+/// value that was set.
+fn wrap_nullable(interp: &Interpreter, sig: &rustclr_core::metadata::TypeSig, owner: AssemblyId, value: Value) -> Value {
+    use rustclr_core::metadata::TypeSig;
+    let TypeSig::GenericInst { is_value_type: true, .. } = sig.unwrap_modifiers() else { return value };
+    let Some(nullable) = interp.loader.registry.find_type_by_name("System.Nullable`1") else { return value };
+    // Only a Nullable takes this shape; another generic struct is left alone.
+    let is_nullable = match sig.unwrap_modifiers() {
+        TypeSig::GenericInst { definition, .. } => interp
+            .loader
+            .assembly_opt(owner)
+            .and_then(|a| interp.loader.resolve_type_token(a, *definition))
+            == Some(nullable),
+        _ => false,
+    };
+    if !is_nullable || matches!(value, Value::Struct(_)) {
+        return value;
+    }
+    let has_value = !value.is_null();
+    Value::Struct(Box::new(rustclr_core::StructValue {
+        type_id: nullable,
+        fields: vec![Value::I32(has_value as i32), if has_value { value } else { Value::I32(0) }],
+    }))
+}
+
 fn unbox(interp: &Interpreter, value: Value) -> Value {
     match &value {
         Value::Obj(h) => interp
@@ -984,18 +1131,35 @@ fn register_activator(interp: &mut Interpreter) {
         let id = described(i, a, 0)?;
         Ok(Some(construct(i, id)?))
     });
-    interp.register_native(key(ACTIVATOR, "CreateInstance()"), |_i, _a| {
-        Err(ExecutionError::MissingImplementation(
-            "Activator.CreateInstance<T>() cannot name T on this runtime: generic type \
-             arguments are erased. Pass the type explicitly — CreateInstance(typeof(T)) — \
-             or see docs/limitations.md."
-                .into(),
-        ))
+    // `new T()` inside generic code: the instantiation this call went
+    // through carries `T` — resolved from the caller's frame when the caller
+    // was itself generic.
+    interp.register_native(key(ACTIVATOR, "CreateInstance()"), |i, _a| {
+        let object = i.loader.core().object;
+        let t = i
+            .current_native_method()
+            .and_then(|m| i.loader.registry.method(m).generic_args.first().copied())
+            .filter(|t| t.is_valid() && *t != object);
+        match t {
+            Some(t) => Ok(Some(construct(i, t)?)),
+            None => Err(ExecutionError::MissingImplementation(
+                "Activator.CreateInstance<T>() could not tell what T is here. Pass the type \
+                 explicitly — CreateInstance(typeof(T)) — or see docs/limitations.md."
+                    .into(),
+            )),
+        }
     });
 }
 
 /// Allocates an instance and runs its parameterless constructor.
 fn construct(interp: &mut Interpreter, type_id: TypeId) -> ExecResult<Value> {
+    // A framework construction (`List<Item>` from `PropertyType` or
+    // `MakeGenericType`) exists for reflection only; instances of framework
+    // generics are always the erased definition, which their natives expect.
+    let type_id = match interp.loader.registry.ty(type_id).generic_definition {
+        Some(definition) if interp.loader.is_framework_type(definition) => definition,
+        _ => type_id,
+    };
     let ty = interp.loader.registry.ty(type_id);
     if ty.is_abstract || ty.kind == TypeKind::Interface {
         let name = ty.full_name();
@@ -1016,6 +1180,14 @@ fn construct(interp: &mut Interpreter, type_id: TypeId) -> ExecResult<Value> {
     });
     if let Some(ctor) = ctor {
         interp.invoke(ctor, vec![Value::Obj(handle)])?;
+    } else {
+        // A framework type has no managed constructor to find: its storage is
+        // set up by the native one (`Dictionary<,>` allocates its buckets),
+        // which `newobj` would have called.
+        let name = interp.loader.registry.ty(type_id).full_name();
+        if let Some(native) = interp.native(&format!("{name}::.ctor()")).or_else(|| interp.native(&format!("{name}::.ctor/0"))) {
+            native(interp, &[Value::Obj(handle)])?;
+        }
     }
     Ok(Value::Obj(handle))
 }

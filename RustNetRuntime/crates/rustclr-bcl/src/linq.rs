@@ -316,20 +316,20 @@ fn register_aggregates(interp: &mut Interpreter) {
 
     interp.register_native(key("Sum/1"), |i, a| {
         let items = source(i, a, 0);
-        Ok(Some(total(&items)))
+        total_of(i, &items)
     });
     interp.register_native(key("Sum/2"), |i, a| {
         let projected = project(i, a)?;
-        Ok(Some(total(&projected)))
+        total_of(i, &projected)
     });
 
     interp.register_native(key("Average/1"), |i, a| {
         let items = source(i, a, 0);
-        average(&items)
+        average_of(i, &items)
     });
     interp.register_native(key("Average/2"), |i, a| {
         let projected = project(i, a)?;
-        average(&projected)
+        average_of(i, &projected)
     });
 
     interp.register_native(key("Min/1"), |i, a| {
@@ -387,6 +387,29 @@ fn project(interp: &mut Interpreter, args: &[Value]) -> ExecResult<Vec<Value>> {
 ///
 /// `new[] { 1, 2 }.Sum()` must produce `3`, not `3.0` — the difference shows up
 /// the moment the result is printed.
+/// `Sum`, in decimal when the items are decimals: money must not pass
+/// through `double`.
+fn total_of(i: &mut Interpreter, items: &[Value]) -> ExecResult<Option<Value>> {
+    if items.iter().any(|v| crate::decimal::is_decimal(i, v)) {
+        let mut sum = crate::decimal::Dec::ZERO;
+        for v in items {
+            let d = crate::decimal::to_dec(i, v)?;
+            sum = sum.add(&d).map_err(|_| ExecutionError::exception(rustclr_core::ClrExceptionKind::Overflow, "Value was either too large or too small for a Decimal."))?;
+        }
+        return Ok(Some(crate::decimal::encode(i, sum)));
+    }
+    Ok(Some(total(items)))
+}
+
+fn average_of(i: &mut Interpreter, items: &[Value]) -> ExecResult<Option<Value>> {
+    if !items.is_empty() && items.iter().any(|v| crate::decimal::is_decimal(i, v)) {
+        let sum = crate::decimal::decode(&total_of(i, items)?.unwrap_or(Value::Null));
+        let mean = sum.div(&crate::decimal::Dec::from_i64(items.len() as i64)).unwrap_or(sum);
+        return Ok(Some(crate::decimal::encode(i, mean)));
+    }
+    average(items)
+}
+
 fn total(items: &[Value]) -> Value {
     if items.iter().any(|v| matches!(v, Value::F(_))) {
         return Value::F(items.iter().filter_map(as_number).sum());
@@ -429,6 +452,9 @@ fn extreme(
 /// Anything else is refused rather than ordered arbitrarily — a silently wrong
 /// sort is far harder to notice than a failed one.
 pub(crate) fn compare(interp: &Interpreter, x: &Value, y: &Value) -> ExecResult<i32> {
+    if crate::decimal::is_decimal(interp, x) && crate::decimal::is_decimal(interp, y) {
+        return Ok(crate::decimal::decode(x).cmp(&crate::decimal::decode(y)) as i32);
+    }
     if let (Some(a), Some(b)) = (as_number(x), as_number(y)) {
         return Ok(match a.partial_cmp(&b) {
             Some(core::cmp::Ordering::Less) => -1,
@@ -733,6 +759,9 @@ fn new_grouping(interp: &mut Interpreter, k: Value, members: Vec<Value>) -> Valu
 // -- materialisation ---------------------------------------------------------
 
 fn register_conversions(interp: &mut Interpreter) {
+    // `AsEnumerable` only changes the static type: the source is the result.
+    interp.register_native(key("AsEnumerable/1"), |i, a| Ok(Some(arg(i, a, 0)?)));
+
     interp.register_native(key("ToList/1"), |i, a| {
         let items = source(i, a, 0);
         Ok(Some(new_list(i, items)))

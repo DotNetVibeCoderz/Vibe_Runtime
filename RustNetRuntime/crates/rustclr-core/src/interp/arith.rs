@@ -80,6 +80,27 @@ impl Interpreter {
     pub(super) fn binary_numeric(&mut self, op: Op, unsigned: bool) -> ExecResult<()> {
         let (a, b) = self.pop2()?;
 
+        // Same-typed operands are nearly every case; settle them before the
+        // general promotion and pointer checks. Integer division stays on the
+        // slow path, which raises DivideByZero and Overflow.
+        let fast = match (&a, &b, op) {
+            (Value::I32(x), Value::I32(y), Op::Add) => Some(Value::I32(x.wrapping_add(*y))),
+            (Value::I32(x), Value::I32(y), Op::Sub) => Some(Value::I32(x.wrapping_sub(*y))),
+            (Value::I32(x), Value::I32(y), Op::Mul) => Some(Value::I32(x.wrapping_mul(*y))),
+            (Value::I64(x), Value::I64(y), Op::Add) => Some(Value::I64(x.wrapping_add(*y))),
+            (Value::I64(x), Value::I64(y), Op::Sub) => Some(Value::I64(x.wrapping_sub(*y))),
+            (Value::I64(x), Value::I64(y), Op::Mul) => Some(Value::I64(x.wrapping_mul(*y))),
+            (Value::F(x), Value::F(y), Op::Add) => Some(Value::F(x + y)),
+            (Value::F(x), Value::F(y), Op::Sub) => Some(Value::F(x - y)),
+            (Value::F(x), Value::F(y), Op::Mul) => Some(Value::F(x * y)),
+            (Value::F(x), Value::F(y), Op::Div) => Some(Value::F(x / y)),
+            _ => None,
+        };
+        if let Some(v) = fast {
+            self.push(v);
+            return Ok(());
+        }
+
         // Pointer arithmetic, before the numeric promotion: a pointer here is
         // a buffer plus a byte offset, and adding an integer to one has to
         // keep the buffer rather than collapse to a number.
@@ -503,6 +524,40 @@ impl Interpreter {
         b: &Value,
     ) -> ExecResult<bool> {
         use Op::*;
+        // Signed comparisons of same-typed integers, as every counted loop
+        // makes them.
+        match (a, b) {
+            (Value::I32(x), Value::I32(y)) => match op {
+                Beq | BeqS => return Ok(x == y),
+                BneUn | BneUnS => return Ok(x != y),
+                Bge | BgeS => return Ok(x >= y),
+                Bgt | BgtS => return Ok(x > y),
+                Ble | BleS => return Ok(x <= y),
+                Blt | BltS => return Ok(x < y),
+                _ => {}
+            },
+            (Value::I64(x), Value::I64(y)) => match op {
+                Beq | BeqS => return Ok(x == y),
+                BneUn | BneUnS => return Ok(x != y),
+                Bge | BgeS => return Ok(x >= y),
+                Bgt | BgtS => return Ok(x > y),
+                Ble | BleS => return Ok(x <= y),
+                Blt | BltS => return Ok(x < y),
+                _ => {}
+            },
+            // IEEE comparisons are false when either side is NaN, which is
+            // what the signed forms require; `bne.un` is true then.
+            (Value::F(x), Value::F(y)) => match op {
+                Beq | BeqS => return Ok(x == y),
+                BneUn | BneUnS => return Ok(x != y),
+                Bge | BgeS => return Ok(x >= y),
+                Bgt | BgtS => return Ok(x > y),
+                Ble | BleS => return Ok(x <= y),
+                Blt | BltS => return Ok(x < y),
+                _ => {}
+            },
+            _ => {}
+        }
         Ok(match op {
             Beq | BeqS => self.compare_equal(a, b),
             BneUn | BneUnS => !self.compare_equal(a, b),

@@ -654,6 +654,68 @@ remainder and has had no single x86 instruction since SSE replaced x87's
 
 ---
 
+## `DateTimeOffset` keeps two offsets: UTC and the host's
+
+A `DateTimeOffset` is one 64-bit slot, like `DateTime`: the instant as UTC
+ticks, plus one bit saying whether it reads in the host's UTC offset. `UtcNow`,
+`Now`, `ToLocalTime`, the Unix-time conversions, arithmetic, comparisons and
+formatting (`zzz`, `o`, `K`) all behave as in .NET.
+
+An offset that is neither zero nor the host's (`new DateTimeOffset(..., TimeSpan.FromHours(7))`
+on a machine at UTC+1, or `Parse("...+07:00")`) keeps the **instant** exactly,
+so comparisons, `UtcTicks` and `ToUnixTimeMilliseconds` are right. Its `Offset`
+then reads as zero, so `Hour` and `ToString` show the UTC clock. Convert with
+`ToOffset` only to UTC or the local offset. `DateTime` does not track `Kind`,
+so `new DateTimeOffset(dateTime)` takes the clock as UTC.
+
+---
+
+## `decimal` is exact
+
+`System.Decimal` is implemented as .NET defines it: a 96-bit mantissa, a scale
+of 0 to 28 and a sign (`crates/rustclr-bcl/src/decimal.rs`). Arithmetic is
+exact where the result fits and otherwise rounds half to even, as .NET does;
+trailing zeros are kept (`1.50m + 2.5m` is `4.00`); division gives as many
+digits as fit (`1m / 3m` has 28 threes); overflow and division by zero throw
+`OverflowException` and `DivideByZeroException`. Conversions to and from every
+numeric type, `Math.Round` with every `MidpointRounding`, `Floor`, `Ceiling`,
+`Truncate`, `Abs`, `Max`, `Min`, `Sign`, parsing, `Convert.ToDecimal`, LINQ
+`Sum`, `Average`, `Min`, `Max` and ordering, dictionary keys and record
+equality all work on decimals.
+
+Formatting is exact for `""`, `G`, `F`, `N` and `P`. Other formats (`C`, `E`,
+custom patterns such as `"#,##0.00"`) go through `double`, which is exact to 15
+significant digits. JSON numbers are read through `double` as well. The native
+code generator declines methods that use `decimal`; they are interpreted.
+
+---
+
+## Regular expressions: .NET syntax, a backtracking matcher
+
+`System.Text.RegularExpressions` runs on RustBCL's own engine
+(`crates/rustclr-bcl/src/regex_engine.rs`), which matches over UTF-16 code
+units as .NET does: `Index` and `Length` agree with .NET, and a character
+outside the BMP is two units.
+
+Supported: classes, sets with ranges, negation and subtraction, `\p{..}`
+categories and the common named blocks, anchors (`^ $ \A \z \Z \b \B \G`),
+capturing, non-capturing, named, atomic and lookaround groups, inline options,
+greedy and lazy quantifiers, backreferences, and the options IgnoreCase,
+Multiline, Singleline, ExplicitCapture, IgnorePatternWhitespace and
+ECMAScript. `IsMatch`, `Match`, `NextMatch`, `Matches`, `Replace` (with `$1`,
+`${name}`, `$$`, `$&`, `` $` ``, `$'` and a `MatchEvaluator`), `Split`,
+`Escape`, `Unescape` and `Result` behave as in .NET.
+
+Not supported: `RightToLeft` (refused at construction), balancing groups,
+conditionals `(?(...)...)`, and `Group.Captures` beyond the last capture.
+General categories come from Rust's `char` predicates plus fixed ranges:
+exact for letters, case, digits and white space, close for punctuation and
+symbols. A match that backtracks more than 50 million steps stops with
+`InvalidOperationException` instead of hanging, where .NET would run until a
+timeout you set.
+
+---
+
 ## Sorting with your own comparer works, and is stable
 
 `list.Sort((a, b) => ...)` and `list.Sort(myComparer)` both run. The comparator
