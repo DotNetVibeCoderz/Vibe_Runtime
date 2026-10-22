@@ -268,7 +268,7 @@ jobs:
           path: assets
           name: nuget
       - name: Checksums
-        working-directory: ../assets
+        working-directory: assets
         run: |
           ls -la
           sha256sum * > SHA256SUMS.txt
