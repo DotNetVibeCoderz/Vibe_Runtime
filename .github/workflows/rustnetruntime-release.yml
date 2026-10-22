@@ -127,7 +127,7 @@ jobs:
           "$rustnet" --version
           work="$RUNNER_TEMP/hello"
           dotnet new console -n Hello -o "$work" --force
-          printf 'System.Console.WriteLine("Hello from RustCLR on " + System.Environment.OSVersion.Platform);\n' > "$work/Program.cs"
+          printf 'var sum = System.Linq.Enumerable.Sum(System.Linq.Enumerable.Range(1, 10));\nSystem.Console.WriteLine($"Hello from RustCLR, 1+..+10 = {sum}");\n' > "$work/Program.cs"
           dotnet build "$work" -c Release
           out="$("$rustnet" run "$work/bin/Release/net10.0/Hello.dll")"
           echo "$out"

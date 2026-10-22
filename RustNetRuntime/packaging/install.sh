@@ -34,7 +34,7 @@ DESKTOP="$PREFIX/share/applications"
 
 # ── Uninstall ────────────────────────────────────────────────────────────────
 if $UNINSTALL; then
-  echo "Removing RustNetRuntime from $PREFIX…"
+  echo "Removing RustNetRuntime from ${PREFIX}…"
   rm -f "$BIN/rustnet" "$BIN/codegen"
   rm -rf "$LIB" "$SHARE"
   rm -f "$DESKTOP/rustnet-codegen.desktop"

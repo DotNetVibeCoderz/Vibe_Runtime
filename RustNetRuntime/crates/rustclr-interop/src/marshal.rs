@@ -107,7 +107,7 @@ pub unsafe fn read_c_string(interp: &mut Interpreter, ptr: i64) -> Value {
     if ptr == 0 {
         return Value::Null;
     }
-    let text = unsafe { std::ffi::CStr::from_ptr(ptr as *const i8) }
+    let text = unsafe { std::ffi::CStr::from_ptr(ptr as *const core::ffi::c_char) }
         .to_string_lossy()
         .into_owned();
     Value::Obj(interp.alloc_string(&text))
@@ -151,7 +151,7 @@ mod tests {
         assert_eq!(m.slot, AbiSlot::Integer);
         assert_ne!(m.integer, 0);
         // Reading it back through the pointer must give the same text.
-        let text = unsafe { std::ffi::CStr::from_ptr(m.integer as *const i8) };
+        let text = unsafe { std::ffi::CStr::from_ptr(m.integer as *const core::ffi::c_char) };
         assert_eq!(text.to_str().unwrap(), "hello");
     }
 

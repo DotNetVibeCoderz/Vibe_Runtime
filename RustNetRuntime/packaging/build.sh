@@ -87,7 +87,7 @@ cp "$RUSTNET" "$STAGE/bin/"
 # when the SDK cannot target this RID, which keeps a toolchain-only package
 # possible on exotic targets.
 if command -v dotnet >/dev/null 2>&1; then
-  echo "Publishing CodeGen for $RID…"
+  echo "Publishing CodeGen for ${RID}…"
   if dotnet publish "$ROOT/src/CodeGen" \
       -c Release -r "$RID" --self-contained true \
       -p:PublishSingleFile=false \

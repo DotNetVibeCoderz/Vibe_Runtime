@@ -42,8 +42,8 @@ mod platform {
     pub type Handle = *mut core::ffi::c_void;
 
     unsafe extern "system" {
-        fn LoadLibraryA(name: *const i8) -> Handle;
-        fn GetProcAddress(module: Handle, name: *const i8) -> Symbol;
+        fn LoadLibraryA(name: *const core::ffi::c_char) -> Handle;
+        fn GetProcAddress(module: Handle, name: *const core::ffi::c_char) -> Symbol;
         fn FreeLibrary(module: Handle) -> i32;
     }
 
@@ -82,15 +82,17 @@ mod platform {
     const RTLD_NOW: i32 = 2;
 
     unsafe extern "C" {
-        fn dlopen(name: *const i8, flags: i32) -> Handle;
-        fn dlsym(handle: Handle, name: *const i8) -> Symbol;
+        fn dlopen(name: *const core::ffi::c_char, flags: i32) -> Handle;
+        fn dlsym(handle: Handle, name: *const core::ffi::c_char) -> Symbol;
         fn dlclose(handle: Handle) -> i32;
     }
 
     pub fn open(name: &str) -> Result<Handle, LoadError> {
-        // Try the name as given, then the conventional `lib<name>.so` form,
-        // because P/Invoke declarations are usually written for Windows.
-        for candidate in [name.to_string(), format!("lib{name}.so"), format!("{name}.so")] {
+        // Try the name as given, then the conventional `lib<name>.so` (`.dylib`
+        // on macOS) forms, because P/Invoke declarations are usually written for
+        // Windows.
+        let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
+        for candidate in [name.to_string(), format!("lib{name}.{ext}"), format!("{name}.{ext}")] {
             let Ok(c) = CString::new(candidate.as_str()) else { continue };
             let handle = unsafe { dlopen(c.as_ptr(), RTLD_NOW) };
             if !handle.is_null() {
