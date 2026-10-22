@@ -2868,9 +2868,16 @@ impl Loader {
         declared: MethodId,
     ) -> Option<MethodId> {
         for base in self.registry.base_chain(type_id) {
-            for assembly in &self.assemblies {
-                if let Some(m) = assembly.method_impls.get(&(base, declared)) {
-                    return Some(*m);
+            // `MethodImpl` rows name the open definition; a construction such as
+            // `EventCallback<MouseEventArgs>` shares its methods, so the body found
+            // under the definition is the one to run. Rustzor's renderer reaches
+            // `IEventCallbackLike.Untyped` on a boxed `EventCallback<T>` this way.
+            let definition = self.registry.ty(base).generic_definition;
+            for owner in core::iter::once(base).chain(definition) {
+                for assembly in &self.assemblies {
+                    if let Some(m) = assembly.method_impls.get(&(owner, declared)) {
+                        return Some(*m);
+                    }
                 }
             }
         }

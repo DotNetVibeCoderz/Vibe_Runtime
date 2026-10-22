@@ -36,7 +36,7 @@ fn values_held_by_a_native_survive_a_collection_inside_its_callbacks() {
         interp.invoke(method, vec![Value::I32(300)]).expect("runs under constant collection")
     };
     // Expected values from dotnet.
-    let parts = [("GcConstText", 2100), ("GcStringsOnly", 1090), ("GcStringsArray", 1090), ("GcTagsArray", 2290), ("GcLoopLoop", 2290), ("GcSelectLoop", 2290), ("GcLoopSum", 2290), ("GcPartSelect", 2290), ("GcPartWhere", 138), ("GcPartAny", 1), ("GcPartLengths", 2590), ("LinqUnderCollection", 3029)];
+    let parts = [("GcConstText", 2100), ("GcStringsOnly", 1090), ("GcStringsArray", 1090), ("GcTagsArray", 2290), ("GcLoopLoop", 2290), ("GcSelectLoop", 2290), ("GcLoopSum", 2290), ("GcPartSelect", 2290), ("GcPartWhere", 138), ("GcPartAny", 1), ("GcPartLengths", 2590), ("LinqUnderCollection", 3029), ("GcEventUnsubscribe", 1990)];
     let got: Vec<(&str, Option<Value>)> = parts.iter().map(|(n, _)| (*n, run(n))).collect();
     let collections = interp.stats.collections;
     let wrong: Vec<String> = parts

@@ -1738,7 +1738,16 @@ impl Interpreter {
                 .with::<ClrDelegate, _>(*h, |d| d.targets.clone())
                 .ok_or_else(ExecutionError::null_reference)?;
 
-            let mut result = None;
+            // The invocation list is a snapshot: a handler may unsubscribe the
+            // ones after it, leaving this delegate — and their receivers —
+            // reachable only from here. Root the delegate and the arguments
+            // until the last target returns, or a collection during an early
+            // handler frees a later one's receiver (Rustzor: a page leaving on
+            // `LocationChanged` had its own handler run on a reused handle).
+            let mark = self.native_roots.len();
+            self.native_roots.extend(args.iter().cloned());
+            self.native_roots.extend(targets.iter().filter(|t| !t.receiver.is_null()).map(|t| Value::Obj(t.receiver)));
+            let mut result = Ok(None);
             for target in targets {
                 let mut call_args = Vec::with_capacity(args.len());
                 if !target.receiver.is_null() {
@@ -1746,9 +1755,13 @@ impl Interpreter {
                 }
                 call_args.extend_from_slice(&args[1..]);
                 // A multicast delegate returns the last invocation's result.
-                result = self.invoke(target.method, call_args)?;
+                result = self.invoke(target.method, call_args);
+                if result.is_err() {
+                    break;
+                }
             }
-            return Ok(Some(result));
+            self.native_roots.truncate(mark);
+            return Ok(Some(result?));
         }
 
         Ok(None)

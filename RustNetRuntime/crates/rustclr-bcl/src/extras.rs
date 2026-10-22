@@ -1245,6 +1245,48 @@ fn register_strings(interp: &mut Interpreter) {
         let comparison = arg_i32(i, a, 2)?;
         Ok(Some(Value::I32(find_units(&s, &needle, 0, ignores_case(comparison)))))
     });
+    // IndexOf(char, int, int): a start and a count. Its own exact key, so the
+    // arity fallback below (which reads the third argument as a StringComparison)
+    // never sees it.
+    interp.register_native(key("IndexOf(char,int,int)"), |i, a| {
+        let s = units(i, a, 0)?;
+        let c = arg_i32(i, a, 1)? as u16;
+        let from = arg_i32(i, a, 2)?;
+        let count = arg_i32(i, a, 3)?;
+        if from < 0 || count < 0 || from as usize + count as usize > s.len() {
+            return Err(out_of_range("count"));
+        }
+        let (from, end) = (from as usize, from as usize + count as usize);
+        Ok(Some(Value::I32(s[from..end].iter().position(|u| *u == c).map(|p| (p + from) as i32).unwrap_or(-1))))
+    });
+    // IndexOf(string, int, StringComparison): the start index, then the comparison.
+    // `IndexOf(string, int, int)` has its own exact key, so this one only sees the enum form.
+    interp.register_native(key("IndexOf/3"), |i, a| {
+        let s = units(i, a, 0)?;
+        let needle = match arg(i, a, 1)? {
+            Value::I32(c) => vec![c as u16],
+            _ => units(i, a, 1)?,
+        };
+        let from = arg_i32(i, a, 2)?;
+        if from < 0 || from as usize > s.len() {
+            return Err(out_of_range("startIndex"));
+        }
+        let comparison = arg_i32(i, a, 3)?;
+        Ok(Some(Value::I32(find_units(&s, &needle, from as usize, ignores_case(comparison)))))
+    });
+    // IndexOf(string, int, int, StringComparison).
+    interp.register_native(key("IndexOf/4"), |i, a| {
+        let s = units(i, a, 0)?;
+        let needle = units(i, a, 1)?;
+        let from = arg_i32(i, a, 2)?;
+        let count = arg_i32(i, a, 3)?;
+        if from < 0 || count < 0 || from as usize + count as usize > s.len() {
+            return Err(out_of_range("count"));
+        }
+        let end = from as usize + count as usize;
+        let comparison = arg_i32(i, a, 4)?;
+        Ok(Some(Value::I32(find_units(&s[..end], &needle, from as usize, ignores_case(comparison)))))
+    });
     interp.register_native(key("IndexOfAny(char[])"), |i, a| {
         let s = units(i, a, 0)?;
         let set: Vec<u16> = { let h__ = arg_handle(i, a, 1)?; array_values(i, h__) }.iter().map(|v| v.as_i32().unwrap_or(0) as u16).collect();
