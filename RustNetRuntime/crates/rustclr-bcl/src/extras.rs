@@ -318,13 +318,13 @@ fn register_numbers(interp: &mut Interpreter) {
         let full: &'static str = k(format!("System.{ty}"));
         let wide = ty == "Int64";
         for member in ["Parse/2", "Parse/3"] {
-            interp.register_native(k(format!("{full}::{member}")), if wide { parse_long } else { parse_int });
+            interp.register_native(k(format!("{full}::{member}")), if wide { |i, a| crate::numerics::parse_styled_native(i, a, true) } else { |i, a| crate::numerics::parse_styled_native(i, a, false) });
         }
         if ty != "Int32" && ty != "Int64" {
             interp.register_native(k(format!("{full}::Parse(string)")), parse_int);
         }
         for member in ["TryParse/2", "TryParse/3", "TryParse/4"] {
-            interp.register_native(k(format!("{full}::{member}")), if wide { try_parse_long } else { try_parse_int });
+            interp.register_native(k(format!("{full}::{member}")), if wide { |i, a| crate::numerics::try_parse_styled_native(i, a, true) } else { |i, a| crate::numerics::try_parse_styled_native(i, a, false) });
         }
     }
     for ty in ["Double", "Single"] {
@@ -478,30 +478,9 @@ fn parse_int(i: &mut Interpreter, a: &[Value]) -> ExecResult<Option<Value>> {
     cleaned.parse::<i32>().map(|v| Some(Value::I32(v))).map_err(|_| bad_format(&s))
 }
 
-fn parse_long(i: &mut Interpreter, a: &[Value]) -> ExecResult<Option<Value>> {
-    let s = arg_string(i, a, 0)?;
-    let cleaned: String = s.trim().chars().filter(|c| *c != ',').collect();
-    cleaned.parse::<i64>().map(|v| Some(Value::I64(v))).map_err(|_| bad_format(&s))
-}
-
 fn parse_double(i: &mut Interpreter, a: &[Value]) -> ExecResult<Option<Value>> {
     let s = arg_string(i, a, 0)?;
     format::parse_number(&s).map(|v| Some(Value::F(v))).ok_or_else(|| bad_format(&s))
-}
-
-/// The out parameter is always the last argument.
-fn try_parse_int(i: &mut Interpreter, a: &[Value]) -> ExecResult<Option<Value>> {
-    let s = arg_string_or_empty(i, a, 0)?;
-    let parsed = s.trim().parse::<i32>().ok();
-    store_out(i, a, a.len() - 1, Value::I32(parsed.unwrap_or(0)))?;
-    Ok(Some(Value::I32(parsed.is_some() as i32)))
-}
-
-fn try_parse_long(i: &mut Interpreter, a: &[Value]) -> ExecResult<Option<Value>> {
-    let s = arg_string_or_empty(i, a, 0)?;
-    let parsed = s.trim().parse::<i64>().ok();
-    store_out(i, a, a.len() - 1, Value::I64(parsed.unwrap_or(0)))?;
-    Ok(Some(Value::I32(parsed.is_some() as i32)))
 }
 
 fn try_parse_double(i: &mut Interpreter, a: &[Value]) -> ExecResult<Option<Value>> {
@@ -525,6 +504,38 @@ fn now_ticks(i: &mut Interpreter, local: bool) -> i64 {
     let ms = i.host.wall_clock_millis();
     let offset = if local { i.host.utc_offset_minutes() as i64 * TICKS_PER_MINUTE } else { 0 };
     ms * TICKS_PER_MS + format::UNIX_EPOCH_TICKS + offset
+}
+
+/// The ticks for `text` read with argument 1 of `ParseExact`: one format, or
+/// the first of several that matches. A time-only format falls on today.
+fn parse_exact_any(i: &mut Interpreter, a: &[Value], text: &str) -> ExecResult<Option<i64>> {
+    let formats: Vec<String> = match arg(i, a, 1)? {
+        Value::Obj(h) => match i.string_value(h) {
+            Some(single) => vec![single],
+            None => crate::support::array_values(i, h)
+                .into_iter()
+                .filter_map(|v| match v {
+                    Value::Obj(s) => i.string_value(s),
+                    _ => None,
+                })
+                .collect(),
+        },
+        _ => {
+            return Err(ExecutionError::exception(ClrExceptionKind::ArgumentNull, "Value cannot be null. (Parameter 'format')"));
+        }
+    };
+    for format in &formats {
+        if let Some(found) = format::parse_exact(text, format) {
+            let today = if found.has_date {
+                0
+            } else {
+                let now = now_ticks(i, true);
+                now - now.rem_euclid(TICKS_PER_DAY)
+            };
+            return Ok(Some(found.ticks + today));
+        }
+    }
+    Ok(None)
 }
 
 fn date_value(t: i64) -> ExecResult<Option<Value>> {
@@ -684,6 +695,20 @@ fn register_datetime(interp: &mut Interpreter) {
             format::parse_date(&s).map(|t| Some(Value::I64(t))).ok_or_else(|| bad_format(&s))
         });
     }
+    // ParseExact(string, string | string[], IFormatProvider[, DateTimeStyles]):
+    // the invariant culture, and styles are not applied.
+    for name in ["ParseExact/3", "ParseExact/4"] {
+        interp.register_native(key(name), |i, a| {
+            let s = arg_string(i, a, 0)?;
+            parse_exact_any(i, a, &s)?.map(|t| Some(Value::I64(t))).ok_or_else(|| bad_format(&s))
+        });
+    }
+    interp.register_native(key("TryParseExact/5"), |i, a| {
+        let s = arg_string_or_empty(i, a, 0)?;
+        let parsed = parse_exact_any(i, a, &s)?;
+        store_out(i, a, 4, Value::I64(parsed.unwrap_or(0)))?;
+        Ok(Some(Value::I32(parsed.is_some() as i32)))
+    });
     for name in ["TryParse/2", "TryParse/3", "TryParse/4"] {
         interp.register_native(key(name), |i, a| {
             let s = arg_string_or_empty(i, a, 0)?;
@@ -1838,6 +1863,13 @@ fn register_chars(interp: &mut Interpreter) {
         let _ = test;
         interp.register_native(k(format!("System.Char::{name}(char)")), f);
     }
+    interp.register_native("System.Char::IsAsciiHexDigit(char)", |i, a| char_test(i, a, |c| c.is_ascii_hexdigit()));
+    interp.register_native("System.Char::IsAsciiHexDigitLower(char)", |i, a| char_test(i, a, |c| c.is_ascii_digit() || ('a'..='f').contains(&c)));
+    interp.register_native("System.Char::IsAsciiHexDigitUpper(char)", |i, a| char_test(i, a, |c| c.is_ascii_digit() || ('A'..='F').contains(&c)));
+    interp.register_native("System.Char::IsAsciiLetterOrDigit(char)", |i, a| char_test(i, a, |c| c.is_ascii_alphanumeric()));
+    interp.register_native("System.Span`1::ToString()", crate::spans::span_to_string);
+    interp.register_native("System.ReadOnlySpan`1::ToString()", crate::spans::span_to_string);
+    interp.register_native("System.Uri::IsHexDigit(char)", |i, a| char_test(i, a, |c| c.is_ascii_hexdigit()));
     interp.register_native("System.Char::GetNumericValue(char)", |i, a| {
         let c = char::from_u32(arg_i32(i, a, 0)? as u32).unwrap_or('\0');
         Ok(Some(Value::F(c.to_digit(10).map(|d| d as f64).unwrap_or(-1.0))))
@@ -2238,6 +2270,63 @@ fn array_handle(i: &mut Interpreter, a: &[Value], index: usize) -> ExecResult<Ha
     Ok(h)
 }
 
+fn is_array(i: &Interpreter, v: &Value) -> bool {
+    v.as_handle().filter(|h| !h.is_null()).is_some_and(|h| i.heap.with::<ClrArray, _>(h, |_| ()).is_some())
+}
+
+/// Sorts `keys[start..start+len]` (stable), moving `items` the same way when given:
+/// `Array.Sort(keys, items)`, `Array.Sort(keys, items, comparer)` and
+/// `Array.Sort(array, index, length)`.
+fn sort_keys_items(
+    i: &mut Interpreter,
+    keys: Handle,
+    items: Option<Handle>,
+    comparer: Option<Value>,
+    start: usize,
+    len: usize,
+) -> ExecResult<Option<Value>> {
+    let key_values = elements(i, keys);
+    let item_values = items.map(|h| elements(i, h));
+    if let Some(iv) = &item_values {
+        if iv.len() < start + len {
+            return Err(ExecutionError::exception(
+                ClrExceptionKind::Argument,
+                "The keys and items arrays have different lengths.",
+            ));
+        }
+    }
+    let mut compare: Box<dyn FnMut(&mut Interpreter, &Value, &Value) -> ExecResult<core::cmp::Ordering>> = match comparer {
+        Some(c) => crate::collections::comparison_from(i, c)?,
+        None => Box::new(|i: &mut Interpreter, x: &Value, y: &Value| {
+            Ok(match crate::collections::compare_values(i, x, y)? {
+                n if n < 0 => core::cmp::Ordering::Less,
+                0 => core::cmp::Ordering::Equal,
+                _ => core::cmp::Ordering::Greater,
+            })
+        }),
+    };
+    // Sort positions by their keys, then lay both arrays out in that order.
+    let order: Vec<Value> = (start..start + len).map(|p| Value::I32(p as i32)).collect();
+    let sorted = crate::collections::merge_sort_by(i, order, &mut |i, x, y| {
+        let (px, py) = (x.as_i32().unwrap_or(0) as usize, y.as_i32().unwrap_or(0) as usize);
+        compare(i, &key_values[px], &key_values[py])
+    })?;
+    let positions: Vec<usize> = sorted.iter().map(|v| v.as_i32().unwrap_or(0) as usize).collect();
+    let mut new_keys = key_values.clone();
+    for (n, p) in positions.iter().enumerate() {
+        new_keys[start + n] = key_values[*p].clone();
+    }
+    write_array(i, keys, &new_keys);
+    if let (Some(h), Some(iv)) = (items, item_values) {
+        let mut new_items = iv.clone();
+        for (n, p) in positions.iter().enumerate() {
+            new_items[start + n] = iv[*p].clone();
+        }
+        write_array(i, h, &new_items);
+    }
+    Ok(None)
+}
+
 fn write_array(i: &mut Interpreter, array: Handle, values: &[Value]) {
     i.heap.with_mut::<ClrArray, _>(array, |arr| {
         for (n, v) in values.iter().enumerate() {
@@ -2324,14 +2413,42 @@ fn register_arrays(interp: &mut Interpreter) {
             Ok(None)
         });
     }
+    // Natives bind by arity, so Sort/2 is both Sort(T[], comparer) and
+    // Sort(TKey[] keys, TValue[] items); the second argument tells them apart.
     interp.register_native("System.Array::Sort/2", |i, a| {
         let array = array_handle(i, a, 0)?;
-        let comparer = arg(i, a, 1)?;
+        let second = arg(i, a, 1)?;
+        if is_array(i, &second) {
+            let items = second.as_handle().expect("checked");
+            let n = elements(i, array).len();
+            return sort_keys_items(i, array, Some(items), None, 0, n);
+        }
         let values = elements(i, array);
-        let mut compare = crate::collections::comparison_from(i, comparer)?;
+        let mut compare = crate::collections::comparison_from(i, second)?;
         let sorted = crate::collections::merge_sort_by(i, values, &mut *compare)?;
         write_array(i, array, &sorted);
         Ok(None)
+    });
+    // Sort(T[] array, int index, int length) and Sort(TKey[] keys, TValue[] items, IComparer<TKey>).
+    interp.register_native("System.Array::Sort/3", |i, a| {
+        let array = array_handle(i, a, 0)?;
+        let second = arg(i, a, 1)?;
+        if let Some(index) = second.as_i32() {
+            let length = arg(i, a, 2)?.as_i32().unwrap_or(0);
+            let total = elements(i, array).len() as i32;
+            if index < 0 || length < 0 || index + length > total {
+                return Err(ExecutionError::exception(
+                    ClrExceptionKind::Argument,
+                    "Offset and length were out of bounds for the array or count is greater than the number of elements from index to the end of the source collection.",
+                ));
+            }
+            return sort_keys_items(i, array, None, None, index as usize, length as usize);
+        }
+        let items = second.as_handle().filter(|h| !h.is_null());
+        let comparer = arg(i, a, 2)?;
+        let comparer = comparer.as_handle().filter(|h| !h.is_null()).map(|_| comparer.clone());
+        let n = elements(i, array).len();
+        sort_keys_items(i, array, items, comparer, 0, n)
     });
     for name in ["Reverse/1", "Reverse(int[])"] {
         interp.register_native(k(format!("System.Array::{name}")), |i, a| {

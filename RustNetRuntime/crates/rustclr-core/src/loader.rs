@@ -514,34 +514,43 @@ impl Loader {
         self.primitives.insert(Primitive::Void, void);
         self.registry.ty_mut(void).primitive = Some(Primitive::Void);
 
-        // Exception types the runtime raises itself.
-        for name in [
-            "NullReferenceException",
-            "IndexOutOfRangeException",
-            "InvalidCastException",
-            "DivideByZeroException",
-            "OverflowException",
-            "OutOfMemoryException",
-            "StackOverflowException",
-            "ArgumentException",
-            "ArgumentNullException",
-            "ArgumentOutOfRangeException",
-            "InvalidOperationException",
-            "NotSupportedException",
-            "NotImplementedException",
-            "TypeLoadException",
-            "MissingMethodException",
-            "MissingFieldException",
-            "EntryPointNotFoundException",
-            "DllNotFoundException",
-            "ArithmeticException",
-            "FormatException",
-            "SystemException",
-            "ApplicationException",
+        // Exception types the runtime raises itself, with .NET's hierarchy, so
+        // `catch (ArgumentException)` also catches an ArgumentOutOfRangeException
+        // the runtime throws, and `catch (ArithmeticException)` a DivideByZero.
+        // Each entry names its base, which comes earlier in the list.
+        let mut exceptions: Vec<(&str, TypeId)> = vec![("Exception", exception)];
+        for (name, base) in [
+            ("SystemException", "Exception"),
+            ("ApplicationException", "Exception"),
+            ("NullReferenceException", "SystemException"),
+            ("IndexOutOfRangeException", "SystemException"),
+            ("InvalidCastException", "SystemException"),
+            ("ArithmeticException", "SystemException"),
+            ("DivideByZeroException", "ArithmeticException"),
+            ("OverflowException", "ArithmeticException"),
+            ("OutOfMemoryException", "SystemException"),
+            ("StackOverflowException", "SystemException"),
+            ("ArgumentException", "SystemException"),
+            ("ArgumentNullException", "ArgumentException"),
+            ("ArgumentOutOfRangeException", "ArgumentException"),
+            ("InvalidOperationException", "SystemException"),
+            ("NotSupportedException", "SystemException"),
+            ("NotImplementedException", "SystemException"),
+            ("FormatException", "SystemException"),
+            ("TypeLoadException", "SystemException"),
+            ("EntryPointNotFoundException", "TypeLoadException"),
+            ("DllNotFoundException", "TypeLoadException"),
+            ("MemberAccessException", "SystemException"),
+            ("MissingMemberException", "MemberAccessException"),
+            ("MissingMethodException", "MissingMemberException"),
+            ("MissingFieldException", "MissingMemberException"),
         ] {
-            self.add_native_type("System", name, TypeKind::Class, Some(exception), synth());
+            let parent = exceptions.iter().find(|(n, _)| *n == base).map(|(_, id)| *id).unwrap_or(exception);
+            let id = self.add_native_type("System", name, TypeKind::Class, Some(parent), synth());
+            exceptions.push((name, id));
         }
-        self.add_native_type("System.IO", "IOException", TypeKind::Class, Some(exception), synth());
+        let system_exception = exceptions.iter().find(|(n, _)| *n == "SystemException").map(|(_, id)| *id).unwrap_or(exception);
+        self.add_native_type("System.IO", "IOException", TypeKind::Class, Some(system_exception), synth());
 
         // Non-generic framework delegates. `new Thread(() => …)` allocates a
         // `ThreadStart` first, so the delegate type has to resolve before the

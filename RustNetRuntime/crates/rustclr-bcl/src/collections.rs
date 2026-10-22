@@ -627,6 +627,23 @@ pub(crate) fn sort_with_comparer(
     Ok(None)
 }
 
+/// Whether an object is a sequence to copy from (a framework collection, or a
+/// type with `GetEnumerator`), as opposed to a comparer passed to the same
+/// constructor arity.
+pub(crate) fn is_collection(interp: &Interpreter, h: Handle) -> bool {
+    if interp.heap.with::<ClrArray, _>(h, |_| ()).is_some() {
+        return true;
+    }
+    let Some(ty) = interp.type_of(h) else { return false };
+    let registry = &interp.loader.registry;
+    registry.base_chain(ty).into_iter().any(|t| {
+        let info = registry.ty(t);
+        (info.namespace == GENERIC
+            && matches!(info.name.as_str(), "List`1" | "Queue`1" | "Stack`1" | "HashSet`1" | "Dictionary`2" | "SortedDictionary`2"))
+            || info.methods.iter().any(|m| registry.method(*m).name == "GetEnumerator")
+    })
+}
+
 /// Reads anything enumerable into a vector of values.
 ///
 /// The built-in collections are read straight out of their backing arrays,
@@ -777,10 +794,40 @@ const DICT_KEYS: usize = 2;
 const DICT_VALUES: usize = 3;
 
 fn register_dictionary(interp: &mut Interpreter) {
-    for ctor in [".ctor()", ".ctor(int)", ".ctor/0", ".ctor/1"] {
+    for ctor in [".ctor()", ".ctor(int)", ".ctor/0"] {
         interp.register_native(key("Dictionary`2", ctor), |i, a| {
             let this = receiver(i, a)?;
             reset_table(i, this, DICT_BUCKETS, DICT_NEXT, &[DICT_KEYS, DICT_VALUES]);
+            Ok(None)
+        });
+    }
+    // Natives bind by arity: .ctor/1 is Dictionary(capacity), (comparer) and
+    // (IDictionary or IEnumerable<KeyValuePair>), and .ctor/2 adds a comparer.
+    // A collection argument is copied; a capacity or a comparer starts empty.
+    for ctor in [".ctor/1", ".ctor/2"] {
+        interp.register_native(key("Dictionary`2", ctor), |i, a| {
+            let this = receiver(i, a)?;
+            reset_table(i, this, DICT_BUCKETS, DICT_NEXT, &[DICT_KEYS, DICT_VALUES]);
+            let source = arg(i, a, 1)?;
+            let Some(h) = source.as_handle().filter(|h| !h.is_null()) else {
+                return Ok(None);
+            };
+            if !is_collection(i, h) {
+                return Ok(None);
+            }
+            for pair in sequence_values(i, &source) {
+                let Some(p) = pair.as_handle().filter(|p| !p.is_null()) else { continue };
+                let k = field(i, p, 0);
+                let v = field(i, p, 1);
+                if dict_find(i, this, &k).is_some() {
+                    let rendered = display(i, &k);
+                    return Err(ExecutionError::exception(
+                        ClrExceptionKind::Argument,
+                        format!("An item with the same key has already been added. Key: {rendered}"),
+                    ));
+                }
+                dict_insert(i, this, k, v);
+            }
             Ok(None)
         });
     }

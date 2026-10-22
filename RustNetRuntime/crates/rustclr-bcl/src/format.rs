@@ -880,6 +880,210 @@ pub fn parse_date(text: &str) -> Option<i64> {
     Some(ticks_from(year, month, day, hour, minute, second, ms))
 }
 
+/// A date read by `ParseExact`: its ticks, and whether the format named a
+/// date at all (a time-only format takes today's date, as in .NET).
+pub struct ExactDate {
+    pub ticks: i64,
+    pub has_date: bool,
+}
+
+/// `DateTime.ParseExact` with the invariant culture: the text must match the
+/// format exactly. Custom specifiers (`yyyy yy MM M MMM MMMM dd d ddd dddd
+/// HH H hh h mm m ss s f… F… tt t z… K`, quoted and escaped literals) and the
+/// standard formats `d D t T g G s u o M Y` are understood.
+pub fn parse_exact(text: &str, format: &str) -> Option<ExactDate> {
+    let expanded = match format {
+        "d" => "MM/dd/yyyy",
+        "D" => "dddd, dd MMMM yyyy",
+        "t" => "HH:mm",
+        "T" => "HH:mm:ss",
+        "g" => "MM/dd/yyyy HH:mm",
+        "G" => "MM/dd/yyyy HH:mm:ss",
+        "s" => "yyyy-MM-ddTHH:mm:ss",
+        "u" => "yyyy-MM-dd HH:mm:ss'Z'",
+        "o" | "O" => "yyyy-MM-ddTHH:mm:ss.fffffffK",
+        "M" | "m" => "MMMM dd",
+        "Y" | "y" => "yyyy MMMM",
+        other => other,
+    };
+    let f: Vec<char> = expanded.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pos, mut i) = (0usize, 0usize);
+    let (mut year, mut month, mut day) = (1i64, 1i64, 1i64);
+    let (mut hour, mut minute, mut second, mut fraction) = (0i64, 0i64, 0i64, 0i64);
+    let (mut has_date, mut pm, mut twelve) = (false, None::<bool>, false);
+
+    // Reads between `min` and `max` digits.
+    let digits = |pos: &mut usize, min: usize, max: usize| -> Option<i64> {
+        let start = *pos;
+        while *pos < t.len() && *pos - start < max && t[*pos].is_ascii_digit() {
+            *pos += 1;
+        }
+        if *pos - start < min {
+            return None;
+        }
+        t[start..*pos].iter().collect::<String>().parse().ok()
+    };
+    // Matches one of `names` (case-insensitively), longest first; returns its index.
+    let name = |pos: &mut usize, names: &[&str]| -> Option<usize> {
+        let rest: String = t[*pos..].iter().collect::<String>().to_lowercase();
+        let mut best: Option<(usize, usize)> = None;
+        for (n, candidate) in names.iter().enumerate() {
+            let lower = candidate.to_lowercase();
+            if rest.starts_with(&lower) && best.map_or(true, |(_, len)| lower.len() > len) {
+                best = Some((n, candidate.chars().count()));
+            }
+        }
+        let (n, len) = best?;
+        *pos += len;
+        Some(n)
+    };
+
+    while i < f.len() {
+        let c = f[i];
+        let mut run = 1;
+        while i + run < f.len() && f[i + run] == c && !matches!(c, '\'' | '"' | '\\') {
+            run += 1;
+        }
+        match c {
+            'y' => {
+                has_date = true;
+                year = if run <= 2 {
+                    let y = digits(&mut pos, run, 2)?;
+                    // .NET's TwoDigitYearMax is 2049.
+                    if run == 2 || y < 100 { if y < 50 { 2000 + y } else { 1900 + y } } else { y }
+                } else {
+                    digits(&mut pos, run.max(4), run.max(4))?
+                };
+            }
+            'M' => {
+                has_date = true;
+                month = match run {
+                    1 => digits(&mut pos, 1, 2)?,
+                    2 => digits(&mut pos, 2, 2)?,
+                    3 => {
+                        let short: Vec<String> = MONTHS.iter().map(|m| m[..3].to_string()).collect();
+                        let refs: Vec<&str> = short.iter().map(|s| s.as_str()).collect();
+                        name(&mut pos, &refs)? as i64 + 1
+                    }
+                    _ => name(&mut pos, &MONTHS)? as i64 + 1,
+                };
+            }
+            'd' => {
+                if run <= 2 {
+                    has_date = true;
+                    day = digits(&mut pos, run, 2)?;
+                } else if run == 3 {
+                    let short: Vec<String> = DAYS.iter().map(|d| d[..3].to_string()).collect();
+                    let refs: Vec<&str> = short.iter().map(|s| s.as_str()).collect();
+                    name(&mut pos, &refs)?;
+                } else {
+                    name(&mut pos, &DAYS)?;
+                }
+            }
+            'H' => hour = digits(&mut pos, run.min(2), 2)?,
+            'h' => {
+                hour = digits(&mut pos, run.min(2), 2)?;
+                twelve = true;
+            }
+            'm' => minute = digits(&mut pos, run.min(2), 2)?,
+            's' => second = digits(&mut pos, run.min(2), 2)?,
+            'f' | 'F' => {
+                if run > 7 {
+                    return None;
+                }
+                let start = pos;
+                let value = if c == 'f' { digits(&mut pos, run, run)? } else { digits(&mut pos, 0, run).unwrap_or(0) };
+                let read = (pos - start) as u32;
+                fraction = value * 10i64.pow(7 - read);
+            }
+            't' => {
+                let first = t.get(pos)?.to_ascii_uppercase();
+                if first != 'A' && first != 'P' {
+                    return None;
+                }
+                pos += 1;
+                if run >= 2 {
+                    if t.get(pos)?.to_ascii_uppercase() != 'M' {
+                        return None;
+                    }
+                    pos += 1;
+                }
+                pm = Some(first == 'P');
+            }
+            'z' | 'K' => {
+                // An offset or "Z". Times are taken as given, as in Parse.
+                match t.get(pos) {
+                    Some('Z') => pos += 1,
+                    Some('+') | Some('-') => {
+                        pos += 1;
+                        digits(&mut pos, 1, 2)?;
+                        if t.get(pos) == Some(&':') {
+                            pos += 1;
+                            digits(&mut pos, 2, 2)?;
+                        } else if run >= 3 || c == 'K' {
+                            digits(&mut pos, 0, 2);
+                        }
+                    }
+                    _ if c == 'K' => {}
+                    _ => return None,
+                }
+            }
+            '\'' | '"' => {
+                let mut j = i + 1;
+                while j < f.len() && f[j] != c {
+                    if t.get(pos) != Some(&f[j]) {
+                        return None;
+                    }
+                    pos += 1;
+                    j += 1;
+                }
+                i = j + 1;
+                continue;
+            }
+            '\\' => {
+                let literal = *f.get(i + 1)?;
+                if t.get(pos) != Some(&literal) {
+                    return None;
+                }
+                pos += 1;
+                i += 2;
+                continue;
+            }
+            '%' => {}
+            other => {
+                for _ in 0..run {
+                    if t.get(pos) != Some(&other) {
+                        return None;
+                    }
+                    pos += 1;
+                }
+            }
+        }
+        i += run;
+    }
+    if pos != t.len() {
+        return None;
+    }
+    if let Some(pm) = pm {
+        if hour > 12 {
+            return None;
+        }
+        hour = match (pm, hour) {
+            (true, 12) => 12,
+            (true, h) => h + 12,
+            (false, 12) => 0,
+            (false, h) => h,
+        };
+    } else if twelve && hour > 12 {
+        return None;
+    }
+    if !(1..=9999).contains(&year) || !(1..=12).contains(&month) || day < 1 || day > days_in_month(year, month) || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    Some(ExactDate { ticks: ticks_from(year, month, day, hour, minute, second, 0) + fraction, has_date })
+}
+
 /// Parses `TimeSpan.ToString()` output and the shapes people type:
 /// `[-][d.]hh:mm[:ss[.fffffff]]`, or a bare whole number of days.
 pub fn parse_timespan(text: &str) -> Option<i64> {
@@ -1019,6 +1223,17 @@ mod tests {
         assert_eq!(parse_date("2026-01-15 08:30:05.250Z"), Some(ticks_from(2026, 1, 15, 8, 30, 5, 250)));
         assert_eq!(parse_date("03/09/2026"), Some(ticks_from(2026, 3, 9, 0, 0, 0, 0)));
         assert_eq!(parse_date("2026-02-30"), None);
+        let exact = |t: &str, f: &str| parse_exact(t, f).map(|d| d.ticks);
+        assert_eq!(exact("2026-10-11", "yyyy-MM-dd"), Some(ticks_from(2026, 10, 11, 0, 0, 0, 0)));
+        assert_eq!(exact("11/10/2026 07:05", "dd/MM/yyyy HH:mm"), Some(ticks_from(2026, 10, 11, 7, 5, 0, 0)));
+        assert_eq!(exact("9 Mar 26 3:04 PM", "d MMM yy h:mm tt"), Some(ticks_from(2026, 3, 9, 15, 4, 0, 0)));
+        assert_eq!(exact("Sunday, 11 October 2026", "dddd, dd MMMM yyyy"), Some(ticks_from(2026, 10, 11, 0, 0, 0, 0)));
+        assert_eq!(exact("2026-10-11T08:30:05.1250000Z", "o"), Some(ticks_from(2026, 10, 11, 8, 30, 5, 125)));
+        assert_eq!(exact("20261011", "yyyyMMdd"), Some(ticks_from(2026, 10, 11, 0, 0, 0, 0)));
+        assert_eq!(exact("2026-10-11", "yyyy/MM/dd"), None);
+        assert_eq!(exact("2026-10-11 ", "yyyy-MM-dd"), None);
+        assert_eq!(exact("2026-02-30", "yyyy-MM-dd"), None);
+        assert!(!parse_exact("14:05", "HH:mm").unwrap().has_date);
         assert_eq!(parse_date("nonsense"), None);
     }
 }

@@ -274,6 +274,71 @@ fn numeric_equal(a: &Value, b: &Value) -> bool {
     }
 }
 
+/// `NumberStyles.AllowHexSpecifier` and `NumberStyles.AllowThousands`.
+const HEX: i32 = 0x200;
+const THOUSANDS: i32 = 0x40;
+/// `NumberStyles.Integer`, what the overloads without styles use.
+const INTEGER: i32 = 7;
+
+/// A string argument, or a span of characters standing for one.
+fn text_arg(i: &mut Interpreter, a: &[Value], n: usize) -> rustclr_core::ExecResult<String> {
+    let v = arg(i, a, n)?;
+    if let Some(h) = v.as_handle().filter(|h| !h.is_null()) {
+        if let Some(s) = i.heap.with::<rustclr_core::ClrString, _>(h, |s| s.to_rust_string()) {
+            return Ok(s);
+        }
+    }
+    if let Some(chars) = crate::spans::values(i, &v) {
+        let units: Vec<u16> = chars.iter().map(|c| c.as_i32().unwrap_or(0) as u16).collect();
+        return Ok(String::from_utf16_lossy(&units));
+    }
+    Ok(String::new())
+}
+
+/// The styles argument when argument `n` is one (an enum arrives as an int), else `Integer`.
+fn styles_arg(i: &mut Interpreter, a: &[Value], n: usize) -> i32 {
+    match a.get(n).map(|_| arg(i, a, n)) {
+        Some(Ok(Value::I32(s))) => s,
+        _ => INTEGER,
+    }
+}
+
+/// Parses with the subset of `NumberStyles` an app meets: hex digits (which
+/// wrap like .NET's, so `FFFFFFFF` is -1), thousands separators, white space and a sign.
+fn parse_styled(text: &str, styles: i32, wide: bool, lenient: bool) -> Option<i64> {
+    let t = text.trim();
+    if styles & HEX != 0 {
+        if t.is_empty() || t.len() > if wide { 16 } else { 8 } {
+            return None;
+        }
+        let v = u64::from_str_radix(t, 16).ok()?;
+        return Some(if wide { v as i64 } else { v as u32 as i32 as i64 });
+    }
+    let plain = if lenient || styles & THOUSANDS != 0 { t.replace(',', "") } else { String::from(t) };
+    if wide { plain.parse::<i64>().ok() } else { plain.parse::<i32>().ok().map(i64::from) }
+}
+
+fn number(v: i64, wide: bool) -> Value {
+    if wide { Value::I64(v) } else { Value::I32(v as i32) }
+}
+
+/// `Parse` in every shape; it has always let thousands separators through.
+pub(crate) fn parse_styled_native(i: &mut Interpreter, a: &[Value], wide: bool) -> rustclr_core::ExecResult<Option<Value>> {
+    let text = text_arg(i, a, 0)?;
+    let styles = styles_arg(i, a, 1);
+    parse_styled(&text, styles, wide, true).map(|v| Some(number(v, wide))).ok_or_else(|| bad_format(&text))
+}
+
+/// `TryParse` in every shape; the out parameter is always the last argument.
+pub(crate) fn try_parse_styled_native(i: &mut Interpreter, a: &[Value], wide: bool) -> rustclr_core::ExecResult<Option<Value>> {
+    let text = text_arg(i, a, 0)?;
+    let out = a.len() - 1;
+    let styles = if a.len() == 4 { styles_arg(i, a, 1) } else { INTEGER };
+    let parsed = parse_styled(&text, styles, wide, false);
+    write_out_param(i, a, out, number(parsed.unwrap_or(0), wide))?;
+    Ok(Some(Value::I32(parsed.is_some() as i32)))
+}
+
 fn parse_i32(s: &str) -> rustclr_core::ExecResult<i32> {
     s.trim().parse::<i32>().map_err(|_| bad_format(s))
 }

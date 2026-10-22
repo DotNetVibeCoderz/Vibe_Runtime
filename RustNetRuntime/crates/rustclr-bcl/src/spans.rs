@@ -21,6 +21,7 @@
 
 use alloc::boxed::Box;
 use alloc::format;
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use rustclr_core::{
@@ -235,9 +236,14 @@ pub fn register(interp: &mut Interpreter) {
         "AsSpan/1", "AsSpan/2", "AsSpan/3", "AsMemory/1", "AsMemory/2", "AsMemory/3",
     ] {
         interp.register_native(key("System.MemoryExtensions", member), |i, a| {
-            let Some(handle) = arg(i, a, 0)?.as_handle().filter(|h| !h.is_null()) else {
+            let Some(mut handle) = arg(i, a, 0)?.as_handle().filter(|h| !h.is_null()) else {
                 return Ok(Some(Value::Null));
             };
+            // `"text".AsSpan()`: a string never changes, so a read-only window
+            // over a copy of its characters reads exactly as one over the string.
+            if let Some(text) = i.heap.with::<ClrString, _>(handle, |s| s.to_rust_string()) {
+                handle = crate::support::char_array(i, &text);
+            }
             let available = array_length(i, handle)?;
             let start = if a.len() > 1 { arg(i, a, 1)?.as_i32().unwrap_or(0) } else { 0 };
             let length = if a.len() > 2 {
@@ -302,6 +308,30 @@ pub(crate) fn raw_span(interp: &mut Interpreter, args: &[Value]) -> ExecResult<O
 
 fn key(type_name: &str, member: &str) -> &'static str {
     Box::leak(format!("{type_name}::{member}").into_boxed_str())
+}
+
+/// `Span<T>.ToString()`: a span of characters prints as its text, as in .NET;
+/// any other span prints its type and length. Bound with the full library
+/// (`extras`), not the console subset, which has no use for it.
+pub(crate) fn span_to_string(i: &mut Interpreter, a: &[Value]) -> ExecResult<Option<Value>> {
+    let (source, start, length) = window_of(i, a, 0)?;
+    let (start, length) = (start.max(0) as usize, length.max(0) as usize);
+    let empty = matches!(source, Source::Array(h) if h.is_null());
+    let chars: Option<Vec<u16>> = match source {
+        Source::Text(units) => Some(units.iter().skip(start).take(length).copied().collect()),
+        Source::Array(array) if !array.is_null() => {
+            let char_type = i.loader.primitive_type(rustclr_core::Primitive::Char);
+            let is_char = i.heap.with::<ClrArray, _>(array, |x| x.element_type == char_type).unwrap_or(false);
+            is_char.then(|| (0..length).map(|n| element(i, array, (start + n) as i32).as_i32().unwrap_or(0) as u16).collect())
+        }
+        _ => None,
+    };
+    let text = match chars {
+        Some(units) => String::from_utf16_lossy(&units),
+        None if empty => String::new(),
+        None => format!("System.Span<T>[{length}]"),
+    };
+    Ok(Some(crate::support::string_value(i, &text)))
 }
 
 /// Every element of a span, as values.
