@@ -40,7 +40,7 @@
   <ItemGroup>
     <None Include="../icon/rustnet-128.png" Pack="true" PackagePath="icon.png" Visible="false" />
     <None Include="README.md" Pack="true" PackagePath="README.md" />
-    <None Include="$(NativeDir)/**/*" Pack="true" PackagePath="tools/$(TargetFramework)/any/native/%(RecursiveDir)%(Filename)%(Extension)" Visible="false" />
+    <None Include="$(NativeDir)/**/*" Pack="true" PackagePath="tools/$(TargetFramework)/any/native/" Visible="false" />
   </ItemGroup>
 
   <!-- A package without its binaries would install and then fail on every command. -->

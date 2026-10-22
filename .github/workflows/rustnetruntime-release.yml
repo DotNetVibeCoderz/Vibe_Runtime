@@ -160,18 +160,23 @@ jobs:
           if [ ! -f "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" ]; then
             choco install innosetup -y --no-progress
           fi
+      # PowerShell, not bash: Git Bash rewrites `/D...` switches as paths.
       - name: Compile the installers
+        shell: pwsh
         run: |
-          iscc="/c/Program Files (x86)/Inno Setup 6/ISCC.exe"
-          mkdir -p ../installers ../stage
-          for arch in x64 arm64; do
-            name="rustnet-$VERSION-win-$arch"
-            7z x -y -bso0 "../archives/$name.zip" -o../stage
-            stage="$(cygpath -w "$PWD/../stage/$name")"
-            out="$(cygpath -w "$PWD/../installers")"
-            (cd packaging/windows && "$iscc" /Q "/DAppVersion=$VERSION" "/DArch=$arch" "/DStageDir=$stage" "/DOutputDir=$out" rustnet.iss)
-          done
-          ls -la ../installers
+          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          $root = Resolve-Path ..
+          $installers = New-Item -ItemType Directory -Force (Join-Path $root 'installers')
+          $stageRoot = New-Item -ItemType Directory -Force (Join-Path $root 'stage')
+          foreach ($arch in 'x64', 'arm64') {
+            $name = "rustnet-$env:VERSION-win-$arch"
+            Expand-Archive -Force (Join-Path $root "archives\$name.zip") $stageRoot
+            $stage = Join-Path $stageRoot $name
+            if (-not (Test-Path "$stage\bin\rustnet.exe")) { throw "no rustnet.exe in $stage" }
+            & $iscc /Q "/DAppVersion=$env:VERSION" "/DArch=$arch" "/DStageDir=$stage" "/DOutputDir=$installers" packaging\windows\rustnet.iss
+            if ($LASTEXITCODE -ne 0) { throw "ISCC failed for $arch" }
+          }
+          Get-ChildItem $installers
       - name: Smoke test the x64 installer
         shell: pwsh
         working-directory: installers
