@@ -141,6 +141,7 @@ pub mod strings;
 pub mod tasks;
 pub mod threading;
 pub mod cancellation;
+pub mod paths;
 pub mod support;
 
 use rustclr_core::Interpreter;

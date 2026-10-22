@@ -58,6 +58,7 @@ pub fn register(interp: &mut Interpreter) {
     register_linq(interp);
     register_delegates(interp);
     register_misc(interp);
+    crate::paths::register(interp);
 }
 
 /// Leaks a stable key; the native table holds it for the life of the process.
