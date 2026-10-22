@@ -479,13 +479,33 @@ fn parse_int(i: &mut Interpreter, a: &[Value]) -> ExecResult<Option<Value>> {
     cleaned.parse::<i32>().map(|v| Some(Value::I32(v))).map_err(|_| bad_format(&s))
 }
 
+/// The text to parse: a string, or the characters of a `ReadOnlySpan<char>`
+/// (`double.Parse(text.AsSpan(start, n), styles, provider)` binds to the same
+/// `Parse/3` as the string overload, so both arrive here).
+fn parse_text(i: &mut Interpreter, a: &[Value], n: usize, or_empty: bool) -> ExecResult<String> {
+    let v = arg(i, a, n)?;
+    if let Value::Obj(h) = &v {
+        if let Some(s) = i.string_value(*h) {
+            return Ok(s);
+        }
+        if !h.is_null() {
+            if let Ok(Some(Value::Obj(t))) = crate::spans::span_to_string(i, &a[n..=n]) {
+                if let Some(s) = i.string_value(t).filter(|s| !s.starts_with("System.Span<T>[")) {
+                    return Ok(s);
+                }
+            }
+        }
+    }
+    if or_empty { arg_string_or_empty(i, a, n) } else { arg_string(i, a, n) }
+}
+
 fn parse_double(i: &mut Interpreter, a: &[Value]) -> ExecResult<Option<Value>> {
-    let s = arg_string(i, a, 0)?;
+    let s = parse_text(i, a, 0, false)?;
     format::parse_number(&s).map(|v| Some(Value::F(v))).ok_or_else(|| bad_format(&s))
 }
 
 fn try_parse_double(i: &mut Interpreter, a: &[Value]) -> ExecResult<Option<Value>> {
-    let s = arg_string_or_empty(i, a, 0)?;
+    let s = parse_text(i, a, 0, true)?;
     let parsed = format::parse_number(&s);
     store_out(i, a, a.len() - 1, Value::F(parsed.unwrap_or(0.0)))?;
     Ok(Some(Value::I32(parsed.is_some() as i32)))
