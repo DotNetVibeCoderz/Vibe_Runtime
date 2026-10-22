@@ -1,0 +1,54 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    The RustNetRuntime .NET tool: `dotnet tool install -g RustNetRuntime` gives the `rustnet`
+    command. The tool is a small launcher; the toolchain itself is the native `rustnet` binary
+    for each platform, packed under native/<rid>/ (CI fills that folder from its build matrix).
+    Built by Gravicode Studios, led by Kang Fadhil.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <RollForward>Major</RollForward>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>rustnet-launcher</AssemblyName>
+    <RootNamespace>RustNetRuntime.Tool</RootNamespace>
+    <InvariantGlobalization>true</InvariantGlobalization>
+
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>rustnet</ToolCommandName>
+    <PackageId>RustNetRuntime</PackageId>
+    <Version>0.1.0</Version>
+    <Title>RustNetRuntime</Title>
+    <Authors>Gravicode Studios</Authors>
+    <Company>Gravicode Studios</Company>
+    <Copyright>Gravicode Studios</Copyright>
+    <Description>RustNetRuntime: a .NET runtime (RustCLR) written in Rust. The rustnet command builds, runs, debugs, profiles, inspects and disassembles .NET assemblies on RustCLR, on Windows, Linux and macOS (x64 and arm64). Built by Gravicode Studios, led by Kang Fadhil.</Description>
+    <PackageTags>dotnet;clr;runtime;rust;interpreter;jit;il;embedded;rustnet;rustclr</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/DotNetVibeCoderz/Vibe_Runtime/tree/main/RustNetRuntime</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/DotNetVibeCoderz/Vibe_Runtime</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageIcon>icon.png</PackageIcon>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageOutputPath>$(MSBuildThisFileDirectory)../../dist/nuget</PackageOutputPath>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <!-- Where the native binaries are staged: native/<rid>/rustnet[.exe]. -->
+    <NativeDir>$(MSBuildThisFileDirectory)native</NativeDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="../icon/rustnet-128.png" Pack="true" PackagePath="icon.png" Visible="false" />
+    <None Include="README.md" Pack="true" PackagePath="README.md" />
+    <None Include="$(NativeDir)/**/*" Pack="true" PackagePath="tools/$(TargetFramework)/any/native/%(RecursiveDir)%(Filename)%(Extension)" Visible="false" />
+  </ItemGroup>
+
+  <!-- A package without its binaries would install and then fail on every command. -->
+  <Target Name="RequireNativeBinaries" BeforeTargets="GenerateNuspec">
+    <ItemGroup>
+      <_RustnetBinary Include="$(NativeDir)/*/rustnet;$(NativeDir)/*/rustnet.exe" />
+    </ItemGroup>
+    <Error Condition="'@(_RustnetBinary)' == ''" Text="No native rustnet binaries in $(NativeDir). Stage them as native/&lt;rid&gt;/rustnet[.exe] first." />
+    <Message Importance="high" Text="RustNetRuntime: packing @(_RustnetBinary->Count()) native binaries" />
+  </Target>
+</Project>

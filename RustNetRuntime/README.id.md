@@ -190,6 +190,17 @@ Rincian: [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Instalasi
 
+**Windows:** installer dari [halaman rilis](https://github.com/DotNetVibeCoderz/Vibe_Runtime/releases)
+(`RustNetRuntime-<versi>-win-x64-setup.exe`, atau arm64) menaruh `rustnet` di `PATH` dan CodeGen di
+menu Start. **Linux, macOS:** arsip untuk platform Anda dari halaman yang sama, lalu
+`./install.sh`. **Di mana saja yang ada .NET SDK:**
+
+```bash
+dotnet tool install -g RustNetRuntime    # perintah rustnet; berbeda dengan package RustNet
+```
+
+Atau bangun paket sendiri:
+
 ```bash
 ./packaging/build.sh              # untuk mesin ini
 ./packaging/build.sh linux-arm64  # atau Raspberry Pi, win-x64, osx-arm64

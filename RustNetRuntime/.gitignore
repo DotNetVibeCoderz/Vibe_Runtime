@@ -18,3 +18,7 @@ testkey.txt
 *.key
 *.pem
 backups/
+
+# Release staging: native binaries for the NuGet tool, and its output.
+packaging/nuget/native/
+/dist/nuget/

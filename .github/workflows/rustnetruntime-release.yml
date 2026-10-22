@@ -1,0 +1,299 @@
+# Release RustNetRuntime: test, build the toolchain for six platforms, make the Windows
+# installers and the archives, pack the `RustNetRuntime` .NET tool, then publish to nuget.org
+# and create a GitHub release.
+#
+# Tags are `rustnetruntime-v<version>` because this repository holds more than one runtime.
+# The version must equal [workspace.package] version in RustNetRuntime/Cargo.toml.
+#
+# A manual run is a dry run by default: everything is built and uploaded as workflow
+# artifacts, nothing is published. Publishing is irreversible (nuget.org versions can only
+# be unlisted), so it happens only after every build and smoke test is green.
+#
+# The NuGet id is RustNetRuntime. Do not confuse it with `RustNet`, the separate
+# microcontroller package published from Vibe_Framework.
+#
+# Built by Gravicode Studios, led by Kang Fadhil.
+name: Release RustNetRuntime
+
+on:
+  push:
+    tags: ['rustnetruntime-v*']
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Build everything but publish nothing'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+    working-directory: RustNetRuntime
+
+env:
+  DOTNET_NOLOGO: '1'
+  DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+  CARGO_TERM_COLOR: always
+  PACKAGE_ID: RustNetRuntime
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      publish: ${{ steps.v.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        name: Resolve the version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          cargo_version="$(sed -n '/^\[workspace.package\]/,/^\[/p' Cargo.toml | grep -m1 '^version' | sed 's/.*"\(.*\)".*/\1/')"
+          if [ "$REF_TYPE" = "tag" ]; then
+            version="${REF_NAME#rustnetruntime-v}"
+            if [ "$version" != "$cargo_version" ]; then
+              echo "::error::tag version $version does not match Cargo.toml version $cargo_version"
+              exit 1
+            fi
+            publish=true
+          else
+            version="$cargo_version"
+            if [ "$DRY_RUN" = "false" ]; then publish=true; else publish=false; fi
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "RustNetRuntime $version (publish: $publish)"
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: cargo test
+        run: cargo test --workspace --no-fail-fast
+
+  build:
+    needs: version
+    name: build ${{ matrix.rid }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { rid: win-x64,     os: windows-latest,   target: x86_64-pc-windows-msvc,    archive: zip }
+          - { rid: win-arm64,   os: windows-11-arm,   target: aarch64-pc-windows-msvc,   archive: zip }
+          - { rid: linux-x64,   os: ubuntu-22.04,     target: x86_64-unknown-linux-gnu,  archive: tar.gz }
+          - { rid: linux-arm64, os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, archive: tar.gz }
+          - { rid: osx-arm64,   os: macos-14,         target: aarch64-apple-darwin,      archive: tar.gz }
+          - { rid: osx-x64,     os: macos-14,         target: x86_64-apple-darwin,       archive: tar.gz, cross: true }
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      RID: ${{ matrix.rid }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Build the package
+        run: bash packaging/build.sh "$RID" "$TARGET"
+
+      - name: Collect
+        run: |
+          exe=""; case "$RID" in win-*) exe=".exe";; esac
+          mkdir -p ../out/native/"$RID"
+          cp "target/$TARGET/release/rustnet$exe" ../out/native/"$RID"/
+          cp "dist/rustnet-$VERSION-$RID.${{ matrix.archive }}" ../out/
+          ls -la ../out ../out/native/"$RID"
+
+      - name: Smoke test (native)
+        if: ${{ !matrix.cross }}
+        run: |
+          exe=""; case "$RID" in win-*) exe=".exe";; esac
+          rustnet="$PWD/target/$TARGET/release/rustnet$exe"
+          "$rustnet" --version
+          work="$RUNNER_TEMP/hello"
+          dotnet new console -n Hello -o "$work" --force
+          printf 'System.Console.WriteLine("Hello from RustCLR on " + System.Environment.OSVersion.Platform);\n' > "$work/Program.cs"
+          dotnet build "$work" -c Release
+          out="$("$rustnet" run "$work/bin/Release/net10.0/Hello.dll")"
+          echo "$out"
+          echo "$out" | grep -q "Hello from RustCLR"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.rid }}
+          path: out/native
+      - uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.rid }}
+          path: out/rustnet-*.${{ matrix.archive }}
+          compression-level: 0
+
+  installer:
+    needs: [version, build]
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: archive-win-*
+          path: archives
+          merge-multiple: true
+      - name: Make sure Inno Setup is there
+        run: |
+          if [ ! -f "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" ]; then
+            choco install innosetup -y --no-progress
+          fi
+      - name: Compile the installers
+        run: |
+          iscc="/c/Program Files (x86)/Inno Setup 6/ISCC.exe"
+          mkdir -p ../installers ../stage
+          for arch in x64 arm64; do
+            name="rustnet-$VERSION-win-$arch"
+            7z x -y -bso0 "../archives/$name.zip" -o../stage
+            stage="$(cygpath -w "$PWD/../stage/$name")"
+            out="$(cygpath -w "$PWD/../installers")"
+            (cd packaging/windows && "$iscc" /Q "/DAppVersion=$VERSION" "/DArch=$arch" "/DStageDir=$stage" "/DOutputDir=$out" rustnet.iss)
+          done
+          ls -la ../installers
+      - name: Smoke test the x64 installer
+        shell: pwsh
+        working-directory: installers
+        run: |
+          $setup = Get-ChildItem "RustNetRuntime-$env:VERSION-win-x64-setup.exe"
+          $dir = Join-Path $env:RUNNER_TEMP 'rnr'
+          $p = Start-Process $setup.FullName -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/CURRENTUSER',"/DIR=$dir",'/TASKS=addtopath' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "setup exited with $($p.ExitCode)" }
+          & "$dir\bin\rustnet.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw 'rustnet did not run' }
+          $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+          if (-not ($userPath.Split(';') -contains "$dir\bin")) { throw 'bin was not added to the user PATH' }
+          if (-not (Test-Path "$dir\codegen\CodeGen.exe")) { throw 'CodeGen was not installed' }
+          $u = Start-Process "$dir\unins000.exe" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES' -Wait -PassThru
+          Start-Sleep -Seconds 3
+          $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+          if ($userPath -and ($userPath.Split(';') -contains "$dir\bin")) { throw 'uninstall left bin on PATH' }
+          Write-Host 'installer: install, PATH, CodeGen and uninstall all fine'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installers
+          path: installers/*.exe
+          compression-level: 0
+
+  nuget:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: RustNetRuntime/packaging/nuget/native
+          merge-multiple: true
+      - name: Pack
+        run: |
+          find packaging/nuget/native -type f | sort
+          count="$(find packaging/nuget/native -type f -name 'rustnet*' | wc -l)"
+          [ "$count" -eq 6 ] || { echo "::error::expected 6 native binaries, found $count"; exit 1; }
+          dotnet pack packaging/nuget/RustNetRuntime.Tool.csproj -c Release -p:Version="$VERSION"
+          ls -la dist/nuget
+          test -f "dist/nuget/$PACKAGE_ID.$VERSION.nupkg"
+      - name: Smoke test the tool
+        run: |
+          dotnet tool install "$PACKAGE_ID" --version "$VERSION" --tool-path "$RUNNER_TEMP/tools" --add-source "$PWD/dist/nuget"
+          "$RUNNER_TEMP/tools/rustnet" --version
+          work="$RUNNER_TEMP/hello"
+          dotnet new console -n Hello -o "$work" --force
+          printf 'System.Console.WriteLine("Hello from the RustNetRuntime tool");\n' > "$work/Program.cs"
+          dotnet build "$work" -c Release
+          "$RUNNER_TEMP/tools/rustnet" run "$work/bin/Release/net10.0/Hello.dll" | tee "$RUNNER_TEMP/out.txt"
+          grep -q "Hello from the RustNetRuntime tool" "$RUNNER_TEMP/out.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nuget
+          path: RustNetRuntime/dist/nuget/*.nupkg
+          compression-level: 0
+
+  publish:
+    needs: [version, test, build, installer, nuget]
+    if: needs.version.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      TAG: rustnetruntime-v${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          pattern: archive-*
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          name: installers
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          name: nuget
+      - name: Checksums
+        working-directory: ../assets
+        run: |
+          ls -la
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Push to nuget.org
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: |
+          [ -n "$NUGET_API_KEY" ] || { echo "::error::the NUGET_API_KEY secret is not set"; exit 1; }
+          nupkg="../assets/$PACKAGE_ID.$VERSION.nupkg"
+          test -f "$nupkg"
+          # One explicit file, and only this id: `RustNet` is a different product.
+          dotnet nuget push "$nupkg" --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json --skip-duplicate
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > ../notes.md <<NOTES
+          RustNetRuntime $VERSION: a .NET runtime (RustCLR) written in Rust.
+
+          **Windows:** run \`RustNetRuntime-$VERSION-win-x64-setup.exe\` (or arm64). It installs per user, puts \`rustnet\` on PATH and adds the CodeGen IDE to the Start menu.
+          **Linux and macOS:** unpack the archive for your platform and run \`./install.sh\`.
+          **.NET tool:** \`dotnet tool install -g RustNetRuntime\` gives the \`rustnet\` command on every platform.
+
+          You need the .NET SDK to compile C#. Checksums are in SHA256SUMS.txt.
+
+          Built by Gravicode Studios, led by Kang Fadhil. · Dibuat oleh Gravicode Studios dipimpin oleh Kang Fadhil.
+          NOTES
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" ../assets/* --clobber
+          else
+            gh release create "$TAG" ../assets/* --title "RustNetRuntime $VERSION" --notes-file ../notes.md --target "$GITHUB_SHA"
+          fi

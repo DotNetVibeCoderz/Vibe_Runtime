@@ -44,7 +44,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 authors = ["Gravicode Studios <studio@gravicode.com>"]
-repository = "https://github.com/gravicode/RustNetRuntime"
+repository = "https://github.com/DotNetVibeCoderz/Vibe_Runtime"
 rust-version = "1.85"
 
 [workspace.dependencies]

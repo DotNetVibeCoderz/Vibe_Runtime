@@ -24,6 +24,29 @@ pertama Anda gagal dengan pesan yang membingungkan.
 
 ## Memasang
 
+### Dari rilis (cara cepat)
+
+Setiap rilis di [halaman rilis](https://github.com/DotNetVibeCoderz/Vibe_Runtime/releases)
+berisi, untuk versi `0.1.0`:
+
+| Berkas | Untuk |
+| --- | --- |
+| `RustNetRuntime-0.1.0-win-x64-setup.exe`, `…-win-arm64-setup.exe` | Installer Windows: per pengguna (tanpa hak admin; pemasangan untuk semua pengguna juga ditawarkan), menaruh `rustnet` di `PATH`, CodeGen di menu Start, dan uninstaller di Apps |
+| `rustnet-0.1.0-<rid>.zip` / `.tar.gz` | Paket untuk `win-x64`, `win-arm64`, `linux-x64`, `linux-arm64`, `osx-x64`, `osx-arm64`, dipasang seperti di bawah |
+| `RustNetRuntime.0.1.0.nupkg` | .NET tool, juga ada di nuget.org |
+| `SHA256SUMS.txt` | Checksum semua berkas di atas |
+
+Atau, cukup dengan .NET SDK:
+
+```bash
+dotnet tool install -g RustNetRuntime
+rustnet --version
+```
+
+Tool ini membawa toolchain `rustnet` untuk keenam platform (tanpa CodeGen). ID NuGet-nya
+**RustNetRuntime**; `RustNet` di nuget.org adalah package lain, yaitu framework untuk
+mikrokontroler.
+
 ### Linux dan macOS
 
 ```bash

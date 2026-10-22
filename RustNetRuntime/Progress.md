@@ -19,6 +19,30 @@ PrimeSieve     IDENTICAL   (written by Jack from a prompt)
 SensorGateway  IDENTICAL   (edited by Jack from a prompt)
 ```
 
+## 2026-10-22 — release 0.1.0: installers, archives and the RustNetRuntime .NET tool
+
+- `.github/workflows/rustnetruntime-release.yml` (repository root): on a
+  `rustnetruntime-v*` tag, or by hand as a dry run, it runs `cargo test`, builds
+  `packaging/build.sh` natively on six runners (win-x64, win-arm64, linux-x64,
+  linux-arm64, osx-arm64, and osx-x64 cross-built on arm64), runs a C# hello
+  world on each native build, compiles the Windows installers, packs the .NET
+  tool, then pushes to nuget.org and creates the GitHub release with
+  `SHA256SUMS.txt`.
+- `packaging/windows/rustnet.iss`: Inno Setup installer. Per user by default,
+  `rustnet` on `PATH` (removed again on uninstall), CodeGen in the Start menu,
+  a command-prompt shortcut. CI installs it silently, checks `rustnet`, `PATH`
+  and CodeGen, and uninstalls it.
+- `packaging/nuget`: the `RustNetRuntime` .NET tool (command `rustnet`), a
+  launcher over the native binary for the machine's platform, with all six
+  inside; it sets the executable bit that NuGet drops. NuGet id
+  **RustNetRuntime**, because `RustNet` is the separate microcontroller package.
+  Verified locally: packed with the win-x64 binary, installed, `--version` and
+  exit codes pass through.
+- `packaging/icon`: the icon (a hex nut with a run prompt in its bore), as SVG,
+  PNGs and a multi-size `.ico`; also CodeGen's application icon.
+- Install docs (English and Indonesian) and both READMEs describe the release
+  files and the tool.
+
 ## 2026-10-11 — fixes found by Rustzor's apps
 
 Rustzor (C# web apps on this runtime in WebAssembly) drove these out with real

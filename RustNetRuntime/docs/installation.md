@@ -24,6 +24,29 @@ error.
 
 ## Install
 
+### From a release (the quick way)
+
+Every release on the [releases page](https://github.com/DotNetVibeCoderz/Vibe_Runtime/releases)
+has, for version `0.1.0`:
+
+| File | For |
+| --- | --- |
+| `RustNetRuntime-0.1.0-win-x64-setup.exe`, `…-win-arm64-setup.exe` | Windows installer: per user (no elevation; an all-users install is offered), puts `rustnet` on `PATH`, CodeGen in the Start menu, an uninstaller in Apps |
+| `rustnet-0.1.0-<rid>.zip` / `.tar.gz` | The package for `win-x64`, `win-arm64`, `linux-x64`, `linux-arm64`, `osx-x64`, `osx-arm64`, installed as below |
+| `RustNetRuntime.0.1.0.nupkg` | The .NET tool, also on nuget.org |
+| `SHA256SUMS.txt` | Checksums of all of the above |
+
+Or, with only the .NET SDK:
+
+```bash
+dotnet tool install -g RustNetRuntime
+rustnet --version
+```
+
+The tool carries the `rustnet` toolchain for all six platforms (not CodeGen). Its NuGet id is
+**RustNetRuntime**; `RustNet` on nuget.org is a different package, the microcontroller
+framework.
+
 ### Linux and macOS
 
 ```bash

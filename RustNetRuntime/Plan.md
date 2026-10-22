@@ -357,3 +357,8 @@ would hit. Neither is allowed to drift from the code.
 
 **CodeGen.** Track the runtime: as the supported IL subset grows, the templates
 marked *runs on RustCLR* grow with it.
+
+**Releases.** Tag `rustnetruntime-v<version>` (equal to the workspace version)
+to publish installers, archives and the `RustNetRuntime` .NET tool; a manual run
+of the release workflow is a dry run. Next: sign the Windows installers and
+binaries, and a winget manifest.

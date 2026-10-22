@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- RustNetRuntime: a hex nut (Rust, the metal it runs on) whose bore holds a run prompt
+       (C# running). Built by Gravicode Studios, led by Kang Fadhil. -->
+  <defs>
+    <linearGradient id="face" x1="0.15" y1="0" x2="0.85" y2="1">
+      <stop offset="0" stop-color="#F08A55"/>
+      <stop offset="0.45" stop-color="#D75F33"/>
+      <stop offset="1" stop-color="#8E3D20"/>
+    </linearGradient>
+    <linearGradient id="chamfer" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FFD58A"/>
+      <stop offset="0.5" stop-color="#D9A441"/>
+      <stop offset="1" stop-color="#7A4A12"/>
+    </linearGradient>
+    <radialGradient id="bore" cx="0.42" cy="0.38" r="0.75">
+      <stop offset="0" stop-color="#3A2219"/>
+      <stop offset="1" stop-color="#140B08"/>
+    </radialGradient>
+    <linearGradient id="thread" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5B2A16"/>
+      <stop offset="1" stop-color="#2A140C"/>
+    </linearGradient>
+  </defs>
+
+  <!-- the nut: rounded hexagon, flat sides left and right -->
+  <path d="M256 22 L459 139 Q470 145 470 158 L470 354 Q470 367 459 373 L256 490 Q256 490 256 490 L53 373 Q42 367 42 354 L42 158 Q42 145 53 139 Z"
+        fill="url(#chamfer)"/>
+  <path d="M256 46 L444 154 Q450 158 450 165 L450 347 Q450 354 444 358 L256 466 L68 358 Q62 354 62 347 L62 165 Q62 158 68 154 Z"
+        fill="url(#face)"/>
+  <!-- light on the upper faces, shade on the lower ones -->
+  <path d="M256 46 L444 154 Q450 158 450 165 L450 200 L256 92 L62 200 L62 165 Q62 158 68 154 Z" fill="#FFFFFF" opacity="0.14"/>
+  <path d="M62 312 L256 420 L450 312 L450 347 Q450 354 444 358 L256 466 L68 358 Q62 354 62 347 Z" fill="#000000" opacity="0.16"/>
+
+  <!-- the bore: thread ring, then the dark opening -->
+  <circle cx="256" cy="256" r="142" fill="url(#thread)"/>
+  <circle cx="256" cy="256" r="142" fill="none" stroke="#D9A441" stroke-width="7" stroke-dasharray="9 13" opacity="0.55"/>
+  <circle cx="256" cy="256" r="122" fill="url(#bore)"/>
+  <circle cx="256" cy="256" r="122" fill="none" stroke="#000" stroke-opacity="0.35" stroke-width="4"/>
+
+  <!-- the run prompt -->
+  <path d="M190 196 L262 256 L190 316" fill="none" stroke="#FFF3EC" stroke-width="34" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="270" y="292" width="64" height="26" rx="8" fill="#D9A441"/>
+</svg>

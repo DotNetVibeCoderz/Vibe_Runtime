@@ -185,6 +185,17 @@ Detail: [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Install
 
+**Windows:** the installer from the [releases page](https://github.com/DotNetVibeCoderz/Vibe_Runtime/releases)
+(`RustNetRuntime-<version>-win-x64-setup.exe`, or arm64) puts `rustnet` on `PATH` and CodeGen in
+the Start menu. **Linux, macOS:** the archive for your platform from the same page, then
+`./install.sh`. **Anywhere with the .NET SDK:**
+
+```bash
+dotnet tool install -g RustNetRuntime    # the rustnet command; not to be confused with the RustNet package
+```
+
+Or build a package yourself:
+
 ```bash
 ./packaging/build.sh              # for this machine
 ./packaging/build.sh linux-arm64  # or a Raspberry Pi, win-x64, osx-arm64
