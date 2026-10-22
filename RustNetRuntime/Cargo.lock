@@ -10,7 +10,7 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "rustclr-bcl"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libm",
  "rustclr-core",
@@ -25,7 +25,7 @@ dependencies = [
 
 [[package]]
 name = "rustclr-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rustclr-gc",
  "rustclr-gfx",
@@ -37,15 +37,15 @@ dependencies = [
 
 [[package]]
 name = "rustclr-crypto"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "rustclr-db"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "rustclr-device"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rustclr-flashfs",
  "rustclr-hal",
@@ -55,26 +55,26 @@ dependencies = [
 
 [[package]]
 name = "rustclr-diag"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "rustclr-espat"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "rustclr-flashfs"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rustclr-hal",
 ]
 
 [[package]]
 name = "rustclr-gc"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "rustclr-gfx"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rustclr-hal",
  "rustclr-hal-host",
@@ -82,46 +82,46 @@ dependencies = [
 
 [[package]]
 name = "rustclr-hal"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "rustclr-hal-esp32c3"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rustclr-hal",
 ]
 
 [[package]]
 name = "rustclr-hal-host"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rustclr-hal",
 ]
 
 [[package]]
 name = "rustclr-hal-k210"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rustclr-hal",
 ]
 
 [[package]]
 name = "rustclr-hal-rp2040"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rustclr-hal",
 ]
 
 [[package]]
 name = "rustclr-hal-stm32"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rustclr-hal",
 ]
 
 [[package]]
 name = "rustclr-interop"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rustclr-core",
  "rustclr-gc",
@@ -129,7 +129,7 @@ dependencies = [
 
 [[package]]
 name = "rustclr-jit"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rustclr-bcl",
  "rustclr-core",
@@ -138,15 +138,15 @@ dependencies = [
 
 [[package]]
 name = "rustclr-metadata"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "rustclr-mqtt"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "rustclr-net"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rustclr-diag",
  "rustclr-mqtt",
@@ -154,7 +154,7 @@ dependencies = [
 
 [[package]]
 name = "rustclr-ota"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rustclr-crypto",
  "rustclr-secureboot",
@@ -162,26 +162,26 @@ dependencies = [
 
 [[package]]
 name = "rustclr-rndp"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "rustclr-sched"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "rustclr-secureboot"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rustclr-crypto",
 ]
 
 [[package]]
 name = "rustclr-usb"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "rustnet-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rustclr-bcl",
  "rustclr-core",

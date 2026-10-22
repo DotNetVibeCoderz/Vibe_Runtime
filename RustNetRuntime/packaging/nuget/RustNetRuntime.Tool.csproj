@@ -18,7 +18,7 @@
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>rustnet</ToolCommandName>
     <PackageId>RustNetRuntime</PackageId>
-    <Version>0.1.0</Version>
+    <Version>0.1.1</Version>
     <Title>RustNetRuntime</Title>
     <Authors>Gravicode Studios</Authors>
     <Company>Gravicode Studios</Company>

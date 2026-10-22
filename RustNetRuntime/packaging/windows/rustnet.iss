@@ -1,14 +1,14 @@
 ; RustNetRuntime installer for Windows (Inno Setup 6).
 ; Built by Gravicode Studios, led by Kang Fadhil.
 ;
-;   iscc /DAppVersion=0.1.0 /DStageDir=..\..\dist\rustnet-0.1.0-win-x64 /DArch=x64 /DOutputDir=..\..\dist rustnet.iss
+;   iscc /DAppVersion=0.1.1 /DStageDir=..\..\dist\rustnet-0.1.1-win-x64 /DArch=x64 /DOutputDir=..\..\dist rustnet.iss
 ;
 ; StageDir is a tree made by packaging/build.sh: bin\rustnet.exe, codegen\ (optional),
 ; docs\, samples\, README*, LICENSE, VERSION. Installs per user by default (no elevation);
 ; the user can choose an all-users install, which asks for elevation.
 
 #ifndef AppVersion
-  #define AppVersion "0.1.0"
+  #define AppVersion "0.1.1"
 #endif
 #ifndef Arch
   #define Arch "x64"

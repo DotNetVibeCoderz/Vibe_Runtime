@@ -27,13 +27,13 @@ error.
 ### From a release (the quick way)
 
 Every release on the [releases page](https://github.com/DotNetVibeCoderz/Vibe_Runtime/releases)
-has, for version `0.1.0`:
+has, for version `0.1.1`:
 
 | File | For |
 | --- | --- |
-| `RustNetRuntime-0.1.0-win-x64-setup.exe`, `…-win-arm64-setup.exe` | Windows installer: per user (no elevation; an all-users install is offered), puts `rustnet` on `PATH`, CodeGen in the Start menu, an uninstaller in Apps |
-| `rustnet-0.1.0-<rid>.zip` / `.tar.gz` | The package for `win-x64`, `win-arm64`, `linux-x64`, `linux-arm64`, `osx-x64`, `osx-arm64`, installed as below |
-| `RustNetRuntime.0.1.0.nupkg` | The .NET tool, also on nuget.org |
+| `RustNetRuntime-0.1.1-win-x64-setup.exe`, `…-win-arm64-setup.exe` | Windows installer: per user (no elevation; an all-users install is offered), puts `rustnet` on `PATH`, CodeGen in the Start menu, an uninstaller in Apps |
+| `rustnet-0.1.1-<rid>.zip` / `.tar.gz` | The package for `win-x64`, `win-arm64`, `linux-x64`, `linux-arm64`, `osx-x64`, `osx-arm64`, installed as below |
+| `RustNetRuntime.0.1.1.nupkg` | The .NET tool, also on nuget.org |
 | `SHA256SUMS.txt` | Checksums of all of the above |
 
 Or, with only the .NET SDK:
@@ -50,8 +50,8 @@ framework.
 ### Linux and macOS
 
 ```bash
-tar xzf rustnet-0.1.0-linux-x64.tar.gz
-cd rustnet-0.1.0-linux-x64
+tar xzf rustnet-0.1.1-linux-x64.tar.gz
+cd rustnet-0.1.1-linux-x64
 ./install.sh
 ```
 
@@ -71,8 +71,8 @@ On Linux a desktop entry is added so CodeGen appears in your application menu.
 ### Windows
 
 ```powershell
-Expand-Archive rustnet-0.1.0-win-x64.zip
-cd rustnet-0.1.0-win-x64
+Expand-Archive rustnet-0.1.1-win-x64.zip
+cd rustnet-0.1.1-win-x64
 .\install.ps1
 ```
 

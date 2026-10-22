@@ -19,6 +19,20 @@ PrimeSieve     IDENTICAL   (written by Jack from a prompt)
 SensorGateway  IDENTICAL   (edited by Jack from a prompt)
 ```
 
+## 2026-10-23 — release 0.1.1
+
+- Version 0.1.1 (installers, archives, the `RustNetRuntime` .NET tool), built by
+  the same release workflow. Fixes since 0.1.0, each with a conformance check
+  that runs on .NET and on RustCLR (488 checks, identical):
+  - explicitly implemented interface members on generic type instantiations
+    are found (a Razor `NavLink` `@onclick` crashed without it);
+  - `String.IndexOf(string, int, StringComparison)` and
+    `(string, int, int, StringComparison)`, and an exact binding for
+    `IndexOf(char, int, int)`;
+  - delegate targets stay rooted while an event is invoked, so a collection
+    mid-call cannot free a handler's object;
+  - `double.Parse` and `double.TryParse` over `ReadOnlySpan<char>`.
+
 ## 2026-10-22 — release 0.1.0: installers, archives and the RustNetRuntime .NET tool
 
 - `.github/workflows/rustnetruntime-release.yml` (repository root): on a
