@@ -18,8 +18,10 @@ use crate::time::Instant;
 /// `Ok`.
 pub type Result<T> = core::result::Result<T, Box<dyn Any + Send + 'static>>;
 
-/// Stack size when the caller does not ask for one.
-pub const DEFAULT_STACK: usize = 8 << 20;
+/// Stack size when the caller does not ask for one: std's default (2 MiB).
+/// An embedder without demand paging commits it up front, so it is worth
+/// keeping to what std itself gives a thread.
+pub const DEFAULT_STACK: usize = 2 << 20;
 
 /// The id of a thread.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -207,6 +209,6 @@ impl Builder {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
-        spawn_with(self.stack_size.unwrap_or(DEFAULT_STACK).max(DEFAULT_STACK), body)
+        spawn_with(self.stack_size.unwrap_or(DEFAULT_STACK), body)
     }
 }
