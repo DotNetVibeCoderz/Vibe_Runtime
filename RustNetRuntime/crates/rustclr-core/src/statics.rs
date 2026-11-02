@@ -16,20 +16,20 @@
 use crate::prelude::*;
 use crate::value::Value;
 
-#[cfg(feature = "std")]
-use std::sync::{Arc, Mutex, MutexGuard};
+#[cfg(feature = "threads")]
+use rustclr_thread::sync::{Arc, Mutex, MutexGuard};
 
-#[cfg(not(feature = "std"))]
+#[cfg(not(feature = "threads"))]
 use alloc::rc::Rc;
-#[cfg(not(feature = "std"))]
+#[cfg(not(feature = "threads"))]
 use core::cell::{RefCell, RefMut};
 
 /// Static-field values, indexed by `FieldId`.
 #[derive(Clone, Default)]
 pub struct SharedStatics {
-    #[cfg(feature = "std")]
+    #[cfg(feature = "threads")]
     inner: Arc<Mutex<Vec<Value>>>,
-    #[cfg(not(feature = "std"))]
+    #[cfg(not(feature = "threads"))]
     inner: Rc<RefCell<Vec<Value>>>,
 }
 
@@ -40,14 +40,14 @@ impl SharedStatics {
     /// value out and a write puts one in, so the guard never spans managed
     /// code. Holding one across a call would deadlock the moment that call
     /// touched another static.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "threads")]
     pub fn lock(&self) -> MutexGuard<'_, Vec<Value>> {
         // A poisoned lock means a thread panicked mid-write. There is no
         // sensible half-updated static, so this propagates.
         self.inner.lock().expect("static storage is poisoned")
     }
 
-    #[cfg(not(feature = "std"))]
+    #[cfg(not(feature = "threads"))]
     pub fn lock(&self) -> RefMut<'_, Vec<Value>> {
         self.inner.borrow_mut()
     }

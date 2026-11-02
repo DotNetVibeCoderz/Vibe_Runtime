@@ -31,6 +31,7 @@ members = [
     "crates/rustclr-mqtt",
     "crates/rustclr-diag",
     "crates/rustclr-gc",
+    "crates/rustclr-thread",
     "crates/rustclr-sched",
     "crates/rustclr-interop",
     "crates/rustclr-core",
@@ -67,6 +68,7 @@ rustclr-usb      = { path = "crates/rustclr-usb",      version = "0.1.0" }
 rustclr-mqtt     = { path = "crates/rustclr-mqtt",     version = "0.1.0" }
 rustclr-diag     = { path = "crates/rustclr-diag",     version = "0.1.0" }
 rustclr-gc       = { path = "crates/rustclr-gc",       version = "0.1.0" }
+rustclr-thread   = { path = "crates/rustclr-thread",   version = "0.1.0" }
 rustclr-sched    = { path = "crates/rustclr-sched",    version = "0.1.0" }
 rustclr-interop  = { path = "crates/rustclr-interop",  version = "0.1.0" }
 rustclr-core     = { path = "crates/rustclr-core",     version = "0.1.0" }

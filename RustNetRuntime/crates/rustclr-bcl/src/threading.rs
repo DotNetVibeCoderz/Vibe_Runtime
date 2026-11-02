@@ -99,11 +99,11 @@ fn register_thread(interp: &mut Interpreter) {
 /// Runs the thread body synchronously; see this module's note on serialisation.
 /// The slot on a `Thread` holding the id of the OS thread it started.
 /// Unused without `std`, where `Thread.Start` runs the body synchronously.
-#[cfg(feature = "std")]
+#[cfg(feature = "threads")]
 const THREAD_ID: usize = 1;
 
 /// `Thread.Start()` — spawns.
-#[cfg(feature = "std")]
+#[cfg(feature = "threads")]
 fn start_thread(interp: &mut Interpreter, args: &[Value]) -> ExecResult<Option<Value>> {
     let this = arg_handle(interp, args, 0)?;
     let body = interp
@@ -129,12 +129,12 @@ fn start_thread(interp: &mut Interpreter, args: &[Value]) -> ExecResult<Option<V
 }
 
 /// Without `std` there is nothing to spawn onto, so the body runs inline.
-#[cfg(not(feature = "std"))]
+#[cfg(not(feature = "threads"))]
 fn start_thread(interp: &mut Interpreter, args: &[Value]) -> ExecResult<Option<Value>> {
     run_thread_body(interp, args)
 }
 
-#[cfg(feature = "std")]
+#[cfg(feature = "threads")]
 fn join_thread(interp: &mut Interpreter, args: &[Value]) -> ExecResult<Option<Value>> {
     let this = arg_handle(interp, args, 0)?;
     let id = interp
@@ -148,7 +148,7 @@ fn join_thread(interp: &mut Interpreter, args: &[Value]) -> ExecResult<Option<Va
     Ok(None)
 }
 
-#[cfg(not(feature = "std"))]
+#[cfg(not(feature = "threads"))]
 fn join_thread(_i: &mut Interpreter, _a: &[Value]) -> ExecResult<Option<Value>> {
     Ok(None)
 }

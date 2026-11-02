@@ -10,6 +10,11 @@ rust-version.workspace = true
 
 [features]
 default = ["std"]
-std = []
+std = ["threads", "rustclr-thread/std"]
+# Several mutator threads over one heap (a lock around it, stop-the-world
+# collection at safe points). Implied by `std`; without `std` the threads,
+# locks and clocks come from the embedder through `rustclr-thread`'s hooks.
+threads = ["dep:rustclr-thread"]
 
 [dependencies]
+rustclr-thread = { path = "../rustclr-thread", version = "0.1.0", default-features = false, optional = true }

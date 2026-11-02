@@ -10,7 +10,10 @@ rust-version.workspace = true
 
 [features]
 default = ["std"]
-std = ["dep:rustclr-net", "rustclr-core/std", "rustclr-gc/std", "rustclr-hal/std"]
+std = ["dep:rustclr-net", "rustclr-core/std", "rustclr-gc/std", "rustclr-hal/std", "threads", "rustclr-thread/std"]
+# Real managed threads (`Thread`, `Task.Run`, `Parallel`, `Monitor`). Implied by
+# `std`; without it the embedder installs `rustclr_thread::Hooks`.
+threads = ["rustclr-core/threads", "rustclr-gc/threads", "dep:rustclr-thread"]
 # Float maths from libm instead of std. Enable together with no-default-features.
 libm-math = ["dep:libm"]
 
@@ -19,6 +22,7 @@ libm-math = ["dep:libm"]
 # features on, and RustBCL has to be buildable without `std`.
 rustclr-core = { path = "../rustclr-core", version = "0.1.0", default-features = false }
 rustclr-gc = { path = "../rustclr-gc", version = "0.1.0", default-features = false }
+rustclr-thread = { path = "../rustclr-thread", version = "0.1.0", default-features = false, optional = true }
 # The board seam the `RustNet.Hal` bindings talk to.
 rustclr-hal = { path = "../rustclr-hal", version = "0.1.0", default-features = false }
 # The store behind `RustNet.IO`.

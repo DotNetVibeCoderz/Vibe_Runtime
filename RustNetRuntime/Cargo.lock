@@ -21,6 +21,7 @@ dependencies = [
  "rustclr-hal",
  "rustclr-hal-host",
  "rustclr-net",
+ "rustclr-thread",
 ]
 
 [[package]]
@@ -33,6 +34,7 @@ dependencies = [
  "rustclr-metadata",
  "rustclr-net",
  "rustclr-sched",
+ "rustclr-thread",
 ]
 
 [[package]]
@@ -71,6 +73,9 @@ dependencies = [
 [[package]]
 name = "rustclr-gc"
 version = "0.1.1"
+dependencies = [
+ "rustclr-thread",
+]
 
 [[package]]
 name = "rustclr-gfx"
@@ -167,6 +172,9 @@ version = "0.1.1"
 [[package]]
 name = "rustclr-sched"
 version = "0.1.1"
+dependencies = [
+ "rustclr-thread",
+]
 
 [[package]]
 name = "rustclr-secureboot"
@@ -174,6 +182,10 @@ version = "0.1.1"
 dependencies = [
  "rustclr-crypto",
 ]
+
+[[package]]
+name = "rustclr-thread"
+version = "0.1.1"
 
 [[package]]
 name = "rustclr-usb"

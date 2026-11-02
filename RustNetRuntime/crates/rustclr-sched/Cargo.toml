@@ -8,4 +8,12 @@ authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["std"]
+# The thread pool and channels. Without it only the lock-free queue is built
+# (no_std + alloc, over `rustclr-thread`), which is what the runtime's task
+# pool needs.
+std = ["rustclr-thread/std"]
+
 [dependencies]
+rustclr-thread = { path = "../rustclr-thread", version = "0.1.0", default-features = false }

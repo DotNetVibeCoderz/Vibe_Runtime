@@ -40,9 +40,12 @@ extern crate alloc;
 ///   small integer ids, tuples of them, or names — all `Ord` — so this costs
 ///   nothing but a different iteration order. Nothing in the runtime depends
 ///   on map order, and a microcontroller has no business pulling in a hasher.
-/// * `Arc` is an `Rc` without `std`. RISC-V `imc` has no atomics, so `Arc`
-///   does not exist there; the interpreter is single-threaded on a chip, which
-///   is exactly when `Rc` is the right type anyway.
+/// * `Arc` is an `Rc` without `std` -- unless the `threads` feature is on.
+///   RISC-V `imc` has no atomics, so `Arc` does not exist there; the
+///   interpreter is single-threaded on a chip, which is exactly when `Rc` is
+///   the right type anyway. An embedder that supplies threads without `std`
+///   (`rustclr-thread`'s hooks) needs the real `Arc`, since what it shares
+///   crosses threads.
 pub(crate) mod prelude {
     #[cfg(not(feature = "std"))]
     #[allow(unused_imports)]
@@ -52,11 +55,16 @@ pub(crate) mod prelude {
         collections::BTreeMap as HashMap,
         collections::VecDeque,
         format,
-        rc::Rc as Arc,
         string::{String, ToString},
         vec,
         vec::Vec,
     };
+    #[cfg(all(not(feature = "std"), not(feature = "threads")))]
+    #[allow(unused_imports)]
+    pub(crate) use alloc::rc::Rc as Arc;
+    #[cfg(all(not(feature = "std"), feature = "threads"))]
+    #[allow(unused_imports)]
+    pub(crate) use alloc::sync::Arc;
     #[cfg(feature = "std")]
     #[allow(unused_imports)]
     pub(crate) use std::{
@@ -81,7 +89,7 @@ pub mod host;
 pub mod interp;
 pub mod loader;
 pub mod monitor;
-#[cfg(feature = "std")]
+#[cfg(feature = "threads")]
 pub mod pool;
 pub mod profile;
 pub mod rowmap;

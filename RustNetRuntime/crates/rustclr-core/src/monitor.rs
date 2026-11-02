@@ -22,14 +22,14 @@
 
 use crate::prelude::*;
 
-#[cfg(feature = "std")]
-use std::sync::{Arc, Condvar, Mutex};
-#[cfg(feature = "std")]
-use std::thread::ThreadId;
+#[cfg(feature = "threads")]
+use rustclr_thread::sync::{Arc, Condvar, Mutex};
+#[cfg(feature = "threads")]
+use rustclr_thread::thread::ThreadId;
 
 use rustclr_gc::Handle;
 
-#[cfg(feature = "std")]
+#[cfg(feature = "threads")]
 #[derive(Default)]
 struct State {
     /// Owner and recursion depth, by locked object.
@@ -57,26 +57,26 @@ pub enum Wait {
 }
 
 /// Whether a deadline has passed. `None` never has.
-#[cfg(feature = "std")]
-fn timed_out(deadline: Option<std::time::Instant>) -> bool {
-    deadline.is_some_and(|at| std::time::Instant::now() >= at)
+#[cfg(feature = "threads")]
+fn timed_out(deadline: Option<rustclr_thread::time::Instant>) -> bool {
+    deadline.is_some_and(|at| rustclr_thread::time::Instant::now() >= at)
 }
 
 /// The monitors of one runtime.
-#[cfg(feature = "std")]
+#[cfg(feature = "threads")]
 #[derive(Clone, Default)]
 pub struct Monitors {
     inner: Arc<Inner>,
 }
 
-#[cfg(feature = "std")]
+#[cfg(feature = "threads")]
 #[derive(Default)]
 struct Inner {
     state: Mutex<State>,
     released: Condvar,
 }
 
-#[cfg(feature = "std")]
+#[cfg(feature = "threads")]
 impl Monitors {
     /// Takes the monitor on `object`, waiting if another thread holds it.
     ///
@@ -84,7 +84,7 @@ impl Monitors {
     /// as stopped while it cannot poll. It is a closure rather than a guard
     /// because the caller owns the mutator registry and this module does not.
     pub fn enter(&self, object: Handle, blocked: &mut dyn FnMut(&mut dyn FnMut())) {
-        let me = std::thread::current().id();
+        let me = rustclr_thread::thread::current().id();
         let key = object.to_bits();
 
         // The fast path: uncontended, or already ours.
@@ -135,7 +135,7 @@ impl Monitors {
     /// `Enter` never completed, and throwing there would replace the real
     /// exception with a misleading one.
     pub fn exit(&self, object: Handle) {
-        let me = std::thread::current().id();
+        let me = rustclr_thread::thread::current().id();
         let mut state = self.lock();
         let key = object.to_bits();
         let Some((owner, depth)) = state.held.get_mut(&key) else { return };
@@ -152,7 +152,7 @@ impl Monitors {
 
     /// Whether this thread holds the monitor, for `Pulse` and diagnostics.
     pub fn holds(&self, object: Handle) -> bool {
-        let me = std::thread::current().id();
+        let me = rustclr_thread::thread::current().id();
         self.lock()
             .held
             .get(&object.to_bits())
@@ -173,7 +173,7 @@ impl Monitors {
         timeout: Option<core::time::Duration>,
         blocked: &mut dyn FnMut(&mut dyn FnMut()),
     ) -> Wait {
-        let me = std::thread::current().id();
+        let me = rustclr_thread::thread::current().id();
         let key = object.to_bits();
 
         // Release fully, remembering how deep we were.
@@ -190,7 +190,7 @@ impl Monitors {
         };
         self.inner.released.notify_all();
 
-        let deadline = timeout.map(|t| std::time::Instant::now() + t);
+        let deadline = timeout.map(|t| rustclr_thread::time::Instant::now() + t);
         let mut pulsed = false;
         blocked(&mut || {
             let mut state = self.lock();
@@ -208,7 +208,7 @@ impl Monitors {
                 }
                 state = match deadline {
                     Some(at) => {
-                        let left = at.saturating_duration_since(std::time::Instant::now());
+                        let left = at.saturating_duration_since(rustclr_thread::time::Instant::now());
                         // A floor, so a thread that has timed out still wakes to
                         // notice the monitor becoming free.
                         let left = left.max(core::time::Duration::from_millis(1));
@@ -247,7 +247,7 @@ impl Monitors {
         self.inner.released.notify_all();
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+    fn lock(&self) -> rustclr_thread::sync::MutexGuard<'_, State> {
         self.inner.state.lock().expect("the monitor registry is poisoned")
     }
 }
@@ -256,13 +256,13 @@ impl Monitors {
 ///
 /// It still counts, because `lock` is re-entrant and the count is what tells
 /// a nested `Exit` not to release too early.
-#[cfg(not(feature = "std"))]
+#[cfg(not(feature = "threads"))]
 #[derive(Clone, Default)]
 pub struct Monitors {
     inner: alloc::rc::Rc<core::cell::RefCell<HashMap<u64, usize>>>,
 }
 
-#[cfg(not(feature = "std"))]
+#[cfg(not(feature = "threads"))]
 impl Monitors {
     pub fn enter(&self, object: Handle, _blocked: &mut dyn FnMut(&mut dyn FnMut())) {
         *self.inner.borrow_mut().entry(object.to_bits()).or_insert(0) += 1;

@@ -35,14 +35,14 @@ use crate::{CollectionReport, GcObject, GcStats, Handle, Heap, RootSet};
 // targets — `thumbv6m` and `riscv32imc` — have no atomics at all, so
 // `alloc::sync::Arc` does not exist there. `Rc` is the right type on a chip
 // anyway: one core, one thread, and nothing to share across.
-#[cfg(feature = "std")]
-use std::sync::Arc;
-#[cfg(not(feature = "std"))]
+#[cfg(feature = "threads")]
+use rustclr_thread::sync::Arc;
+#[cfg(not(feature = "threads"))]
 use alloc::rc::Rc as Arc;
 
-#[cfg(feature = "std")]
-type Cell = std::sync::Mutex<Heap>;
-#[cfg(not(feature = "std"))]
+#[cfg(feature = "threads")]
+type Cell = rustclr_thread::sync::Mutex<Heap>;
+#[cfg(not(feature = "threads"))]
 type Cell = core::cell::RefCell<Heap>;
 
 /// A [`Heap`] that can be shared between threads.
@@ -63,7 +63,7 @@ impl SharedHeap {
     /// Private on purpose: handing this out would let a caller hold the lock
     /// across arbitrary work, which is exactly what the wrapper exists to
     /// prevent.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "threads")]
     fn locked<R>(&self, f: impl FnOnce(&mut Heap) -> R) -> R {
         // A poisoned heap means another thread panicked mid-mutation. There is
         // no recovery from a half-updated object graph, so this propagates
@@ -72,7 +72,7 @@ impl SharedHeap {
         f(&mut heap)
     }
 
-    #[cfg(not(feature = "std"))]
+    #[cfg(not(feature = "threads"))]
     fn locked<R>(&self, f: impl FnOnce(&mut Heap) -> R) -> R {
         f(&mut self.inner.borrow_mut())
     }
@@ -225,7 +225,7 @@ mod tests {
         assert!(heap.is_valid(kept));
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "threads")]
     #[test]
     fn several_threads_allocate_into_one_heap() {
         use std::thread;

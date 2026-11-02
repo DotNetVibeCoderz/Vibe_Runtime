@@ -63,7 +63,7 @@ const EXCEPTION: usize = 2;
 const CONTINUATIONS: usize = 3;
 /// The OS thread running this task's body, when `Task.Run` started one.
 /// There are no OS threads without `std`, so nothing reads it there.
-#[cfg(feature = "std")]
+#[cfg(feature = "threads")]
 const THREAD: usize = 4;
 
 const PENDING: i32 = 0;
@@ -106,9 +106,9 @@ pub fn register(interp: &mut Interpreter) {
 /// One per core, capped by the work available: spawning four threads for two
 /// iterations costs more than it saves, and spawning one is just the sequential
 /// loop with extra steps.
-#[cfg(feature = "std")]
+#[cfg(feature = "threads")]
 fn degree(items: usize) -> usize {
-    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let cores = rustclr_thread::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     cores.min(items).max(1)
 }
 
@@ -121,7 +121,7 @@ fn degree(items: usize) -> usize {
 /// body has to be independent of the order its iterations run in; one that is
 /// not was already wrong. What *is* preserved is that every iteration runs
 /// exactly once before this returns.
-#[cfg(feature = "std")]
+#[cfg(feature = "threads")]
 fn run_in_parallel(
     interp: &mut Interpreter,
     body: &Value,
@@ -178,7 +178,7 @@ fn run_in_parallel(
         if interp.help_with_queued_work() {
             continue;
         }
-        interp.blocking(|_| std::thread::yield_now());
+        interp.blocking(|_| rustclr_thread::thread::yield_now());
     }
 
     let error = outcome.lock().expect("parallel outcome poisoned").take();
@@ -189,7 +189,7 @@ fn run_in_parallel(
 }
 
 /// `Parallel.Invoke`: one thread per action.
-#[cfg(feature = "std")]
+#[cfg(feature = "threads")]
 fn run_each_in_parallel(interp: &mut Interpreter, actions: Vec<Value>) -> ExecResult<()> {
     if actions.len() <= 1 {
         for action in actions {
@@ -218,7 +218,7 @@ fn run_each_in_parallel(interp: &mut Interpreter, actions: Vec<Value>) -> ExecRe
         if interp.help_with_queued_work() {
             continue;
         }
-        interp.blocking(|_| std::thread::yield_now());
+        interp.blocking(|_| rustclr_thread::thread::yield_now());
     }
     let error = outcome.lock().expect("parallel outcome poisoned").take();
     match error {
@@ -228,7 +228,7 @@ fn run_each_in_parallel(interp: &mut Interpreter, actions: Vec<Value>) -> ExecRe
 }
 
 /// Without `std` there is one thread, so a parallel loop is a loop.
-#[cfg(not(feature = "std"))]
+#[cfg(not(feature = "threads"))]
 fn run_in_parallel(
     interp: &mut Interpreter,
     body: &Value,
@@ -240,7 +240,7 @@ fn run_in_parallel(
     Ok(())
 }
 
-#[cfg(not(feature = "std"))]
+#[cfg(not(feature = "threads"))]
 fn run_each_in_parallel(interp: &mut Interpreter, actions: Vec<Value>) -> ExecResult<()> {
     for action in actions {
         crate::linq::call(interp, &action, &[])?;
@@ -573,7 +573,7 @@ fn register_task(interp: &mut Interpreter) {
     //
     // One timer thread serves every outstanding delay; the completion runs on a
     // pool worker like any other job.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "threads")]
     interp.register_native(key(&format!("{TASKS}.Task"), "Delay(int)"), |i, a| {
         let ms = arg_i32(i, a, 0)?.max(0) as u64;
         let task = new_task(i, false);
@@ -584,7 +584,7 @@ fn register_task(interp: &mut Interpreter) {
     });
     // Without threads there is nothing to overlap with, so the delay is a sleep
     // and the task comes back finished.
-    #[cfg(not(feature = "std"))]
+    #[cfg(not(feature = "threads"))]
     interp.register_native(key(&format!("{TASKS}.Task"), "Delay(int)"), |i, a| {
         let ms = arg_i32(i, a, 0)?.max(0) as u64;
         sleep_millis(i, ms);
@@ -649,7 +649,7 @@ fn register_task(interp: &mut Interpreter) {
 /// body inline, and an `await` blocks rather than suspending. Starting several
 /// tasks and awaiting them afterwards genuinely runs them at once; awaiting one
 /// inside a loop does not.
-#[cfg(feature = "std")]
+#[cfg(feature = "threads")]
 fn run_delegate(interp: &mut Interpreter, args: &[Value]) -> ExecResult<Option<Value>> {
     let body = args.first().cloned().unwrap_or(Value::Null);
     let task = new_task(interp, true);
@@ -690,7 +690,7 @@ fn run_delegate(interp: &mut Interpreter, args: &[Value]) -> ExecResult<Option<V
 }
 
 /// Without threads the body runs where it is created, as it always did.
-#[cfg(not(feature = "std"))]
+#[cfg(not(feature = "threads"))]
 fn run_delegate(interp: &mut Interpreter, args: &[Value]) -> ExecResult<Option<Value>> {
     let body = args.first().cloned().unwrap_or(Value::Null);
     match invoke_delegate(interp, &body, &[]) {
@@ -718,7 +718,7 @@ fn returns_void(interp: &Interpreter) -> bool {
 /// with the inner one's *result*. Waiting for the inner task here is what makes
 /// that possible, and it is safe on a pool worker because waiting helps run
 /// queued work rather than idling.
-#[cfg(feature = "std")]
+#[cfg(feature = "threads")]
 fn unwrap_inner_task(interp: &mut Interpreter, value: Value) -> ExecResult<Value> {
     let Some(handle) = value.as_handle().filter(|h| !h.is_null()) else {
         return Ok(value);
@@ -736,7 +736,7 @@ fn unwrap_inner_task(interp: &mut Interpreter, value: Value) -> ExecResult<Value
 /// interpreter started it: the starter joins, and anyone else watches the
 /// task's own status. Both are done from inside `blocking`, so a collection
 /// does not sit waiting for a thread that is itself waiting.
-#[cfg(feature = "std")]
+#[cfg(feature = "threads")]
 fn settle(interp: &mut Interpreter, task: Handle) -> ExecResult<()> {
     if status_of(interp, task) != PENDING {
         return Ok(());
@@ -795,7 +795,7 @@ fn settle(interp: &mut Interpreter, task: Handle) -> ExecResult<()> {
             // A yield rather than a sleep: the common case is a task about to
             // finish on another thread, and the samples above only need to be
             // separated, not spaced out.
-            std::thread::yield_now();
+            rustclr_thread::thread::yield_now();
             status_of(i, task) != PENDING
         });
     }
@@ -810,7 +810,7 @@ fn settle(interp: &mut Interpreter, task: Handle) -> ExecResult<()> {
     }
 }
 
-#[cfg(not(feature = "std"))]
+#[cfg(not(feature = "threads"))]
 fn settle(_i: &mut Interpreter, _task: Handle) -> ExecResult<()> {
     Ok(())
 }
@@ -1216,10 +1216,10 @@ fn completed_or_default(interp: &mut Interpreter, args: &[Value]) -> ExecResult<
 
 const SOURCES: &str = "System.Threading.Tasks.Sources";
 
-#[cfg(feature = "std")]
-use std::sync::atomic::{AtomicUsize, Ordering};
-#[cfg(feature = "std")]
-use std::sync::{Arc, Mutex};
+#[cfg(feature = "threads")]
+use core::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "threads")]
+use rustclr_thread::sync::{Arc, Mutex};
 
 /// Slots of `ManualResetValueTaskSourceCore<T>`.
 const PROMISE_RESULT: usize = 0;

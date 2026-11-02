@@ -223,6 +223,22 @@ pool deadlocks in the familiar way — every worker blocked on a task whose job 
 still in the queue behind it — and a task that awaits another task is exactly
 that shape. It is also why the pool never needs to grow under load.
 
+### Threads without `std`
+
+The thread machinery above is the `threads` feature of `rustclr-gc`,
+`rustclr-core` and `rustclr-bcl`, which `std` turns on. An embedder that has
+threads but no Rust standard library -- an operating system with its own
+syscalls -- enables `threads` without `std` and installs
+`rustclr_thread::Hooks` at start-up: start a thread, join it, wait on a 32-bit
+word with an optional timeout, wake its waiters, read a monotonic clock.
+`rustclr-thread` builds `Mutex`, `Condvar`, `thread::spawn`/`Builder`/`sleep`
+and `Instant` on those, with std's signatures, so the code above is the same
+code in both builds. [Buitenzorg OS](https://github.com/DotNetVibeCoderz/Vibe_OS)
+runs the conformance fixture this way (`checks=488 failures=0` on x86-64,
+ARM64 and RISC-V). A microcontroller build turns neither feature on and keeps
+the single-threaded behaviour: `Thread.Start` runs inline and every lock is a
+`RefCell`.
+
 ### How the runtime runs on several threads
 
 `Thread.Start` spawns. The machinery underneath, with tests in

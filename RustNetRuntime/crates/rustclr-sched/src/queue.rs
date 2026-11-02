@@ -10,8 +10,10 @@
 //! free list and only reused after the queue has drained, which is safe because
 //! a node is unlinked before it is retired and no reader can reach it again.
 
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use rustclr_thread::sync::Mutex;
 
 struct Node<T> {
     value: Option<T>,
@@ -20,7 +22,7 @@ struct Node<T> {
 
 impl<T> Node<T> {
     fn new(value: Option<T>) -> *mut Node<T> {
-        Box::into_raw(Box::new(Node { value, next: AtomicPtr::new(std::ptr::null_mut()) }))
+        Box::into_raw(Box::new(Node { value, next: AtomicPtr::new(core::ptr::null_mut()) }))
     }
 }
 
@@ -73,7 +75,7 @@ impl<T> LockFreeQueue<T> {
                 // SAFETY: as above.
                 let linked = unsafe {
                     (*tail).next.compare_exchange(
-                        std::ptr::null_mut(),
+                        core::ptr::null_mut(),
                         node,
                         Ordering::Release,
                         Ordering::Relaxed,

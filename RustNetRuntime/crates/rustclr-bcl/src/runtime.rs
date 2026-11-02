@@ -364,11 +364,11 @@ fn register_environment(interp: &mut Interpreter) {
         Ok(Some(Value::I32(managed_thread_id())))
     });
     interp.register_native("System.Environment::get_ProcessorCount()", |_i, _a| {
-        #[cfg(feature = "std")]
-        let cores = std::thread::available_parallelism().map(|n| n.get() as i32).unwrap_or(1);
+        #[cfg(feature = "threads")]
+        let cores = rustclr_thread::thread::available_parallelism().map(|n| n.get() as i32).unwrap_or(1);
         // A microcontroller has one core and no way to ask. Reporting 1 is the
         // truth here, not a fallback.
-        #[cfg(not(feature = "std"))]
+        #[cfg(not(feature = "threads"))]
         let cores = 1;
         Ok(Some(Value::I32(cores)))
     });
@@ -835,8 +835,14 @@ fn managed_thread_id() -> i32 {
     ID.with(|id| *id)
 }
 
+/// The embedder's thread id: small and stable for a thread's lifetime.
+#[cfg(all(feature = "threads", not(feature = "std")))]
+fn managed_thread_id() -> i32 {
+    rustclr_thread::thread::current().id().as_u64() as i32
+}
+
 /// One thread, one id.
-#[cfg(not(feature = "std"))]
+#[cfg(not(feature = "threads"))]
 fn managed_thread_id() -> i32 {
     1
 }

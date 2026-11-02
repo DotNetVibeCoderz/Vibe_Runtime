@@ -295,7 +295,7 @@ pub struct Interpreter {
     /// framed message corrupts it. The embedder that redirected the main
     /// thread's console has to be able to redirect a spawned thread's too, so
     /// the host is *built by it* rather than assumed here.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "threads")]
     pub host_factory: Option<alloc::sync::Arc<dyn Fn() -> Box<dyn Host> + Send + Sync>>,
     /// The board underneath, if the embedder installed one.
     ///
@@ -406,16 +406,16 @@ pub struct Interpreter {
     ///
     /// Lazily, because building it copies the loader once per core, and a
     /// program that never starts a task should not pay for that.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "threads")]
     pool: Option<crate::pool::TaskPool>,
     /// Whether this interpreter *is* a pool worker, rather than one that uses
     /// the pool. Only a worker's blocking should make the pool grow.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "threads")]
     is_pool_worker: bool,
     /// Threads started by this one, waiting to be joined.
-    #[cfg(feature = "std")]
-    threads: HashMap<u64, std::thread::JoinHandle<(ExecResult<()>, bool)>>,
-    #[cfg(feature = "std")]
+    #[cfg(feature = "threads")]
+    threads: HashMap<u64, rustclr_thread::thread::JoinHandle<(ExecResult<()>, bool)>>,
+    #[cfg(feature = "threads")]
     next_thread_id: u64,
     /// Method count when this interpreter was made a worker, or zero.
     ///
@@ -485,7 +485,7 @@ impl Interpreter {
             #[cfg(feature = "std")]
             mqtt: None,
             profiler: None,
-            #[cfg(feature = "std")]
+            #[cfg(feature = "threads")]
             host_factory: None,
             debugger: None,
             cancel: None,
@@ -503,13 +503,13 @@ impl Interpreter {
             exit_requested: None,
             current_native: None,
             monitors: crate::monitor::Monitors::default(),
-            #[cfg(feature = "std")]
+            #[cfg(feature = "threads")]
             pool: None,
-            #[cfg(feature = "std")]
+            #[cfg(feature = "threads")]
             is_pool_worker: false,
-            #[cfg(feature = "std")]
+            #[cfg(feature = "threads")]
             threads: HashMap::new(),
-            #[cfg(feature = "std")]
+            #[cfg(feature = "threads")]
             next_thread_id: 0,
             loaded_size: 0,
             current_native_type_args: Vec::new(),
@@ -1016,7 +1016,7 @@ impl Interpreter {
     /// The two are then mutator threads over one object graph: either can
     /// allocate, either can mutate an object the other made, either sees the
     /// other's writes to a static, and a collection on either stops both.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "threads")]
     pub fn worker(&self, host: Box<dyn Host>) -> Self {
         let mut worker = Self::with_host(host);
         worker.heap = self.heap.clone();
@@ -1056,11 +1056,17 @@ impl Interpreter {
     /// Real stdio unless the embedder said otherwise. Every place that starts a
     /// managed thread goes through this, so redirecting the console redirects
     /// *all* of it rather than only the thread that happened to be first.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "threads")]
     pub fn new_host(&self) -> Box<dyn Host> {
         match &self.host_factory {
             Some(build) => build(),
+            #[cfg(feature = "std")]
             None => Box::new(crate::host::SystemHost::new()),
+            // Without `std` there is no stdio to fall back to: an embedder
+            // that starts threads installs a `host_factory`; otherwise the
+            // thread's output is kept, not lost.
+            #[cfg(not(feature = "std"))]
+            None => Box::new(crate::host::CaptureHost::new()),
         }
     }
 
@@ -1070,14 +1076,14 @@ impl Interpreter {
     /// own frames. It is a *managed* thread in every sense that matters — it
     /// allocates into the same object graph, it is stopped by a collection, and
     /// what it writes to a static is what the starting thread reads.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "threads")]
     pub fn spawn(
         &mut self,
         host: Box<dyn Host>,
         body: impl FnOnce(&mut Interpreter) -> ExecResult<()> + Send + 'static,
     ) -> u64 {
         let mut worker = self.worker(host);
-        let handle = std::thread::spawn(move || {
+        let handle = rustclr_thread::thread::spawn(move || {
             let result = body(&mut worker);
             // The worker's loader is dropped here, and with it its registration
             // in the mutator registry — a collection will stop waiting for a
@@ -1103,7 +1109,7 @@ impl Interpreter {
     ///
     /// Join handles belong to the interpreter that spawned them, so a thread
     /// waiting on a task another thread started has to watch instead of join.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "threads")]
     pub fn owns_thread(&self, id: u64) -> bool {
         self.threads.contains_key(&id)
     }
@@ -1114,7 +1120,7 @@ impl Interpreter {
     /// a collection on the thread being waited for would otherwise wait for
     /// this one forever. That deadlock is not hypothetical — it is the first
     /// thing the safepoint protocol got wrong.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "threads")]
     pub fn join(&mut self, id: u64) -> ExecResult<()> {
         let Some(handle) = self.threads.remove(&id) else {
             return Ok(());
@@ -1138,7 +1144,7 @@ impl Interpreter {
     }
 
     /// The task pool, started on first use.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "threads")]
     pub fn task_pool(&mut self) -> crate::pool::TaskPool {
         if let Some(pool) = &self.pool {
             return pool.clone();
@@ -1155,7 +1161,7 @@ impl Interpreter {
     }
 
     /// Queues managed work on the pool.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "threads")]
     pub fn queue_work(
         &mut self,
         job: Box<dyn FnOnce(&mut Interpreter) + Send>,
@@ -1164,7 +1170,7 @@ impl Interpreter {
     }
 
     /// Queues managed work to run after a delay.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "threads")]
     pub fn queue_work_after(
         &mut self,
         delay: core::time::Duration,
@@ -1177,14 +1183,14 @@ impl Interpreter {
     ///
     /// For a pool worker waiting for work: it is between jobs, so its frames
     /// are empty and there is nothing for a collection to keep.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "threads")]
     pub fn blocked_now(&self) -> rustclr_gc::safepoint::Blocked {
         self.mutators.blocked()
     }
 
     /// Runs one queued job here, if there is one. Used by a thread that would
     /// otherwise idle waiting for a task.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "threads")]
     pub fn help_with_queued_work(&mut self) -> bool {
         let Some(pool) = self.pool.clone() else { return false };
         pool.run_one(self)
@@ -1195,7 +1201,7 @@ impl Interpreter {
     /// Pool workers are always registered, so counting mutators alone would say
     /// "yes" forever. What matters is whether work is outstanding, or a thread
     /// that is not a pool worker is running.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "threads")]
     pub fn work_may_still_arrive(&self) -> bool {
         let pooled = self.pool.as_ref().map(|p| p.worker_count()).unwrap_or(0);
         let outstanding = self.pool.as_ref().map(|p| p.outstanding()).unwrap_or(0);
@@ -1345,9 +1351,9 @@ impl Interpreter {
         // A pool worker that blocks is a worker the pool has lost for the
         // duration, so it says so — and the pool starts another if that leaves
         // queued work with nobody to run it.
-        #[cfg(feature = "std")]
+        #[cfg(feature = "threads")]
         let pool = self.pool.clone().filter(|_| self.is_pool_worker);
-        #[cfg(feature = "std")]
+        #[cfg(feature = "threads")]
         let _away = pool.as_ref().map(|p| p.worker_blocking(self));
 
         let out = f(self);
@@ -1356,7 +1362,7 @@ impl Interpreter {
     }
 
     /// Marks this interpreter as one of the pool's own workers.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "threads")]
     pub fn mark_as_pool_worker(&mut self, pool: crate::pool::TaskPool) {
         self.pool = Some(pool);
         self.is_pool_worker = true;

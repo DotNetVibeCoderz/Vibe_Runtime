@@ -50,17 +50,19 @@
 //! collection path on every target rather than a `cfg` at each call site, and
 //! the shim compiles away.
 
-#[cfg(feature = "std")]
-use std::sync::atomic::{AtomicUsize, Ordering};
-#[cfg(feature = "std")]
-use std::sync::{Arc, Condvar, Mutex};
+#[cfg(feature = "threads")]
+use core::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "threads")]
+use rustclr_thread::sync::{Arc, Condvar, Mutex};
 
 use crate::handle::Handle;
 use crate::RootSet;
 
-#[cfg(feature = "std")]
+#[cfg(feature = "threads")]
 mod std_impl {
     use super::*;
+    #[allow(unused_imports)]
+    use alloc::{boxed::Box, vec, vec::Vec};
 /// Roots gathered from every mutator, as one root set.
 ///
 /// The collector does not care which thread a root came from, only that it has
@@ -358,7 +360,7 @@ impl Drop for Registration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::thread;
     use std::time::Duration;
 
@@ -563,7 +565,7 @@ mod tests {
 
 }
 
-#[cfg(feature = "std")]
+#[cfg(feature = "threads")]
 pub use std_impl::*;
 
 // ── without `std` ────────────────────────────────────────────────────────────
@@ -571,10 +573,10 @@ pub use std_impl::*;
 /// Roots gathered from every mutator, as one root set.
 ///
 /// On one thread that is just the caller's own roots.
-#[cfg(not(feature = "std"))]
+#[cfg(not(feature = "threads"))]
 pub struct AllRoots(alloc::vec::Vec<Handle>);
 
-#[cfg(not(feature = "std"))]
+#[cfg(not(feature = "threads"))]
 impl RootSet for AllRoots {
     fn collect_roots(&self, out: &mut alloc::vec::Vec<Handle>) {
         out.extend_from_slice(&self.0);
@@ -582,7 +584,7 @@ impl RootSet for AllRoots {
 }
 
 /// The single-threaded shim. Every method is a no-op or a direct call.
-#[cfg(not(feature = "std"))]
+#[cfg(not(feature = "threads"))]
 #[derive(Clone, Default)]
 pub struct Mutators {
     /// Always zero. Present so compiled code has an address to read on every
@@ -590,7 +592,7 @@ pub struct Mutators {
     stopping_flag: usize,
 }
 
-#[cfg(not(feature = "std"))]
+#[cfg(not(feature = "threads"))]
 impl Mutators {
     /// One thread, so a collection is never *requested* — it just happens.
     pub fn stopping_flag(&self) -> *const usize {
@@ -633,8 +635,8 @@ impl Mutators {
 
 }
 
-#[cfg(not(feature = "std"))]
+#[cfg(not(feature = "threads"))]
 pub struct Registration;
 
-#[cfg(not(feature = "std"))]
+#[cfg(not(feature = "threads"))]
 pub struct Blocked;

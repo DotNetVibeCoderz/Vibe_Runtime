@@ -23,10 +23,18 @@
 //! assert_eq!(total.load(Ordering::Relaxed), 5050);
 //! ```
 
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
+
+#[cfg(feature = "std")]
 pub mod channel;
 pub mod queue;
+#[cfg(feature = "std")]
 pub mod task;
 
+#[cfg(feature = "std")]
 pub use channel::{channel, Receiver, RecvError, SendError, Sender};
 pub use queue::LockFreeQueue;
+#[cfg(feature = "std")]
 pub use task::{JoinHandle, Task, TaskState, ThreadPool};

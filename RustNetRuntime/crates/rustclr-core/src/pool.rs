@@ -26,11 +26,15 @@
 //! would unblock the waiter can always run, even if every worker is busy. It is
 //! also why the pool does not need to grow under load.
 
-use crate::host::{Host, SystemHost};
+use crate::host::Host;
+#[cfg(feature = "std")]
+use crate::host::SystemHost;
+#[allow(unused_imports)]
+use alloc::{boxed::Box, format, vec::Vec};
 use crate::interp::Interpreter;
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use rustclr_thread::sync::{Arc, Condvar, Mutex};
 
 use rustclr_sched::LockFreeQueue;
 
@@ -40,7 +44,7 @@ type Job = Box<dyn FnOnce(&mut Interpreter) + Send>;
 struct Inner {
     queue: LockFreeQueue<Job>,
     /// Work waiting for a deadline rather than a worker.
-    timers: Mutex<Vec<(std::time::Instant, Job)>>,
+    timers: Mutex<Vec<(rustclr_thread::time::Instant, Job)>>,
     timer_wake: Condvar,
     /// Jobs queued or running. Zero means nothing is left to complete a task.
     outstanding: AtomicUsize,
@@ -73,7 +77,7 @@ impl TaskPool {
     /// loader plus a share of its heap and statics — the same arrangement
     /// [`Interpreter::worker`] makes for `Thread.Start`.
     pub fn start(parent: &Interpreter, host: impl Fn() -> Box<dyn Host> + Send + Sync + 'static) -> Self {
-        let size = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let size = rustclr_thread::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
         let inner = Arc::new(Inner {
             queue: LockFreeQueue::new(),
             timers: Mutex::new(Vec::new()),
@@ -95,7 +99,7 @@ impl TaskPool {
             let inner = Arc::clone(&inner);
             inner.workers.fetch_add(1, Ordering::AcqRel);
             let pool = TaskPool { inner: Arc::clone(&inner) };
-            std::thread::Builder::new()
+            rustclr_thread::thread::Builder::new()
                 .name(format!("rustclr-task-{index}"))
                 .spawn(move || pool.run_worker(&mut interp))
                 .expect("a task worker starts");
@@ -106,7 +110,7 @@ impl TaskPool {
         // else, so `Task.Delay`'s continuation runs on a pool worker.
         {
             let inner = Arc::clone(&inner);
-            std::thread::Builder::new()
+            rustclr_thread::thread::Builder::new()
                 .name("rustclr-timers".into())
                 .spawn(move || run_timers(inner))
                 .expect("the timer thread starts");
@@ -119,9 +123,9 @@ impl TaskPool {
     ///
     /// Counted as outstanding straight away, so a thread waiting on the task
     /// this will complete knows something is still coming.
-    pub fn schedule(&self, delay: std::time::Duration, job: Job) {
+    pub fn schedule(&self, delay: rustclr_thread::time::Duration, job: Job) {
         self.inner.outstanding.fetch_add(1, Ordering::AcqRel);
-        let due = std::time::Instant::now() + delay;
+        let due = rustclr_thread::time::Instant::now() + delay;
         {
             let mut timers = self.inner.timers.lock().expect("the timer list is poisoned");
             timers.push((due, job));
@@ -174,7 +178,7 @@ impl TaskPool {
         self.inner.workers.fetch_add(1, Ordering::AcqRel);
         self.inner.running.fetch_add(1, Ordering::AcqRel);
         let pool = TaskPool { inner: Arc::clone(&self.inner) };
-        let _ = std::thread::Builder::new()
+        let _ = rustclr_thread::thread::Builder::new()
             .name(format!("rustclr-task-{workers}"))
             .spawn(move || pool.run_worker_body(&mut interp));
     }
@@ -219,7 +223,7 @@ impl TaskPool {
                     let _unused = self
                         .inner
                         .work_available
-                        .wait_timeout(guard, std::time::Duration::from_millis(50))
+                        .wait_timeout(guard, rustclr_thread::time::Duration::from_millis(50))
                         .expect("the task pool is poisoned");
                 }
             }
@@ -238,7 +242,12 @@ impl Drop for Inner {
 
 /// The host a pool worker writes through.
 pub fn default_host() -> Box<dyn Host> {
-    Box::new(SystemHost::new())
+    #[cfg(feature = "std")]
+    return Box::new(SystemHost::new());
+    // No stdio without `std`: keep the output (an embedder that wants a
+    // console installs `Interpreter::host_factory`).
+    #[cfg(not(feature = "std"))]
+    return Box::new(crate::host::CaptureHost::new());
 }
 
 /// Moves work onto the queue as its deadline passes.
@@ -250,7 +259,7 @@ fn run_timers(inner: Arc<Inner>) {
         let mut due_now = Vec::new();
         let wait = {
             let mut timers = inner.timers.lock().expect("the timer list is poisoned");
-            let now = std::time::Instant::now();
+            let now = rustclr_thread::time::Instant::now();
             let mut remaining = Vec::with_capacity(timers.len());
             for (at, job) in timers.drain(..) {
                 if at <= now {
@@ -265,7 +274,7 @@ fn run_timers(inner: Arc<Inner>) {
                 Some(at) => at.saturating_duration_since(now),
                 // Nothing pending: wake on the next `schedule`, or to re-check
                 // shutdown. The cap is what makes that second case work.
-                None => std::time::Duration::from_millis(50),
+                None => rustclr_thread::time::Duration::from_millis(50),
             }
         };
 
@@ -280,7 +289,7 @@ fn run_timers(inner: Arc<Inner>) {
         let guard = inner.timers.lock().expect("the timer list is poisoned");
         let _unused = inner
             .timer_wake
-            .wait_timeout(guard, wait.min(std::time::Duration::from_millis(50)))
+            .wait_timeout(guard, wait.min(rustclr_thread::time::Duration::from_millis(50)))
             .expect("the timer list is poisoned");
     }
 }
