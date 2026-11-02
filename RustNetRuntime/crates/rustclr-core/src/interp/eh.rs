@@ -263,24 +263,35 @@ impl Interpreter {
     /// blocks on the way out.
     pub(super) fn do_leave(&mut self, target: u32) -> ExecResult<StepOutcome> {
         let offset = self.frame_ref().executing_offset();
-        let clauses = self.frame_ref().code.exception_clauses.clone();
 
         // Every finally whose try region we are leaving, innermost first.
-        let mut pending: Vec<u32> = clauses
-            .iter()
-            .filter(|c| matches!(c.kind, HandlerKind::Finally))
-            .filter(|c| c.try_contains(offset) && !c.try_contains(target))
-            .map(|c| c.handler_offset)
-            .collect();
+        // Read in place: every `foreach` leaves a try, and cloning the clause
+        // list here was an allocation per loop. When there is one, the list is
+        // built in the frame's own (reused) vector, which it replaces anyway.
+        let leaves_a_finally = |c: &&rustclr_metadata::ExceptionClause| {
+            matches!(c.kind, HandlerKind::Finally) && c.try_contains(offset) && !c.try_contains(target)
+        };
+        let any = self.frame_ref().code.exception_clauses.iter().any(|c| leaves_a_finally(&c));
 
         // `leave` empties the evaluation stack (III.3.55).
         self.frame().stack.clear();
         self.frame().in_flight = None;
 
-        if pending.is_empty() {
+        if !any {
             self.branch_to(target)?;
             return Ok(StepOutcome::Continue);
         }
+
+        let mut pending = core::mem::take(&mut self.frame().pending_finallies);
+        pending.clear();
+        pending.extend(
+            self.frame_ref()
+                .code
+                .exception_clauses
+                .iter()
+                .filter(leaves_a_finally)
+                .map(|c| c.handler_offset),
+        );
 
         let first = pending.remove(0);
         let frame = self.frame();

@@ -389,7 +389,16 @@ pub struct Interpreter {
     trivial_ctors: crate::rowmap::RowMap<bool>,
     /// Overrides of virtual generic methods, instantiated per call-site
     /// type arguments. See `resolve_virtual_target`.
-    virtual_instantiations: HashMap<(MethodId, Vec<TypeId>), MethodId>,
+    ///
+    /// Keyed by the open method, then searched by argument list: a lookup
+    /// keyed by `(MethodId, Vec<TypeId>)` had to build that `Vec` on every
+    /// generic call just to ask. A method has few instantiations.
+    virtual_instantiations: HashMap<MethodId, Vec<(Vec<TypeId>, MethodId)>>,
+    /// Virtual and interface dispatch, remembered per (declared method,
+    /// receiver type). The answer is a property of the two types, fixed once
+    /// loaded; finding it by name and shape — and, for a natively implemented
+    /// receiver, by building binding-key strings — cost more than the call.
+    dispatch_cache: HashMap<(MethodId, TypeId), MethodId>,
     frames: Vec<Frame>,
     next_frame_id: u32,
     /// `ldstr` results, keyed by assembly index and `#US` offset.
@@ -430,6 +439,11 @@ pub struct Interpreter {
     current_native_type_args: Vec<TypeId>,
     /// Staged by the call site, taken by the next non-IL call.
     pending_type_args: Vec<TypeId>,
+    /// Spent type-argument lists, reused by the next call site that names
+    /// some. Every call on a `List<T>` or `Dictionary<K,V>` member names its
+    /// arguments, and copying them into a fresh `Vec` was an allocation per
+    /// call.
+    pub(crate) type_args_pool: Vec<Vec<TypeId>>,
     /// The method a native handler is currently servicing.
     ///
     /// Native methods are plain `fn` pointers with no user data, so a handler
@@ -475,6 +489,7 @@ impl Interpreter {
             code_cache: Vec::new(),
             trivial_ctors: crate::rowmap::RowMap::new(),
             virtual_instantiations: HashMap::new(),
+            dispatch_cache: HashMap::new(),
             field_defaults: crate::rowmap::RowMap::new(),
             field_slots: crate::rowmap::RowMap::new(),
             dispatching: Vec::new(),
@@ -514,6 +529,7 @@ impl Interpreter {
             loaded_size: 0,
             current_native_type_args: Vec::new(),
             pending_type_args: Vec::new(),
+            type_args_pool: Vec::new(),
         }
     }
 
@@ -1653,7 +1669,17 @@ impl Interpreter {
     /// Consumed by `call_non_il`, so they belong to one call and cannot leak
     /// into the next one.
     pub(crate) fn stage_type_arguments(&mut self, args: Vec<TypeId>) {
-        self.pending_type_args = args;
+        let spent = core::mem::replace(&mut self.pending_type_args, args);
+        self.recycle_type_args(spent);
+    }
+
+    /// Returns a spent type-argument list to the pool.
+    #[inline]
+    pub(crate) fn recycle_type_args(&mut self, mut v: Vec<TypeId>) {
+        if v.capacity() > 0 && self.type_args_pool.len() < 64 {
+            v.clear();
+            self.type_args_pool.push(v);
+        }
     }
 
     fn call_non_il(&mut self, method: MethodId, args: &[Value]) -> ExecResult<Option<Value>> {
@@ -1695,7 +1721,8 @@ impl Interpreter {
                         self.native_depth -= 1;
                         self.native_roots.truncate(mark);
                         self.current_native = previous;
-                        self.current_native_type_args = previous_args;
+                        let spent = core::mem::replace(&mut self.current_native_type_args, previous_args);
+                        self.recycle_type_args(spent);
                         return result;
                     }
                 }

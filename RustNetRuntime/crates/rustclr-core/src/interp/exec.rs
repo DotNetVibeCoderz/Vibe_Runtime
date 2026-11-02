@@ -457,7 +457,7 @@ impl Interpreter {
                 // Boxing a `Nullable<T>` boxes the `T`, or gives null when
                 // there is none (III.4.1). Without this `(object)(int?)5`
                 // was a box of the two-field struct and printed its type name.
-                if self.loader.registry.ty(type_id).full_name() == "System.Nullable`1" {
+                if self.loader.registry.ty(type_id).is_named("System", "Nullable`1") {
                     let (has_value, inner) = match &v {
                         Value::Struct(s) => (
                             s.fields.first().map(|f| f.is_truthy()).unwrap_or(false),
@@ -495,7 +495,14 @@ impl Interpreter {
                 let token = ins.operand.as_token().ok_or_else(|| self.bad_operand(ins))?;
                 let v = self.pop()?;
                 let type_id = self.resolve_type(token)?;
-                let out = self.unbox(v, type_id, ins.op == Op::UnboxAny)?;
+                // Framework generics are erased, so the `T` of a `Nullable<T>`
+                // target is only written in the token.
+                let wrapped = if self.loader.registry.ty(type_id).is_named("System", "Nullable`1") {
+                    self.frame_nullable_argument(token)
+                } else {
+                    None
+                };
+                let out = self.unbox(v, type_id, ins.op == Op::UnboxAny, wrapped)?;
                 self.push(out);
             }
             Op::Castclass => {
@@ -832,7 +839,7 @@ impl Interpreter {
         }
         self.loader
             .resolve_type_token(self.loader.assembly(assembly), token)
-            .ok_or(ExecutionError::UnresolvedToken { token, context: "type".into() })
+            .ok_or_else(|| ExecutionError::UnresolvedToken { token, context: "type".into() })
     }
 
     /// The element type and rank when `token` names a member of `T[,]`.
@@ -988,13 +995,31 @@ impl Interpreter {
         }
     }
 
+    /// [`Self::nullable_argument`] read in the executing frame, so the `T` of
+    /// `(T?)o` is what `T` is here rather than a placeholder.
+    fn frame_nullable_argument(&mut self, token: Token) -> Option<TypeId> {
+        if token.table() != Some(TableId::TypeSpec) {
+            return None;
+        }
+        let assembly = self.frame_ref().assembly;
+        let argument = match self.loader.assembly(assembly).type_specs.get(&token.row())? {
+            TypeSig::GenericInst { args, .. } => args.first()?.clone(),
+            _ => return None,
+        };
+        self.frame_type_of_sig(&argument)
+    }
+
     /// Type arguments the call site's `TypeSpec` names, for a framework generic.
-    fn call_site_type_arguments(&self, token: Token) -> Vec<TypeId> {
+    fn call_site_type_arguments(&mut self, token: Token) -> Vec<TypeId> {
         let Some(assembly) = self.current_assembly() else { return Vec::new() };
-        self.loader
-            .member_ref_type_args(assembly, token)
-            .map(|a| a.to_vec())
-            .unwrap_or_default()
+        let mut out = match self.loader.member_ref_type_args(assembly, token) {
+            Some(a) if !a.is_empty() => self.type_args_pool.pop().unwrap_or_default(),
+            _ => return Vec::new(),
+        };
+        if let Some(a) = self.loader.member_ref_type_args(assembly, token) {
+            out.extend_from_slice(a);
+        }
+        out
     }
 
     /// The construction a member reference names in terms of the executing
@@ -1032,6 +1057,14 @@ impl Interpreter {
                 let open = self.loader.registry.ty(open).generic_definition.unwrap_or(open);
                 if self.loader.is_framework_type(open) {
                     return Some(open);
+                }
+                // On the stack for the usual arity: this runs per call.
+                if args.len() <= 4 {
+                    let mut inline = [TypeId::INVALID; 4];
+                    for (n, a) in args.iter().enumerate() {
+                        inline[n] = self.frame_type_of_sig(a)?;
+                    }
+                    return Some(self.loader.construct_generic(open, &inline[..args.len()]));
                 }
                 let mut resolved = Vec::with_capacity(args.len());
                 for a in args {
@@ -1157,29 +1190,42 @@ impl Interpreter {
         // is instantiated with what those parameters are in this frame;
         // loading could only guess `object`.
         if token.table() == Some(TableId::MethodSpec) {
-            if let Some((open, arguments)) = self.loader.assembly(assembly).method_spec_open.get(&token.row()).cloned() {
-                let mut resolved = Vec::with_capacity(arguments.len());
-                for a in &arguments {
-                    match self.frame_type_of_sig(a) {
-                        Some(t) => resolved.push(t),
-                        None => break,
+            // Read one argument at a time rather than cloning the list: this
+            // runs on every generic call, and a `TypeSig` other than a
+            // `GenericInst` clones without allocating.
+            let row = token.row();
+            let spec = self.loader.assembly(assembly).method_spec_open.get(&row).map(|(open, a)| (*open, a.len()));
+            if let Some((open, count)) = spec {
+                let mut inline = [TypeId::INVALID; 8];
+                let mut spilled = Vec::new();
+                let mut complete = true;
+                for n in 0..count {
+                    let sig = self.loader.assembly(assembly).method_spec_open.get(&row).map(|(_, a)| a[n].clone());
+                    match sig.and_then(|sig| self.frame_type_of_sig(&sig)) {
+                        Some(t) if count <= inline.len() => inline[n] = t,
+                        Some(t) => spilled.push(t),
+                        None => {
+                            complete = false;
+                            break;
+                        }
                     }
                 }
-                if resolved.len() == arguments.len() {
-                    return Ok(self.instantiate_like(open, &resolved));
+                if complete {
+                    let resolved = if count <= inline.len() { &inline[..count] } else { &spilled[..] };
+                    return Ok(self.instantiate_like(open, resolved));
                 }
             }
         }
         self.loader
             .resolve_method_token(self.loader.assembly(assembly), token)
-            .ok_or(ExecutionError::UnresolvedToken { token, context: "method".into() })
+            .ok_or_else(|| ExecutionError::UnresolvedToken { token, context: "method".into() })
     }
 
     pub(super) fn resolve_field(&mut self, token: Token) -> ExecResult<FieldId> {
         let assembly = self.frame_ref().assembly;
         self.loader
             .resolve_field_token(self.loader.assembly(assembly), token)
-            .ok_or(ExecutionError::UnresolvedToken { token, context: "field".into() })
+            .ok_or_else(|| ExecutionError::UnresolvedToken { token, context: "field".into() })
     }
 
     // -- calls -------------------------------------------------------------------
@@ -1247,7 +1293,7 @@ impl Interpreter {
         let assembly = self.frame_ref().assembly;
         self.loader
             .call_site_signature(self.loader.assembly(assembly), token)
-            .ok_or(ExecutionError::UnresolvedToken {
+            .ok_or_else(|| ExecutionError::UnresolvedToken {
                 token,
                 context: "calli call-site signature".into(),
             })
@@ -1423,8 +1469,11 @@ impl Interpreter {
         if matches!(info.kind, MethodKind::Il(_)) && !info.is_virtual() {
             return Ok(declared);
         }
-        let generic_args = info.generic_args.clone();
         let target = self.resolve_virtual_definition(receiver, declared)?;
+        if self.loader.registry.method(declared).generic_args.is_empty() {
+            return Ok(target);
+        }
+        let generic_args = self.loader.registry.method(declared).generic_args.clone();
         // A virtual generic method: the override found by dispatch is the open
         // definition. Give it the call site's type arguments, or `typeof(T)`
         // inside the override has nothing to read.
@@ -1462,6 +1511,19 @@ impl Interpreter {
             Some(t) => t,
             None => return Ok(declared),
         };
+        if let Some(&known) = self.dispatch_cache.get(&(declared, actual_type)) {
+            return Ok(known);
+        }
+        let found = self.resolve_virtual_uncached(actual_type, declared)?;
+        self.dispatch_cache.insert((declared, actual_type), found);
+        Ok(found)
+    }
+
+    fn resolve_virtual_uncached(
+        &mut self,
+        actual_type: TypeId,
+        declared: MethodId,
+    ) -> ExecResult<MethodId> {
         let info = self.loader.registry.method(declared);
         let declaring = info.declaring_type;
 
@@ -1506,7 +1568,7 @@ impl Interpreter {
             let explicit = format!("{}.{name}", self.loader.registry.ty(declaring).full_name());
             let chain: Vec<TypeId> = self.loader.registry.base_chain(actual_type).collect();
             for owner in chain {
-                if self.loader.registry.ty(owner).full_name() == "System.Object" {
+                if self.loader.registry.ty(owner).is_named("System", "Object") {
                     break;
                 }
                 if let Some(m) = self.native_override(owner, &explicit, &sig) {
@@ -1562,14 +1624,15 @@ impl Interpreter {
         if generic_args.is_empty() || !self.loader.registry.method(method).generic_args.is_empty() {
             return method;
         }
-        let key = (method, generic_args.to_vec());
-        if let Some(&known) = self.virtual_instantiations.get(&key) {
+        if let Some(known) = self.virtual_instantiations.get(&method).and_then(|list| {
+            list.iter().find(|(args, _)| args.as_slice() == generic_args).map(|(_, id)| *id)
+        }) {
             return known;
         }
         let mut clone = self.loader.registry.method(method).clone();
         clone.generic_args = generic_args.to_vec();
         let id = self.loader.registry.add_method(clone);
-        self.virtual_instantiations.insert(key, id);
+        self.virtual_instantiations.entry(method).or_default().push((generic_args.to_vec(), id));
         id
     }
 
@@ -2243,7 +2306,7 @@ impl Interpreter {
 
     // -- boxing --------------------------------------------------------------------
 
-    fn unbox(&mut self, v: Value, target: TypeId, any: bool) -> ExecResult<Value> {
+    fn unbox(&mut self, v: Value, target: TypeId, any: bool, wrapped: Option<TypeId>) -> ExecResult<Value> {
         match v.as_handle() {
             Some(h) if h.is_null() => {
                 // `unbox.any` of null is a cast when the target is a
@@ -2254,7 +2317,7 @@ impl Interpreter {
                 // so a failed test reached here as null and threw.
                 if any {
                     let ty = self.loader.registry.ty(target);
-                    if ty.full_name() == "System.Nullable`1" {
+                    if ty.is_named("System", "Nullable`1") {
                         return Ok(self.zero_of(target));
                     }
                     if !ty.kind.is_value_like() {
@@ -2276,14 +2339,13 @@ impl Interpreter {
                     // (III.4.33): `(int?)obj` where `obj` holds an int.
                     if any {
                         let ty = self.loader.registry.ty(target);
-                        // Framework generics are erased, so the argument
-                        // may be unknown; a box only ever holds a value type,
-                        // so then any boxed value is the `T`.
-                        let argument_fits = match ty.generic_args.first() {
-                            Some(&arg) => arg == boxed_type,
+                        // `(long?)(object)5` is an InvalidCastException. Only
+                        // a `T` the frame alone knows (`(T?)o`) goes unchecked.
+                        let argument_fits = match wrapped.or(ty.generic_args.first().copied()) {
+                            Some(arg) => arg == boxed_type,
                             None => true,
                         };
-                        if ty.full_name() == "System.Nullable`1" && argument_fits {
+                        if ty.is_named("System", "Nullable`1") && argument_fits {
                             if let Value::Struct(mut s) = self.zero_of(target) {
                                 if s.fields.len() >= 2 {
                                     s.fields[0] = Value::I32(1);

@@ -19,6 +19,37 @@ PrimeSieve     IDENTICAL   (written by Jack from a prompt)
 SensorGateway  IDENTICAL   (edited by Jack from a prompt)
 ```
 
+## 2026-11-02 — fixes found by Buitenzorg.UI, and the per-call allocations
+
+Buitenzorg OS runs this runtime as a ring-3 program (`no_std`, `threads`), and
+its C# UI toolkit drove these out.
+
+- Fixed: `x as T` with `T : class` (`isinst !!T; unbox.any !!T`) threw
+  NullReferenceException when the test failed — `unbox.any` of null to a
+  reference type is a cast and gives null; to `Nullable<T>` the empty nullable,
+  and a boxed `T` to `Nullable<T>` is wrapped.
+- Fixed: a public nested type of a library (`Kit.Checks`) used from another
+  assembly was an unresolved token — nested TypeDefs are now also registered
+  as `Ns.Outer+Nested`, the name a TypeRef binds by.
+- New: `String.LastIndexOf` start/count overloads, `IndexOfAny`/`LastIndexOfAny`
+  start/count overloads, `IComparable.CompareTo` on boxed primitives/strings/
+  enums, `Environment.GetEnvironmentVariable`, `MemoryExtensions.Contains`.
+- Faster: the interpreter allocated on every call (eager `ok_or` error
+  strings, `Vec` keys for generic lookups, type-argument copies, a clause-list
+  clone per `leave`, uncached interface dispatch). ~35,000 → ~1,600 Rust
+  allocations per round of a UI-shaped benchmark; 2.0 s → 1.1 s on the host,
+  4.8 s → 1.3 s on the host under `linked_list_allocator` (the embedder's
+  allocator; not measured on the device). `BTreeMap` vs `HashMap` measured as
+  noise once the keys stopped being built per call, so no hasher was added.
+- Fixed: a collector counted the threads to wait for once, so a thread that
+  exited during a collection (unregistering instead of parking) wedged the
+  process; `collections_from_several_threads_do_not_overlap` hung now and then
+  this way. Coming back from `Blocked` now also wakes a draining collector.
+
+**Verified:** Conformance `checks=499 failures=0`, byte-identical to .NET;
+cross-assembly `checks=9 failures=0`; ModernSyntax `checks=35 failures=0`;
+`cargo test --workspace` 474 passed; `bash tests/embedded.sh` all targets built.
+
 ## 2026-10-23 — release 0.1.1
 
 - Version 0.1.1 (installers, archives, the `RustNetRuntime` .NET tool), built by

@@ -1036,7 +1036,20 @@ polyfill:
 * **Maps.** `HashMap` becomes `BTreeMap` without `std`. Every key the runtime
   uses — integer ids, tuples of them, names — is already `Ord`, so this costs
   an iteration order that nothing depends on, and avoids pulling a hasher onto
-  a microcontroller.
+  a microcontroller. It is not a speed problem either: with every map swapped
+  to a `BTreeMap` on the host, a call-heavy UI-shaped workload ran within
+  noise of `std`'s `HashMap`. What *is* a speed problem on an embedder is the
+  allocator. Emulated on the host, `linked_list_allocator` (first fit over a
+  free list, as a kernel embedder uses) cost 2.4x on that workload over the
+  system allocator, because the interpreter allocated on every call: an
+  `UnresolvedToken` error string built eagerly by `ok_or` on every method and
+  field token, a `Vec<TypeId>` built to look up each generic instantiation
+  and construction, a type-argument copy per `List<T>` call, a clause list
+  cloned per `leave`, and interface dispatch that searched by name and built
+  binding-key strings on every call. Those are gone (dispatch is cached per
+  declared method and receiver type), and allocations on that workload fell
+  from ~35,000 to ~1,600 per round — under the same free-list allocator it
+  went from 4.8 s to 1.3 s.
 * **`Arc` becomes `Rc`.** RISC-V `imc` — the ESP32-C3's core — has no atomics
   extension, so `Arc` does not exist on that target. The interpreter is
   single-threaded on a chip, which is exactly when `Rc` is correct anyway.

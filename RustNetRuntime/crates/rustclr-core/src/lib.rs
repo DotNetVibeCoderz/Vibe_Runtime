@@ -38,8 +38,13 @@ extern crate alloc;
 ///
 /// * `HashMap` is a `BTreeMap` without `std`. The runtime's maps are keyed by
 ///   small integer ids, tuples of them, or names — all `Ord` — so this costs
-///   nothing but a different iteration order. Nothing in the runtime depends
-///   on map order, and a microcontroller has no business pulling in a hasher.
+///   a different iteration order, which nothing depends on, and a
+///   microcontroller has no business pulling in a hasher. Measured on the
+///   host with every map swapped to a `BTreeMap`, a call-heavy workload ran
+///   within noise of `std`'s `HashMap` once the per-call caches stopped
+///   building `Vec`/`String` keys (and ~15% slower before) — so a hash table
+///   was not worth a dependency. What did matter was allocation: see
+///   `docs/limitations.md` on embedders with a slow allocator.
 /// * `Arc` is an `Rc` without `std` -- unless the `threads` feature is on.
 ///   RISC-V `imc` has no atomics, so `Arc` does not exist there; the
 ///   interpreter is single-threaded on a chip, which is exactly when `Rc` is

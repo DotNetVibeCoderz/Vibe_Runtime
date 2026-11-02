@@ -217,8 +217,10 @@ pub struct Loader {
     /// types, keyed by the receiver type and the native binding name.
     interned_calls: HashMap<(TypeId, String), MethodId>,
     /// One runtime type per closed construction, keyed by definition and
-    /// arguments, so `Box<int>` named twice is one type.
-    generic_constructions: HashMap<(TypeId, Vec<TypeId>), TypeId>,
+    /// arguments, so `Box<int>` named twice is one type. Keyed by definition,
+    /// then searched by argument list, so a lookup needs no `Vec` built just
+    /// to ask: `frame_type_of_sig` asks on every call that names a generic.
+    generic_constructions: HashMap<TypeId, Vec<(Vec<TypeId>, TypeId)>>,
     /// `T[]` as reflection names it, one per element type. See `array_type_of`.
     array_types: HashMap<TypeId, TypeId>,
 }
@@ -1946,7 +1948,8 @@ impl Loader {
         let constructions: Vec<(TypeId, TypeId)> = self
             .generic_constructions
             .values()
-            .filter_map(|c| self.registry.ty(*c).generic_definition.map(|d| (*c, d)))
+            .flat_map(|list| list.iter().map(|(_, c)| *c))
+            .filter_map(|c| self.registry.ty(c).generic_definition.map(|d| (c, d)))
             .collect();
         for (construction, definition) in constructions {
             let base = self.registry.ty(definition).base;
@@ -2346,7 +2349,8 @@ impl Loader {
         let constructions: Vec<(TypeId, TypeId)> = self
             .generic_constructions
             .values()
-            .filter_map(|c| self.registry.ty(*c).generic_definition.map(|d| (*c, d)))
+            .flat_map(|list| list.iter().map(|(_, c)| *c))
+            .filter_map(|c| self.registry.ty(c).generic_definition.map(|d| (c, d)))
             .collect();
         for (construction, definition) in constructions {
             let vtable = self.registry.ty(definition).vtable.clone();
@@ -2693,8 +2697,12 @@ impl Loader {
     /// by a `TypeSpec` at load time, cache included, so `MakeGenericType` and
     /// `typeof` agree by reference.
     pub fn construct_generic(&mut self, open: TypeId, args: &[TypeId]) -> TypeId {
-        if let Some(existing) = self.generic_constructions.get(&(open, args.to_vec())) {
-            return *existing;
+        if let Some(existing) = self
+            .generic_constructions
+            .get(&open)
+            .and_then(|list| list.iter().find(|(a, _)| a.as_slice() == args).map(|(_, id)| *id))
+        {
+            return existing;
         }
 
         let mut constructed = self.registry.ty(open).clone();
@@ -2723,7 +2731,7 @@ impl Loader {
         constructed.cctor_state = CctorState::NotRun;
 
         let id = self.registry.add_constructed_type(constructed);
-        self.generic_constructions.insert((open, args.to_vec()), id);
+        self.generic_constructions.entry(open).or_default().push((args.to_vec(), id));
         id
     }
 

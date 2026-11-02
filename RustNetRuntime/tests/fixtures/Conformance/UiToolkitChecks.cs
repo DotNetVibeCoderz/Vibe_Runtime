@@ -42,6 +42,10 @@ static partial class Program
             $"{AsOrDefault<string>(5) == null}|{AsOrDefault<string>(null) == null}|{AsOrDefault<string>("s")}|{NullableFrom<int>(null).HasValue}|{NullableFrom<int>(7)}",
             "True|True|s|False|7");
 
+        var wrongNullable = false;
+        try { object boxed = 5; _ = (long?)boxed; } catch (InvalidCastException) { wrongNullable = true; }
+        CheckStr("unbox.any Nullable<T> of another type throws InvalidCastException", wrongNullable.ToString(), "True");
+
         const string text = "a.b.c/d.e";
         CheckStr("LastIndexOf(char, int) and (char, int, int)",
             $"{text.LastIndexOf('.', 4)}|{text.LastIndexOf('.', 2)}|{text.LastIndexOf('.', 8, 3)}|{text.LastIndexOf('.', 6, 3)}|{text.LastIndexOf('.', 0)}|{"".LastIndexOf('x', 0)}",

@@ -261,8 +261,11 @@ impl Mutators {
         // Every registered mutator except this one has to be stopped — either
         // parked at a safe point, or blocked outside the runtime, which amounts
         // to the same thing: it holds no reference into the heap.
-        let others = state.registered.saturating_sub(1);
-        while state.parked + state.blocked < others {
+        //
+        // Re-read `registered` on every wake: a thread that exits during this
+        // wait unregisters instead of parking, and a count taken once would
+        // keep waiting for it forever.
+        while state.parked + state.blocked < state.registered.saturating_sub(1) {
             state = self.inner.parked.wait(state).expect("mutator registry poisoned");
         }
 
@@ -338,6 +341,9 @@ impl Drop for Blocked {
                 state = inner.resumed.wait(state).expect("mutator registry poisoned");
             }
             state.parked -= 1;
+            // A collector waiting for the previous round to drain is watching
+            // this counter reach zero, as in `poll`.
+            inner.parked.notify_all();
         }
     }
 }
@@ -464,6 +470,44 @@ mod tests {
         drop(waiting);
 
         assert!(!overlapped.load(Ordering::SeqCst), "two collections ran at once");
+    }
+
+    #[test]
+    fn a_thread_that_exits_during_a_collection_does_not_wedge_it() {
+        // The collector counted the threads to wait for once, so one that
+        // unregistered instead of parking was waited for forever. It hung
+        // `collections_from_several_threads_do_not_overlap` now and then.
+        let mutators = Mutators::new();
+        let leaving = mutators.register();
+
+        let exits = {
+            let mutators = mutators.clone();
+            thread::spawn(move || {
+                while !mutators.stopping() {
+                    thread::yield_now();
+                }
+                // Let the collector reach its wait, then leave without parking.
+                thread::sleep(Duration::from_millis(20));
+                drop(leaving);
+            })
+        };
+
+        let (done, finished) = std::sync::mpsc::channel();
+        let collector = {
+            let mutators = mutators.clone();
+            thread::spawn(move || {
+                let _me = mutators.register();
+                mutators.stop_the_world(vec![Handle::NULL], |_| ());
+                let _ = done.send(());
+            })
+        };
+
+        assert!(
+            finished.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "the collector waited for a thread that had already exited"
+        );
+        exits.join().expect("exiting thread panicked");
+        collector.join().expect("collector panicked");
     }
 
     #[test]

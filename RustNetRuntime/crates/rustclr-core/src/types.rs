@@ -344,6 +344,13 @@ pub struct RuntimeType {
 }
 
 impl RuntimeType {
+    /// Whether this is `namespace.name`, without building the full name.
+    /// [`Self::full_name`] allocates, which matters on paths run per
+    /// instruction (`box`, `unbox.any`).
+    pub fn is_named(&self, namespace: &str, name: &str) -> bool {
+        self.namespace == namespace && self.name == name
+    }
+
     pub fn full_name(&self) -> String {
         if self.namespace.is_empty() {
             self.name.clone()

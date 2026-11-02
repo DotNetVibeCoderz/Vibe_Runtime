@@ -1445,7 +1445,18 @@ const ENUM_INDEX: usize = 1;
 const ENUM_CURRENT: usize = 2;
 
 pub(crate) fn named_type(interp: &Interpreter, name: &str) -> Option<TypeId> {
-    interp.loader.registry.find_type_by_name(&format!("{GENERIC}.{name}"))
+    // Built on the stack: every `foreach` over a collection asks this.
+    let mut buffer = [0u8; 128];
+    let (prefix, rest) = (GENERIC.as_bytes(), name.as_bytes());
+    let total = prefix.len() + 1 + rest.len();
+    if total > buffer.len() {
+        return interp.loader.registry.find_type_by_name(&format!("{GENERIC}.{name}"));
+    }
+    buffer[..prefix.len()].copy_from_slice(prefix);
+    buffer[prefix.len()] = b'.';
+    buffer[prefix.len() + 1..total].copy_from_slice(rest);
+    let full = core::str::from_utf8(&buffer[..total]).ok()?;
+    interp.loader.registry.find_type_by_name(full)
 }
 
 /// Allocates an enumerator positioned before the first element.

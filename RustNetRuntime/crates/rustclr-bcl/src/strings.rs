@@ -180,10 +180,19 @@ pub fn register(interp: &mut Interpreter) {
         let needle = arg_string_or_empty(i, a, 1)?;
         Ok(Some(Value::I32(utf16_index_of(&s, &needle))))
     });
+    // Searched in the string's own UTF-16 units: converting it to a Rust
+    // string and the char to a one-character string first was three
+    // allocations for a lookup.
     interp.register_native("System.String::IndexOf(char)", |i, a| {
-        let s = arg_string_or_empty(i, a, 0)?;
-        let c = char_from(arg_i32(i, a, 1)?);
-        Ok(Some(Value::I32(utf16_index_of(&s, &c))))
+        let unit = arg_i32(i, a, 1)? as u16;
+        let found = match arg(i, a, 0)? {
+            Value::Obj(h) if !h.is_null() => i
+                .heap
+                .with::<ClrString, _>(h, |s| s.units.iter().position(|u| *u == unit))
+                .flatten(),
+            _ => return Err(ExecutionError::null_reference()),
+        };
+        Ok(Some(Value::I32(found.map(|p| p as i32).unwrap_or(-1))))
     });
     interp.register_native("System.String::LastIndexOf(string)", |i, a| {
         let s = arg_string_or_empty(i, a, 0)?;
