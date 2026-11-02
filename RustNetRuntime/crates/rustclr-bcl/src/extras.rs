@@ -172,6 +172,89 @@ fn find_units(haystack: &[u16], needle: &[u16], from: usize, ignore_case: bool) 
     -1
 }
 
+/// The characters of a `char[]` argument, for the `*IndexOfAny` family.
+fn char_set(interp: &mut Interpreter, args: &[Value], index: usize) -> ExecResult<Vec<u16>> {
+    let h = match arg(interp, args, index)? {
+        Value::Obj(h) if !h.is_null() => h,
+        _ => return Err(ExecutionError::null_reference()),
+    };
+    Ok(array_values(interp, h).iter().map(|v| v.as_i32().unwrap_or(0) as u16).collect())
+}
+
+/// `IndexOfAny(set, startIndex, count)` with .NET's range checks.
+fn index_of_any(s: &[u16], set: &[u16], from: i32, count: i32) -> ExecResult<Option<Value>> {
+    if from < 0 || from as usize > s.len() {
+        return Err(out_of_range("startIndex"));
+    }
+    if count < 0 || from as usize + count as usize > s.len() {
+        return Err(out_of_range("count"));
+    }
+    let (from, end) = (from as usize, from as usize + count as usize);
+    Ok(Some(Value::I32(s[from..end].iter().position(|u| set.contains(u)).map(|p| (p + from) as i32).unwrap_or(-1))))
+}
+
+/// `LastIndexOf(char, startIndex, count)` and `LastIndexOfAny`: searches
+/// backwards from `start` over `count` characters, ending at
+/// `start - count + 1` — the window .NET defines, with its exceptions.
+fn last_index_of_char(s: &[u16], set: &[u16], start: i32, count: i32) -> ExecResult<Option<Value>> {
+    if s.is_empty() {
+        return Ok(Some(Value::I32(-1)));
+    }
+    if start < 0 || start as usize >= s.len() {
+        return Err(out_of_range("startIndex"));
+    }
+    if count < 0 || count as i64 > start as i64 + 1 {
+        return Err(out_of_range("count"));
+    }
+    let lo = (start + 1 - count) as usize;
+    let hi = start as usize + 1;
+    Ok(Some(Value::I32(s[lo..hi].iter().rposition(|u| set.contains(u)).map(|p| (p + lo) as i32).unwrap_or(-1))))
+}
+
+/// `LastIndexOf(string, startIndex, count, comparison)`, following .NET's
+/// rules: an empty receiver accepts a start of -1 or 0, a start equal to the
+/// length is pulled back one, and a match must lie wholly inside the window
+/// `[start - count + 1, start]`.
+fn last_index_of_string(s: &[u16], needle: &[u16], start: i32, count: i32, ignore_case: bool) -> ExecResult<Option<Value>> {
+    let (mut start, mut count) = (start as i64, count as i64);
+    if s.is_empty() && (start == -1 || start == 0) {
+        return Ok(Some(Value::I32(if needle.is_empty() { 0 } else { -1 })));
+    }
+    if start < 0 || start > s.len() as i64 {
+        return Err(out_of_range("startIndex"));
+    }
+    if start == s.len() as i64 {
+        start -= 1;
+        if count > 0 {
+            count -= 1;
+        }
+    }
+    if count < 0 || start - count + 1 < 0 {
+        return Err(out_of_range("count"));
+    }
+    if needle.is_empty() {
+        return Ok(Some(Value::I32((start + 1) as i32)));
+    }
+    let lo = (start - count + 1) as usize;
+    let hi = start as usize + 1;
+    let window = &s[lo..hi];
+    if needle.len() > window.len() {
+        return Ok(Some(Value::I32(-1)));
+    }
+    for at in (0..=window.len() - needle.len()).rev() {
+        let part = &window[at..at + needle.len()];
+        let matched = if ignore_case {
+            part.iter().zip(needle).all(|(x, y)| fold(*x) == fold(*y))
+        } else {
+            part == needle
+        };
+        if matched {
+            return Ok(Some(Value::I32((lo + at) as i32)));
+        }
+    }
+    Ok(Some(Value::I32(-1)))
+}
+
 /// `StringComparison`: 1, 3 and 5 are the case-insensitive members.
 fn ignores_case(comparison: i32) -> bool {
     comparison % 2 == 1
@@ -1335,6 +1418,70 @@ fn register_strings(interp: &mut Interpreter) {
             }
         }
         Ok(Some(Value::I32(last)))
+    });
+    // The start-index and count overloads of LastIndexOf / IndexOfAny /
+    // LastIndexOfAny. Each has its own exact key: the arity fallback
+    // `LastIndexOf/2` above reads its second argument as a StringComparison,
+    // so `LastIndexOf('x', 3)` used to search the whole string.
+    interp.register_native(key("LastIndexOf(char,int)"), |i, a| {
+        let s = units(i, a, 0)?;
+        let start = arg_i32(i, a, 2)?;
+        last_index_of_char(&s, &[arg_i32(i, a, 1)? as u16], start, start.saturating_add(1))
+    });
+    interp.register_native(key("LastIndexOf(char,int,int)"), |i, a| {
+        let s = units(i, a, 0)?;
+        let c = arg_i32(i, a, 1)? as u16;
+        last_index_of_char(&s, &[c], arg_i32(i, a, 2)?, arg_i32(i, a, 3)?)
+    });
+    interp.register_native(key("LastIndexOf(string,int)"), |i, a| {
+        let (s, n) = (units(i, a, 0)?, units(i, a, 1)?);
+        let start = arg_i32(i, a, 2)?;
+        last_index_of_string(&s, &n, start, start.saturating_add(1), false)
+    });
+    interp.register_native(key("LastIndexOf(string,int,int)"), |i, a| {
+        let (s, n) = (units(i, a, 0)?, units(i, a, 1)?);
+        last_index_of_string(&s, &n, arg_i32(i, a, 2)?, arg_i32(i, a, 3)?, false)
+    });
+    // LastIndexOf(string, int, StringComparison).
+    interp.register_native(key("LastIndexOf/3"), |i, a| {
+        let (s, n) = (units(i, a, 0)?, units(i, a, 1)?);
+        let start = arg_i32(i, a, 2)?;
+        let ignore = ignores_case(arg_i32(i, a, 3)?);
+        last_index_of_string(&s, &n, start, start.saturating_add(1), ignore)
+    });
+    // LastIndexOf(string, int, int, StringComparison).
+    interp.register_native(key("LastIndexOf/4"), |i, a| {
+        let (s, n) = (units(i, a, 0)?, units(i, a, 1)?);
+        let ignore = ignores_case(arg_i32(i, a, 4)?);
+        last_index_of_string(&s, &n, arg_i32(i, a, 2)?, arg_i32(i, a, 3)?, ignore)
+    });
+    interp.register_native(key("IndexOfAny(char[],int)"), |i, a| {
+        let s = units(i, a, 0)?;
+        let set = char_set(i, a, 1)?;
+        let from = arg_i32(i, a, 2)?;
+        index_of_any(&s, &set, from, s.len() as i32 - from)
+    });
+    interp.register_native(key("IndexOfAny(char[],int,int)"), |i, a| {
+        let s = units(i, a, 0)?;
+        let set = char_set(i, a, 1)?;
+        index_of_any(&s, &set, arg_i32(i, a, 2)?, arg_i32(i, a, 3)?)
+    });
+    interp.register_native(key("LastIndexOfAny(char[])"), |i, a| {
+        let s = units(i, a, 0)?;
+        let set = char_set(i, a, 1)?;
+        let start = s.len() as i32 - 1;
+        last_index_of_char(&s, &set, start, start + 1)
+    });
+    interp.register_native(key("LastIndexOfAny(char[],int)"), |i, a| {
+        let s = units(i, a, 0)?;
+        let set = char_set(i, a, 1)?;
+        let start = arg_i32(i, a, 2)?;
+        last_index_of_char(&s, &set, start, start.saturating_add(1))
+    });
+    interp.register_native(key("LastIndexOfAny(char[],int,int)"), |i, a| {
+        let s = units(i, a, 0)?;
+        let set = char_set(i, a, 1)?;
+        last_index_of_char(&s, &set, arg_i32(i, a, 2)?, arg_i32(i, a, 3)?)
     });
     interp.register_native(key("Contains(char)"), |i, a| {
         let s = units(i, a, 0)?;

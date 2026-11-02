@@ -1594,6 +1594,11 @@ fn register_enumerator_tail(interp: &mut Interpreter, type_name: &str) {
 // simple the record is.
 
 fn register_comparers(interp: &mut Interpreter) {
+    // `((IComparable)boxed).CompareTo(other)` on a primitive, string, enum or
+    // decimal. A program's own `IComparable` is found through its vtable
+    // before the call ever reaches here; this is the framework types' half.
+    interp.register_native("System.IComparable::CompareTo(object)", compare_boxed);
+    interp.register_native("System.IComparable`1::CompareTo/1", compare_boxed);
     interp.register_native(key("EqualityComparer`1", "get_Default()"), |i, _a| {
         Ok(Some(default_comparer(i, "EqualityComparer`1")))
     });
@@ -1681,6 +1686,38 @@ fn find_equals(interp: &Interpreter, type_id: TypeId) -> Option<MethodId> {
         }
     }
     None
+}
+
+/// `IComparable.CompareTo(object)` with a framework value as the receiver:
+/// null sorts first, and a value of another type is an `ArgumentException`,
+/// as on .NET.
+fn compare_boxed(interp: &mut Interpreter, args: &[Value]) -> ExecResult<Option<Value>> {
+    let this = arg(interp, args, 0)?;
+    let other = arg(interp, args, 1)?;
+    let open = |interp: &Interpreter, v: &Value| -> (Value, Option<TypeId>) {
+        match v {
+            Value::Obj(h) if !h.is_null() => match interp.heap.with::<ClrBox, _>(*h, |b| (b.value.clone(), b.type_id)) {
+                Some((inner, t)) => (inner, Some(t)),
+                None => (v.clone(), interp.type_of(*h)),
+            },
+            other => (other.clone(), None),
+        }
+    };
+    if matches!(other, Value::Null) || other.as_handle().is_some_and(|h| h.is_null()) {
+        return Ok(Some(Value::I32(1)));
+    }
+    let (a, ta) = open(interp, &this);
+    let (b, tb) = open(interp, &other);
+    if let (Some(ta), Some(tb)) = (ta, tb) {
+        if ta != tb {
+            let name = interp.loader.registry.ty(ta).name.clone();
+            return Err(ExecutionError::exception(
+                ClrExceptionKind::Argument,
+                format!("Object must be of type {name}."),
+            ));
+        }
+    }
+    Ok(Some(Value::I32(compare_values(interp, &a, &b)?)))
 }
 
 /// Ordering for `Comparer<T>.Default`: numeric for numbers, ordinal for

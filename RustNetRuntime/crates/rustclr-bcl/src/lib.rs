@@ -157,6 +157,7 @@ pub fn install(interp: &mut Interpreter) {
     ranges::register(interp);
     strings::register(interp);
     spans::register(interp);
+    spans::register_contains(interp);
     marshal::register(interp);
     numerics::register(interp);
     threading::register(interp);

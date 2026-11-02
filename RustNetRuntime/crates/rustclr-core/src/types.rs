@@ -534,6 +534,17 @@ impl TypeRegistry {
         &mut self.fields[id.index()]
     }
 
+    /// Registers a second name for a type already added, without displacing
+    /// a type that holds the name first.
+    ///
+    /// A nested `TypeDef` has an empty namespace and only its own simple
+    /// name, which is what `Type.Name` must report — but another assembly's
+    /// `TypeRef` to it binds by `Namespace.Outer+Nested`. The loader adds that
+    /// spelling here so the reference resolves.
+    pub fn add_type_alias(&mut self, full_name: String, id: TypeId) {
+        self.by_name.entry(full_name).or_insert(id);
+    }
+
     pub fn find_type_by_name(&self, full_name: &str) -> Option<TypeId> {
         self.by_name.get(full_name).copied()
     }
@@ -609,6 +620,27 @@ impl TypeRegistry {
         }
         let tdef = t.generic_definition.filter(|d| valid(*d)).map(|d| self.ty(d)).unwrap_or(t);
         let (ns, iface) = (tdef.namespace.as_str(), tdef.name.as_str());
+        // The core interfaces of primitives, strings and enums. A boxed int
+        // cast to `IComparable` (a sort over `object` keys) was refused.
+        if ns == "System" {
+            let a = self.ty(actual);
+            let system_value = a.namespace == "System"
+                && matches!(a.name.as_str(), "DateTime" | "TimeSpan" | "Decimal" | "Guid" | "DateTimeOffset");
+            return match a.kind {
+                TypeKind::Primitive => matches!(
+                    iface,
+                    "IComparable" | "IComparable`1" | "IEquatable`1" | "IFormattable" | "IConvertible"
+                ),
+                TypeKind::String => {
+                    matches!(iface, "IComparable" | "IComparable`1" | "IEquatable`1" | "IConvertible" | "ICloneable")
+                }
+                TypeKind::Enum => matches!(iface, "IComparable" | "IFormattable" | "IConvertible"),
+                _ if system_value => {
+                    matches!(iface, "IComparable" | "IComparable`1" | "IEquatable`1" | "IFormattable")
+                }
+                _ => false,
+            };
+        }
         let generic = match ns {
             "System.Collections.Generic" => true,
             "System.Collections" => false,

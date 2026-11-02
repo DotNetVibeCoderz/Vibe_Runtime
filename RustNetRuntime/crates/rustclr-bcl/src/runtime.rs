@@ -377,6 +377,17 @@ fn register_environment(interp: &mut Interpreter) {
         let array = string_array(i, &args);
         Ok(Some(Value::Obj(array)))
     });
+    // The host's environment under `std`; without one (a kernel, a board)
+    // every variable is unset, which .NET reports as null.
+    interp.register_native("System.Environment::GetEnvironmentVariable(string)", |i, a| {
+        let name = arg_string(i, a, 0)?;
+        #[cfg(feature = "std")]
+        if let Ok(value) = std::env::var(&name) {
+            return Ok(Some(string_value(i, &value)));
+        }
+        let _ = name;
+        Ok(Some(Value::Null))
+    });
     interp.register_native("System.Environment::get_MachineName()", |i, _a| {
         Ok(Some(string_value(i, "rustclr")))
     });

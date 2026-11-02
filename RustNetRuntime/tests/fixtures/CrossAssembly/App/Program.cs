@@ -59,6 +59,13 @@ handlers.Fire("raw", 1, 2);
 handlers.Fire("one", "abc");
 handlers.Fire("two", "x", 5);
 Check("overloads that differ only in generic arity", heard, "raw:2;one:3;two:x5;");
+// A public type nested in a library class: the program's TypeRef has the
+// enclosing TypeRef, not an assembly, as its resolution scope.
+var kitChecks = new Kit.Checks("ui");
+kitChecks.Add(2);
+kitChecks.Add(3);
+var inner = new Kit.Checks.Inner();
+Check("a nested library type used from another assembly", $"{kitChecks.Name}|{kitChecks.Count}|{Kit.Checks.Kind()}|{inner.Value}|{(int)Kit.Checks.Level.Low}", "ui|5|checks|High|0");
 Console.WriteLine($"checks={checks} failures={failures}");
 
 sealed record Row(string Name, int Units);

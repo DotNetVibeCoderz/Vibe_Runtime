@@ -149,3 +149,26 @@ public sealed class Handlers
     public void On<T1, T2>(string name, Action<T1, T2> handler) => On(name, args => handler((T1)args[0]!, (T2)args[1]!));
     public void Fire(string name, params object?[] args) => _raw[name](args);
 }
+
+/// <summary>
+/// Public types nested in a library class, used from another assembly. The
+/// program's TypeRef names <c>Kit</c> as its resolution scope rather than an
+/// assembly, which is how Buitenzorg.UI's <c>Kit.Checks</c> is reached.
+/// </summary>
+public static class Kit
+{
+    public sealed class Checks
+    {
+        public Checks(string name) => Name = name;
+        public string Name { get; }
+        public int Count;
+        public void Add(int n) => Count += n;
+        public static string Kind() => "checks";
+
+        public enum Level { Low, High }
+        public sealed class Inner
+        {
+            public Level Value = Level.High;
+        }
+    }
+}

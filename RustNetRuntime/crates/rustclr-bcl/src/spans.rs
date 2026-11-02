@@ -283,6 +283,33 @@ pub fn register(interp: &mut Interpreter) {
     });
 }
 
+/// `MemoryExtensions.Contains` over a span. Full tier only: the minimal tier's
+/// binding table sits just under a capacity step of the host's map, and a
+/// search over arrays is not what a 192 KB board runs.
+pub(crate) fn register_contains(interp: &mut Interpreter) {
+    // `array.Contains(x)` binds to `MemoryExtensions.Contains<T>(ReadOnlySpan<T>, T)`
+    // on .NET 10 (the array converts to a span first), not to LINQ's
+    // `Enumerable.Contains` — so `args.Contains("--fast")` landed here.
+    // Elements compare the way `EqualityComparer<T>.Default` does.
+    for member in ["Contains/2", "Contains(!!0)"] {
+        interp.register_native(key("System.MemoryExtensions", member), |i, a| {
+            let subject = arg(i, a, 0)?;
+            let needle = arg(i, a, 1)?;
+            let items = match values(i, &subject) {
+                Some(items) => items,
+                None => match subject.as_handle().filter(|h| !h.is_null()) {
+                    Some(h) if i.heap.with::<ClrArray, _>(h, |_| ()).is_some() => {
+                        crate::support::array_values(i, h)
+                    }
+                    _ => window_values(i, subject).unwrap_or_default(),
+                },
+            };
+            let found = items.iter().any(|v| crate::collections::values_equal(i, v, &needle));
+            Ok(Some(Value::I32(found as i32)))
+        });
+    }
+}
+
 /// `new Span<T>(void* pointer, int length)` — a span over `stackalloc` memory.
 ///
 /// The window records the element width, because the buffer cannot supply it:

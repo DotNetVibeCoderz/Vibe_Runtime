@@ -1562,6 +1562,40 @@ impl Loader {
             assembly.type_by_row.insert(row, type_id);
         }
 
+        // --- pass 1b: nested types under `Outer+Nested` ---------------------
+        // A nested TypeDef is registered under its bare name, but a TypeRef
+        // from another assembly names it through its enclosing type
+        // (`type_ref_full_name` builds `Ns.Outer+Nested`). Without this
+        // spelling a library's public nested type could not be used from a
+        // program at all: `new Kit.Checks()` failed as an unresolved token.
+        let mut enclosing_of: HashMap<u32, u32> = HashMap::new();
+        for row in 1..=md.row_count(TableId::NestedClass) {
+            let nc = md.nested_class(row).map_err(ExecutionError::Metadata)?;
+            enclosing_of.insert(nc.nested.row(), nc.enclosing.row());
+        }
+        for (&nested, _) in enclosing_of.iter() {
+            let mut names = Vec::new();
+            let mut row = nested;
+            // Bounded by the row count, so a cyclic table cannot spin here.
+            for _ in 0..=type_count {
+                let td = md.type_def(row).map_err(ExecutionError::Metadata)?;
+                match enclosing_of.get(&row) {
+                    Some(&outer) => {
+                        names.push(td.name.to_string());
+                        row = outer;
+                    }
+                    None => {
+                        names.push(td.full_name());
+                        break;
+                    }
+                }
+            }
+            names.reverse();
+            if let Some(&type_id) = assembly.type_by_row.get(&nested) {
+                self.registry.add_type_alias(names.join("+"), type_id);
+            }
+        }
+
         // --- pass 2: resolve TypeRefs ----------------------------------------
         for row in 1..=md.row_count(TableId::TypeRef) {
             let full = type_ref_full_name(&md, row).map_err(ExecutionError::Metadata)?;

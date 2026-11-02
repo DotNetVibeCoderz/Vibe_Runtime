@@ -1506,6 +1506,7 @@ static partial class Program
         PathChecks();
         ExplicitGenericChecks();
         StringSearchChecks();
+        UiToolkitChecks();
         GcEventChecks();
         SpanParseChecks();
         CheckEq("LINQ callbacks that allocate", LinqUnderCollection(300), 3029);

@@ -2245,7 +2245,24 @@ impl Interpreter {
 
     fn unbox(&mut self, v: Value, target: TypeId, any: bool) -> ExecResult<Value> {
         match v.as_handle() {
-            Some(h) if h.is_null() => Err(ExecutionError::null_reference()),
+            Some(h) if h.is_null() => {
+                // `unbox.any` of null is a cast when the target is a
+                // reference type (III.4.33), so null passes through; to
+                // `Nullable<T>` it is the empty nullable. Only a real value
+                // type throws. Generic code meets this constantly: `x as T`
+                // with `T : class` compiles to `isinst !!T; unbox.any !!T`,
+                // so a failed test reached here as null and threw.
+                if any {
+                    let ty = self.loader.registry.ty(target);
+                    if ty.full_name() == "System.Nullable`1" {
+                        return Ok(self.zero_of(target));
+                    }
+                    if !ty.kind.is_value_like() {
+                        return Ok(Value::Null);
+                    }
+                }
+                Err(ExecutionError::null_reference())
+            }
             Some(h) => {
                 if let Some((inner, boxed_type)) =
                     self.heap.with::<ClrBox, _>(h, |b| (b.value.clone(), b.type_id))
@@ -2254,6 +2271,27 @@ impl Interpreter {
                         || self.loader.registry.is_assignable_to(boxed_type, target)
                     {
                         return Ok(inner);
+                    }
+                    // `unbox.any Nullable<T>` of a boxed `T` wraps it
+                    // (III.4.33): `(int?)obj` where `obj` holds an int.
+                    if any {
+                        let ty = self.loader.registry.ty(target);
+                        // Framework generics are erased, so the argument
+                        // may be unknown; a box only ever holds a value type,
+                        // so then any boxed value is the `T`.
+                        let argument_fits = match ty.generic_args.first() {
+                            Some(&arg) => arg == boxed_type,
+                            None => true,
+                        };
+                        if ty.full_name() == "System.Nullable`1" && argument_fits {
+                            if let Value::Struct(mut s) = self.zero_of(target) {
+                                if s.fields.len() >= 2 {
+                                    s.fields[0] = Value::I32(1);
+                                    s.fields[1] = inner;
+                                    return Ok(Value::Struct(s));
+                                }
+                            }
+                        }
                     }
                     let from = self.loader.registry.ty(boxed_type).full_name();
                     let to = self.loader.registry.ty(target).full_name();
