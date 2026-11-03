@@ -177,13 +177,20 @@ impl Monitors {
         let key = object.to_bits();
 
         // Release fully, remembering how deep we were.
-        let depth = {
+        // The pulse count is read in the same critical section that releases
+        // the monitor. Reading it later (it used to be read once the waiter
+        // re-took the registry lock) lost a pulse: in between, another thread
+        // could enter the monitor, Pulse and exit, the waiter then took the
+        // already-raised count as its baseline and waited for ever -- seen as
+        // a Thread.Join that never returned on a single CPU, where the
+        // embedder hands the processor to the woken thread right away.
+        let (depth, seen) = {
             let mut state = self.lock();
             match state.held.get(&key) {
                 Some((owner, depth)) if *owner == me => {
                     let depth = *depth;
                     state.held.remove(&key);
-                    depth
+                    (depth, state.pulses.get(&key).copied().unwrap_or(0))
                 }
                 _ => return Wait::NotHeld,
             }
@@ -194,7 +201,6 @@ impl Monitors {
         let mut pulsed = false;
         blocked(&mut || {
             let mut state = self.lock();
-            let seen = state.pulses.get(&key).copied().unwrap_or(0);
             loop {
                 let woken = state.pulses.get(&key).copied().unwrap_or(0) > seen;
                 // The monitor has to be free before returning, pulsed or not:
