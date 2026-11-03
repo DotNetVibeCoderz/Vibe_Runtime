@@ -77,8 +77,12 @@ pub const FULL_BCL_BYTES: usize = 640_000;
 /// `NextInt64`, `NextSingle`, `NextBytes` and `Random.Shared`. Raised to
 /// 254,400 (measured 254,128) when `OperationCanceledException`,
 /// `CancellationTokenRegistration` and the source's two slots joined the
-/// types every tier registers.
-pub const MINIMAL_BCL_BYTES: usize = 254_400;
+/// types every tier registers. Raised to 288,500 (measured 288,082) when
+/// `MathF` and the `float` overloads of `Math` joined the numerics every tier
+/// has: the extra bindings tip the host's binding `HashMap` over a capacity
+/// step (as the regex bindings did for the full tier); a chip's `BTreeMap`
+/// pays only for the entries.
+pub const MINIMAL_BCL_BYTES: usize = 288_500;
 
 /// What a board's memory budget allows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

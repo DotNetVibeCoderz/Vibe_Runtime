@@ -683,6 +683,19 @@ impl Interpreter {
                             "typeof(T) cannot name a generic parameter on this runtime: type arguments are erased. See docs/limitations.md.",
                         ));
                     }
+                    // `typeof(float[])` is the vector type `Single[]`, the
+                    // same object `GetType()` returns for a `float[]`, not
+                    // the erased `System.Array` execution resolves it to.
+                    if let (Some(TableId::TypeSpec), Some(assembly)) = (token.table(), self.current_assembly()) {
+                        let sig = self.loader.assembly(assembly).type_specs.get(&token.row()).cloned();
+                        if let Some(sig @ TypeSig::SzArray(_)) = sig {
+                            if let Some(type_id) = self.loader.reflect_type_sig(assembly, &sig) {
+                                let handle = self.type_object(type_id);
+                                self.push(Value::Obj(handle));
+                                return Ok(StepOutcome::Continue);
+                            }
+                        }
+                    }
                     if let Ok(type_id) = self.resolve_type(token) {
                         let handle = self.type_object(type_id);
                         self.push(Value::Obj(handle));

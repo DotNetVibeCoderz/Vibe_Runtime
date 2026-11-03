@@ -436,6 +436,20 @@ fn register_list(interp: &mut Interpreter) {
         let this = receiver(i, a)?;
         let array = list_items(i, this);
         let values = elements(i, array);
+        // A `T[]` of the element type the call site named: `List<float>`
+        // gives a `float[]` (typed storage, `GetType()` says `Single[]`),
+        // which is what code handing the array on -- to a P/Invoke, to
+        // `Buffer.BlockCopy`, to `is float[]` -- expects. Untyped storage only
+        // when the element type is unknown here.
+        if let Some(element) = i.current_type_arguments().first().copied() {
+            let copy = i.alloc_array(element, values.len());
+            i.heap.with_mut::<ClrArray, _>(copy, |arr| {
+                for (k, v) in values.iter().enumerate() {
+                    arr.storage.set(k, v);
+                }
+            });
+            return Ok(Some(Value::Obj(copy)));
+        }
         let copy = i.alloc_value_array(0);
         with_values(i, copy, |v| *v = values);
         Ok(Some(Value::Obj(copy)))

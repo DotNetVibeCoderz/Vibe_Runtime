@@ -591,6 +591,7 @@ impl Loader {
         for (ns, name) in [
             ("System", "Console"),
             ("System", "Math"),
+            ("System", "MathF"),
             ("System", "Convert"),
             ("System", "Environment"),
             ("System", "DateTime"),

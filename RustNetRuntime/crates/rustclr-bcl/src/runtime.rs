@@ -72,9 +72,20 @@ fn register_object(interp: &mut Interpreter) {
             Value::Struct(s) => Some(s.type_id),
             _ => return Err(rustclr_core::ExecutionError::null_reference()),
         };
-        let Some(type_id) = type_id else {
+        let Some(mut type_id) = type_id else {
             return Err(rustclr_core::ExecutionError::null_reference());
         };
+        // A vector's heap type is the erased `System.Array`; `GetType()`
+        // answers with `T[]` (`new float[2].GetType().Name` is "Single[]").
+        if let Value::Obj(h) = &value {
+            let element = i
+                .heap
+                .with::<rustclr_core::ClrArray, _>(*h, |arr| (arr.dimensions.len() == 1).then_some(arr.element_type))
+                .flatten();
+            if let Some(element) = element {
+                type_id = i.loader.array_type_of(element);
+            }
+        }
         Ok(Some(Value::Obj(i.type_object(type_id))))
     });
 }

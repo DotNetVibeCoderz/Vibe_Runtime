@@ -1508,6 +1508,7 @@ static partial class Program
         StringSearchChecks();
         UiToolkitChecks();
         StructReceiverChecks();
+        FloatMathChecks();
         GcEventChecks();
         SpanParseChecks();
         CheckEq("LINQ callbacks that allocate", LinqUnderCollection(300), 3029);

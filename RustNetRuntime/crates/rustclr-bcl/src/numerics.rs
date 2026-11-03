@@ -39,6 +39,64 @@ fn register_math(interp: &mut Interpreter) {
     unary_f64!("System.Math::Truncate(double)", crate::fmath::trunc);
     unary_f64!("System.Math::Cbrt(double)", crate::fmath::cbrt);
 
+    // `MathF`: the same functions on `float`. The evaluation stack holds every
+    // float as an f64; each result is rounded through f32, as `conv.r4` would.
+    macro_rules! unary_f32 {
+        ($key:literal, $f:expr) => {
+            interp.register_native($key, |i, a| {
+                let x = arg_f64(i, a, 0)? as f32 as f64;
+                let f: fn(f64) -> f64 = $f;
+                Ok(Some(Value::F(f(x) as f32 as f64)))
+            });
+        };
+    }
+    unary_f32!("System.MathF::Sqrt(float)", crate::fmath::sqrt);
+    unary_f32!("System.MathF::Sin(float)", crate::fmath::sin);
+    unary_f32!("System.MathF::Cos(float)", crate::fmath::cos);
+    unary_f32!("System.MathF::Tan(float)", crate::fmath::tan);
+    unary_f32!("System.MathF::Asin(float)", crate::fmath::asin);
+    unary_f32!("System.MathF::Acos(float)", crate::fmath::acos);
+    unary_f32!("System.MathF::Atan(float)", crate::fmath::atan);
+    unary_f32!("System.MathF::Exp(float)", crate::fmath::exp);
+    unary_f32!("System.MathF::Log(float)", crate::fmath::ln);
+    unary_f32!("System.MathF::Log10(float)", crate::fmath::log10);
+    unary_f32!("System.MathF::Log2(float)", crate::fmath::log2);
+    unary_f32!("System.MathF::Floor(float)", crate::fmath::floor);
+    unary_f32!("System.MathF::Ceiling(float)", crate::fmath::ceil);
+    unary_f32!("System.MathF::Truncate(float)", crate::fmath::trunc);
+    unary_f32!("System.MathF::Cbrt(float)", crate::fmath::cbrt);
+    unary_f32!("System.MathF::Abs(float)", crate::fmath::abs);
+    unary_f32!("System.Math::Abs(float)", crate::fmath::abs);
+    interp.register_native("System.MathF::Round(float)", |i, a| {
+        Ok(Some(Value::F(round_half_even(arg_f64(i, a, 0)? as f32 as f64, 0) as f32 as f64)))
+    });
+    macro_rules! binary_f32 {
+        ($key:literal, $f:expr) => {
+            interp.register_native($key, |i, a| {
+                let x = arg_f64(i, a, 0)? as f32 as f64;
+                let y = arg_f64(i, a, 1)? as f32 as f64;
+                let f: fn(f64, f64) -> f64 = $f;
+                Ok(Some(Value::F(f(x, y) as f32 as f64)))
+            });
+        };
+    }
+    binary_f32!("System.MathF::Pow(float,float)", crate::fmath::powf);
+    binary_f32!("System.MathF::Atan2(float,float)", crate::fmath::atan2);
+    binary_f32!("System.MathF::Min(float,float)", |x, y| x.min(y));
+    binary_f32!("System.MathF::Max(float,float)", |x, y| x.max(y));
+    binary_f32!("System.Math::Min(float,float)", |x, y| x.min(y));
+    binary_f32!("System.Math::Max(float,float)", |x, y| x.max(y));
+    for key in ["System.MathF::Sign(float)", "System.Math::Sign(float)"] {
+        interp.register_native(key, |i, a| {
+            let x = arg_f64(i, a, 0)?;
+            Ok(Some(Value::I32(if x > 0.0 { 1 } else if x < 0.0 { -1 } else { 0 })))
+        });
+    }
+    interp.register_native("System.Math::Clamp(float,float,float)", |i, a| {
+        let (x, lo, hi) = (arg_f64(i, a, 0)?, arg_f64(i, a, 1)?, arg_f64(i, a, 2)?);
+        Ok(Some(Value::F((if x < lo { lo } else if x > hi { hi } else { x }) as f32 as f64)))
+    });
+
     interp.register_native("System.Math::Abs(int)", |i, a| {
         let x = arg_i32(i, a, 0)?;
         // `Math.Abs(int.MinValue)` throws rather than wrapping.
