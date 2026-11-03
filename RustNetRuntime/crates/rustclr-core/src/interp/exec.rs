@@ -1337,22 +1337,39 @@ impl Interpreter {
         // Only the value-type half used to be implemented, which left every
         // `foreach` broken at the `Dispose` in its finally block: the receiver
         // arrived as a pointer, so dispatch had no object to look at.
+        // III.2.1 also says: when the value type implements the method
+        // itself, the call goes to it *with the pointer* -- no box. Boxing it
+        // anyway handed the method a copy (and, before `ByRef::Boxed`, a
+        // by-value `this` that `ldflda` could not take the address of:
+        // `A + "x"` in a struct's `ToString` threw NullReferenceException).
+        let mut direct: Option<MethodId> = None;
         if let Some(ct) = constrained {
             let type_id = self.resolve_type(ct)?;
             let value_like = self.loader.registry.ty(type_id).kind.is_value_like();
             if let Some(first) = args.first_mut() {
                 if let Value::Ref(r) = first.clone() {
-                    let inner = self.load_indirect(r)?;
+                    let inner = self.load_indirect(r.clone())?;
                     *first = if value_like {
                         Value::Obj(self.box_value(type_id, inner))
                     } else {
                         inner
                     };
+                    if value_like && virtual_call && has_this {
+                        if let Some(h) = first.as_handle() {
+                            let t = self.resolve_virtual_target(h, declared)?;
+                            if self.loader.registry.method(t).declaring_type == type_id && !self.is_native_method(t) {
+                                *first = Value::Ref(r);
+                                direct = Some(t);
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        let target = if virtual_call && has_this {
+        let target = if let Some(t) = direct {
+            t
+        } else if virtual_call && has_this {
             match args.first().and_then(|v| v.as_handle()) {
                 Some(h) if !h.is_null() => self.resolve_virtual_target(h, declared)?,
                 Some(_) => return Err(ExecutionError::null_reference()),
@@ -1375,8 +1392,15 @@ impl Interpreter {
             if self.loader.registry.ty(target_type).kind.is_value_like() {
                 match args.first().cloned() {
                     Some(Value::Obj(h)) => {
-                        if let Some(inner) = self.heap.with::<ClrBox, _>(h, |b| b.value.clone()) {
-                            args[0] = inner;
+                        // IL code gets a pointer into the box (it may take
+                        // field addresses of `this`, or write through it);
+                        // natives keep receiving the value itself.
+                        if self.is_native_method(target) {
+                            if let Some(inner) = self.heap.with::<ClrBox, _>(h, |b| b.value.clone()) {
+                                args[0] = inner;
+                            }
+                        } else if self.heap.with::<ClrBox, _>(h, |_| ()).is_some() {
+                            args[0] = Value::Ref(ByRef::Boxed { object: h });
                         }
                     }
                     // A raw pointer used as a value type's receiver. `p[0] + ","`
@@ -2179,6 +2203,9 @@ impl Interpreter {
             ByRef::ArrayElement { array, index } => self
                 .heap.with::<ClrArray, _>(array, |a| a.storage.get(index as usize)).flatten()
                 .ok_or_else(|| ExecutionError::index_out_of_range(index as i64, 0))?,
+            ByRef::Boxed { object } => self
+                .heap.with::<ClrBox, _>(object, |b| b.value.clone())
+                .ok_or_else(ExecutionError::null_reference)?,
             ByRef::StructField { base, slot } => {
                 let container = self.load_indirect(*base)?;
                 match container {
@@ -2223,6 +2250,11 @@ impl Interpreter {
             }
             ByRef::Static { slot, .. } => {
                 self.loader.set_static(FieldId(slot), value);
+            }
+            ByRef::Boxed { object } => {
+                if self.heap.with_mut::<ClrBox, _>(object, |b| b.value = value).is_none() {
+                    return Err(ExecutionError::null_reference());
+                }
             }
             ByRef::StructField { base, slot } => {
                 // Value types are copied, not aliased: read the container,

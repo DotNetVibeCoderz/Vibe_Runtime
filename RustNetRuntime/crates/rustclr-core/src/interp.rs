@@ -1546,6 +1546,11 @@ impl Interpreter {
     }
 
     /// Enters a method: either pushes a frame or runs it natively.
+    /// True when `method` has no IL body here (a native binding / internal call).
+    pub(crate) fn is_native_method(&self, method: MethodId) -> bool {
+        !matches!(self.loader.registry.method(method).kind, MethodKind::Il(_))
+    }
+
     fn enter(&mut self, method: MethodId, args: Vec<Value>) -> ExecResult<Entered> {
         self.stats.calls += 1;
 

@@ -36,6 +36,11 @@ pub enum ByRef {
     /// Composing rather than flattening is what lets `a.b.c` work — and it is
     /// the reason `ByRef` is not `Copy`.
     StructField { base: Box<ByRef>, slot: u32 },
+    /// The value inside a box: `this` of a value type's method called on a
+    /// boxed instance (ECMA-335 I.8.9.7 -- the method sees a managed pointer
+    /// to the boxed value, so `ldflda` on `this` and writes through it work,
+    /// and land in the box).
+    Boxed { object: Handle },
 }
 
 /// One evaluation-stack slot.
@@ -192,6 +197,7 @@ impl Value {
             Value::Obj(h) if !h.is_null() => out.push(*h),
             Value::Ref(ByRef::Field { object, .. }) => out.push(*object),
             Value::Ref(ByRef::ArrayElement { array, .. }) => out.push(*array),
+            Value::Ref(ByRef::Boxed { object }) => out.push(*object),
             // A raw pointer roots the buffer it points into. `stackalloc`
             // memory has no other reference anywhere, so without this a
             // collection between the `localloc` and the next write frees it.
