@@ -37,6 +37,19 @@ static partial class Program
     static int GcSelectLoop(int n) => SumByLoop(GcTags(n));
     static int GcLoopSum(int n) => LoopTags(n).Sum(t => t.ToString().Length);
 
+    /// Bytes still live after `n` void calls, each handed a fresh array.
+    ///
+    /// Read by `crates/rustclr-bcl/tests/gc_natives.rs`, which swaps
+    /// `GC.KeepAlive`'s native for one that wrongly answers its argument: a
+    /// void call that leaves a value on the evaluation stack keeps it alive,
+    /// one array per iteration.
+    static long VoidCallsKeepNothing(int n)
+    {
+        long before = System.GC.GetTotalMemory(true);
+        for (int i = 0; i < n; i++) System.GC.KeepAlive(new byte[1000]);
+        return System.GC.GetTotalMemory(true) - before;
+    }
+
     static int GcConstText(int n)
     {
         var list = new List<Tag>();

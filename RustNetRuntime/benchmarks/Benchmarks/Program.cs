@@ -38,8 +38,13 @@ public static class Program
             case "spawn": return Report("spawn", Spawn(100000 * scale));
             case "pingpong": return Report("pingpong", PingPong(50000 * scale));
             case "fanout": return Report("fanout", FanOut(1000000 * scale));
+            // RustNet.Concurrency (Milestone 8.3), the rows 8.4's native fast
+            // paths are judged by.
+            case "channel": return Report("channel", ChannelStream(200000 * scale));
+            case "actors": return Report("actors", ActorMessages(200000 * scale));
+            case "waiting": return Report("waiting", ManyWaiting(1000000 * scale));
             default:
-                Console.WriteLine("workloads: noop fib sieve strings matrix sort alloc virtual exceptions fields kernels inlined arrays spawn pingpong fanout");
+                Console.WriteLine("workloads: noop fib sieve strings matrix sort alloc virtual exceptions fields kernels inlined arrays spawn pingpong fanout channel actors waiting");
                 return 2;
         }
     }
@@ -416,6 +421,58 @@ public static class Program
     // Two tasks hand one value back and forth through two channels, so every
     // message is a wake-up on the other side: the round-trip latency of a
     // continuation, which a run queue decides.
+    // ── A bounded channel between two tasks ─────────────────────────────────
+    //
+    // One producer, one consumer, room for 64. Unlike pingpong the two run
+    // ahead of each other until the channel is full or empty, so this is the
+    // cost of a write and a read rather than of a round trip.
+    private static long ChannelStream(int items)
+    {
+        var channel = System.Threading.Channels.Channel.CreateBounded<long>(64);
+        var producer = Task.Run(async () =>
+        {
+            for (int i = 1; i <= items; i++)
+                await channel.Writer.WriteAsync(i);
+            channel.Writer.Complete();
+        });
+        return Consume(channel.Reader, producer).Result;
+    }
+
+    private static async Task<long> Consume(System.Threading.Channels.ChannelReader<long> reader, Task producer)
+    {
+        long sum = 0;
+        while (await reader.WaitToReadAsync())
+            while (reader.TryRead(out long item))
+                sum += item;
+        await producer;
+        return sum;
+    }
+
+    // ── Messages to an actor ────────────────────────────────────────────────
+    //
+    // Posted from one thread to one actor: mailbox enqueue, the actor's
+    // dispatch loop, and one handler call per message.
+    private static long ActorMessages(int messages)
+    {
+        var counter = RustNet.Concurrency.Actors.Spawn<long>("counter", () => new MessageCounter());
+        for (int i = 1; i <= messages; i++)
+            counter.Post(i);
+        counter.Complete();
+        counter.Completion.Wait();
+        return MessageCounter.Total;
+    }
+
+    private sealed class MessageCounter : RustNet.Concurrency.Actor<long>
+    {
+        public static long Total;
+
+        protected override Task ReceiveAsync(long message)
+        {
+            Total += message;
+            return Task.CompletedTask;
+        }
+    }
+
     private static long PingPong(int rounds)
     {
         var ping = System.Threading.Channels.Channel.CreateUnbounded<long>();
@@ -476,5 +533,24 @@ public static class Program
         long total2 = 0;
         for (int p = 0; p < parents; p++) total2 += outer[p].Result;
         return total2;
+    }
+
+    // Milestone 8.5: a million tasks all waiting on one gate at once — the
+    // memory each costs while parked, then releasing them.
+    private static async Task<long> Waiter(Task<int> gate, int i)
+    {
+        int v = await gate;
+        return v + i;
+    }
+
+    private static long ManyWaiting(int n)
+    {
+        var gate = new TaskCompletionSource<int>();
+        var waiting = new Task<long>[n];
+        for (int i = 0; i < n; i++) waiting[i] = Waiter(gate.Task, i);
+        gate.SetResult(1);
+        long sum = 0;
+        for (int i = 0; i < n; i++) sum += waiting[i].Result;
+        return sum;
     }
 }

@@ -97,10 +97,14 @@ pub trait Collector: Send + Sync {
 #[derive(Debug)]
 pub struct MarkSweep {
     /// Collect once this many bytes have been allocated since the last run.
+    /// Grows by `growth_factor` after each collection, within the bounds
+    /// [`Self::next_trigger`] sets.
     pub allocation_trigger: usize,
+    /// Where the trigger starts, and the lowest it returns to.
+    pub base_trigger: usize,
     /// Never collect below this live size; avoids thrashing on tiny heaps.
     pub minimum_heap: usize,
-    /// Growth factor applied to the trigger after each collection.
+    /// How much the trigger grows after each collection.
     pub growth_factor: f32,
 }
 
@@ -108,6 +112,7 @@ impl Default for MarkSweep {
     fn default() -> Self {
         Self {
             allocation_trigger: 4 * 1024 * 1024,
+            base_trigger: 4 * 1024 * 1024,
             minimum_heap: 256 * 1024,
             growth_factor: 1.5,
         }
@@ -115,6 +120,28 @@ impl Default for MarkSweep {
 }
 
 impl MarkSweep {
+    /// How far past the live set the trigger may grow.
+    ///
+    /// The trigger grows after every collection, which is what keeps a
+    /// program that allocates heavily from collecting constantly — `fanout`
+    /// ran 40% slower when the growth was taken away. But it used to grow
+    /// *whatever survived*: a channel stream whose live set never passed
+    /// 3.5 KB had a 31 MB trigger after six collections, and forty
+    /// collections in, any program's trigger would be terabytes — a server
+    /// that runs for a day stops collecting at all. Bounded by a multiple of
+    /// what survived, it still grows for a program that keeps a lot alive and
+    /// comes back down for one that does not.
+    pub const MAX_TRIGGER_PER_LIVE_BYTE: usize = 64;
+
+    /// The trigger after a collection that left `live_bytes` alive: grown by
+    /// `growth_factor`, at most [`Self::MAX_TRIGGER_PER_LIVE_BYTE`] times the
+    /// live set, and never below `base_trigger`.
+    pub fn next_trigger(&self, live_bytes: usize) -> usize {
+        let grown = (self.allocation_trigger as f32 * self.growth_factor) as usize;
+        let ceiling = live_bytes.saturating_mul(Self::MAX_TRIGGER_PER_LIVE_BYTE);
+        grown.min(ceiling).max(self.base_trigger).min(usize::MAX / 2)
+    }
+
     /// How full a bounded slot table gets before a collection is asked for.
     ///
     /// Three quarters, not the last slot. Collecting at the ceiling means the
@@ -129,6 +156,7 @@ impl MarkSweep {
     pub fn embedded() -> Self {
         Self {
             allocation_trigger: 32 * 1024,
+            base_trigger: 32 * 1024,
             minimum_heap: 8 * 1024,
             growth_factor: 1.2,
         }
@@ -186,10 +214,9 @@ impl Collector for MarkSweep {
         }
         let (live_count, live_bytes) = totals(spaces);
 
-        // Widen the trigger so a program with a large live set does not spend
-        // all its time collecting.
-        let next = (self.allocation_trigger as f32 * self.growth_factor) as usize;
-        self.allocation_trigger = next.max(live_bytes).min(usize::MAX / 2);
+        // Widen the trigger so a program that allocates heavily does not
+        // spend all its time collecting — within a bound set by what is live.
+        self.allocation_trigger = self.next_trigger(live_bytes);
 
         CollectionReport {
             objects_freed,
@@ -231,4 +258,53 @@ impl Collector for NeverCollect {
 /// Live objects and bytes, across every space.
 fn totals(spaces: &[&mut ObjectSpace]) -> (usize, usize) {
     spaces.iter().fold((0, 0), |(count, bytes), s| (count + s.live_count(), bytes + s.live_bytes()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A program that keeps almost nothing alive must not see its trigger
+    /// compound. Before the bound, six collections of a 3.5 KB live set took
+    /// the trigger from 4 MB to 31 MB, and it would have kept going.
+    #[test]
+    fn a_small_live_set_keeps_the_trigger_at_its_base() {
+        let mut policy = MarkSweep::default();
+        for _ in 0..40 {
+            policy.allocation_trigger = policy.next_trigger(3_500);
+        }
+        assert_eq!(policy.allocation_trigger, policy.base_trigger);
+    }
+
+    /// A program that keeps a lot alive still gets a growing trigger, which
+    /// is what keeps it from collecting after every few megabytes.
+    #[test]
+    fn a_large_live_set_lets_the_trigger_grow() {
+        let mut policy = MarkSweep::default();
+        let live = 20 * 1024 * 1024;
+        let mut previous = policy.allocation_trigger;
+        for _ in 0..5 {
+            policy.allocation_trigger = policy.next_trigger(live);
+            assert!(policy.allocation_trigger > previous, "the trigger grows with a large live set");
+            previous = policy.allocation_trigger;
+        }
+        // ...but never past the bound.
+        for _ in 0..40 {
+            policy.allocation_trigger = policy.next_trigger(live);
+        }
+        assert_eq!(policy.allocation_trigger, live * MarkSweep::MAX_TRIGGER_PER_LIVE_BYTE);
+    }
+
+    /// After a spike the trigger comes back down once the live set does.
+    #[test]
+    fn the_trigger_shrinks_when_the_live_set_does() {
+        let mut policy = MarkSweep::default();
+        for _ in 0..20 {
+            policy.allocation_trigger = policy.next_trigger(50 * 1024 * 1024);
+        }
+        let spiked = policy.allocation_trigger;
+        policy.allocation_trigger = policy.next_trigger(10 * 1024);
+        assert!(policy.allocation_trigger < spiked);
+        assert_eq!(policy.allocation_trigger, policy.base_trigger);
+    }
 }

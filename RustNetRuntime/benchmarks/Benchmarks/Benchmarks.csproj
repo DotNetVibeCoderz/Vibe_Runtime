@@ -13,4 +13,7 @@
          comparison for an interpreter. -->
     <TieredCompilation>false</TieredCompilation>
   </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../managed/RustNet.Concurrency/RustNet.Concurrency.csproj" />
+  </ItemGroup>
 </Project>

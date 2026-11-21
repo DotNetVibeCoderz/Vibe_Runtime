@@ -124,6 +124,11 @@ struct Inner {
     size: usize,
     /// The heap, for its count of contended acquisitions.
     heap: rustclr_gc::SharedHeap,
+    /// The first runtime failure inside a job that could not become a managed
+    /// exception — an unresolvable token, a missing native. A job returns
+    /// nothing, so without this such a failure vanished: the task it was
+    /// running never completed, and a program could exit 0 halfway through.
+    fatal: Mutex<Option<crate::error::ExecutionError>>,
 }
 
 /// A pool of threads that run managed work.
@@ -165,6 +170,7 @@ impl TaskPool {
             completed: AtomicUsize::new(0),
             size,
             heap: parent.heap.clone(),
+            fatal: Mutex::new(None),
         });
 
         let host = Arc::new(host);
@@ -211,6 +217,20 @@ impl TaskPool {
 
     pub fn worker_count(&self) -> usize {
         self.inner.workers.load(Ordering::Acquire)
+    }
+
+    /// Records a failure the program cannot continue past. The first wins:
+    /// later ones are usually its consequences.
+    pub fn record_fatal(&self, error: crate::error::ExecutionError) {
+        let mut slot = self.inner.fatal.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.is_none() {
+            *slot = Some(error);
+        }
+    }
+
+    /// The failure [`Self::record_fatal`] kept, if any.
+    pub fn fatal(&self) -> Option<crate::error::ExecutionError> {
+        self.inner.fatal.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// Jobs queued or still running.

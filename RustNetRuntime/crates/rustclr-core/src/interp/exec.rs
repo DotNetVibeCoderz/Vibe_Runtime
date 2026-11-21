@@ -1028,6 +1028,14 @@ impl Interpreter {
     /// Type arguments the call site's `TypeSpec` names, for a framework generic.
     fn call_site_type_arguments(&mut self, token: Token) -> Vec<TypeId> {
         let Some(assembly) = self.current_assembly() else { return Vec::new() };
+        // `items.ToArray()` on a `List<T>` field inside `Box<T>`: the reference
+        // names `List<!0>`, which load time could only bind to a placeholder.
+        // A native that builds a `T[]` from that placeholder made an array of
+        // the wrong element type, and every `int` stored into it read back as
+        // zero. The executing frame knows what `!0` is.
+        if let Some(args) = self.frame_type_arguments_of(token) {
+            return args;
+        }
         let mut out = match self.loader.member_ref_type_args(assembly, token) {
             Some(a) if !a.is_empty() => self.type_args_pool.pop().unwrap_or_default(),
             _ => return Vec::new(),
@@ -1036,6 +1044,33 @@ impl Interpreter {
             out.extend_from_slice(a);
         }
         out
+    }
+
+    /// The type arguments of a member reference's declaring `TypeSpec`,
+    /// resolved against the executing frame. `None` when the reference names
+    /// no type parameter, or when one of them cannot be resolved here.
+    fn frame_type_arguments_of(&mut self, token: Token) -> Option<Vec<TypeId>> {
+        if token.table() != Some(TableId::MemberRef) {
+            return None;
+        }
+        let assembly = self.frame_ref().assembly;
+        let loaded = self.loader.assembly(assembly);
+        let class = *loaded.member_ref_open_class.get(&token.row())?;
+        let TypeSig::GenericInst { args, .. } = loaded.type_specs.get(&class.row())?.clone() else {
+            return None;
+        };
+        let mut out = self.type_args_pool.pop().unwrap_or_default();
+        out.clear();
+        for arg in &args {
+            match self.frame_type_of_sig(arg) {
+                Some(t) => out.push(t),
+                None => {
+                    self.recycle_type_args(out);
+                    return None;
+                }
+            }
+        }
+        Some(out)
     }
 
     /// The construction a member reference names in terms of the executing

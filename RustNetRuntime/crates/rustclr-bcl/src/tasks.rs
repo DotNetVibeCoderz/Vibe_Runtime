@@ -83,6 +83,9 @@ const CANCELED: i32 = 3;
 /// of waiting on a task without blocking a thread.
 const ENTRY_CONTINUE_WITH: i32 = 1;
 const ENTRY_WHEN_ANY: i32 = 2;
+/// `[ENTRY_UNWRAP, outer]`: the outer task of `Task.Run(async () => …)` takes
+/// on the inner task's outcome when it arrives.
+const ENTRY_UNWRAP: i32 = 3;
 
 /// Leaks a stable key string; the native table holds it for the process life.
 fn key(type_name: &str, member: &str) -> &'static str {
@@ -648,11 +651,15 @@ fn run_entry(interp: &mut Interpreter, task: Handle, entry: Handle) -> ExecResul
                     let _ = transition(interp, result, COMPLETED, value)?;
                 }
                 Err(e) => {
-                    let exception = exception_value(&e);
+                    let exception = exception_value(interp, &e);
                     fault(interp, result, exception)?;
                 }
             }
             Ok(())
+        }
+        Some(ENTRY_UNWRAP) => {
+            let outer = parts.get(1).and_then(|v| v.as_handle()).unwrap_or(Handle::NULL);
+            forward_outcome(interp, task, outer)
         }
         Some(ENTRY_WHEN_ANY) => {
             // The first of the set to finish wins; the rest find it final.
@@ -690,7 +697,15 @@ fn resume(interp: &mut Interpreter, cell: Handle) -> ExecResult<()> {
     } else {
         machine
     };
-    interp.invoke(move_next, vec![this])?;
+    let outcome = interp.invoke(move_next, vec![this]);
+    #[cfg(feature = "threads")]
+    if let Err(e) = &outcome {
+        // `MoveNext` catches the program's own exceptions and faults its
+        // builder's task. What comes out of it is the runtime failing, and
+        // the method's task will now never complete.
+        interp.report_fatal(e);
+    }
+    outcome?;
     Ok(())
 }
 
@@ -868,6 +883,20 @@ fn register_task(interp: &mut Interpreter) {
         let value = arg(i, a, 0)?;
         Ok(Some(Value::Obj(completed_task(i, value))))
     });
+    // `Task.FromException(e)` and `Task.FromException<T>(e)`: one key, since
+    // generic methods are erased and both take one argument.
+    interp.register_native(key(&format!("{TASKS}.Task"), "FromException/1"), |i, a| {
+        let exception = arg(i, a, 0)?;
+        if exception.is_null() {
+            return Err(ExecutionError::exception(
+                ClrExceptionKind::ArgumentNull,
+                "Value cannot be null. (Parameter 'exception')",
+            ));
+        }
+        let task = new_task(i, true);
+        i.with_roots(&[Value::Obj(task)], |i| fault(i, task, exception))?;
+        Ok(Some(Value::Obj(task)))
+    });
     // `Task.Delay` hands back a *pending* task and arms a timer, so
     // `var d = Task.Delay(500); Work(); await d;` overlaps the two. Sleeping
     // the caller here instead would make every delay a stop.
@@ -969,6 +998,9 @@ fn register_task(interp: &mut Interpreter) {
         "Delay(System.TimeSpan)",
         "Delay(int,System.Threading.CancellationToken)",
         "Delay(System.TimeSpan,System.Threading.CancellationToken)",
+        // A value type from another assembly renders as a token in a typed
+        // key, so the two-argument overloads also bind by arity.
+        "Delay/2",
     ] {
         interp.register_native(key(&format!("{TASKS}.Task"), member), delay_with);
     }
@@ -1108,18 +1140,12 @@ fn run_delegate(interp: &mut Interpreter, args: &[Value]) -> ExecResult<Option<V
                 // overload unwraps it: the caller gets `Task<int>`, not
                 // `Task<Task<int>>`. Completing with the inner task itself
                 // would give a caller reading `Result` the task object.
-                match unwrap_inner_task(worker, value) {
-                    Ok(value) => complete(worker, task, value),
-                    Err(e) => {
-                        let exception = exception_value(&e);
-                        fault(worker, task, exception)
-                    }
-                }
+                unwrap_into(worker, value, task)
             }
             // A failure inside the delegate becomes a faulted task rather than
             // escaping the worker, which is what `await` expects to observe.
             Err(e) => {
-                let exception = exception_value(&e);
+                let exception = exception_value(worker, &e);
                 fault(worker, task, exception)
             }
         };
@@ -1141,7 +1167,7 @@ fn run_delegate(interp: &mut Interpreter, args: &[Value]) -> ExecResult<Option<V
         Ok(value) => Ok(Some(Value::Obj(completed_task(interp, value)))),
         Err(e) => {
             let task = new_task(interp, true);
-            let exception = exception_value(&e);
+            let exception = exception_value(interp, &e);
             fault(interp, task, exception)?;
             Ok(Some(Value::Obj(task)))
         }
@@ -1156,22 +1182,55 @@ fn returns_void(interp: &Interpreter) -> bool {
         .unwrap_or(false)
 }
 
-/// Unwraps the task an async delegate returned.
+/// Settles `outer` with whatever an async delegate returned.
 ///
-/// `Task.Run(Func<Task<T>>)` is `Unwrap`ped by .NET, so the outer task settles
-/// with the inner one's *result*. Waiting for the inner task here is what makes
-/// that possible, and it is safe on a pool worker because waiting helps run
-/// queued work rather than idling.
-#[cfg(feature = "threads")]
-fn unwrap_inner_task(interp: &mut Interpreter, value: Value) -> ExecResult<Value> {
-    let Some(handle) = value.as_handle().filter(|h| !h.is_null()) else {
-        return Ok(value);
+/// `Task.Run(Func<Task<T>>)` is `Unwrap`ped by .NET: the outer task takes on
+/// the inner one's outcome. That used to be done by *waiting* for the inner
+/// task inside the pool job, which held a worker for the inner task's whole
+/// life — an actor's message loop is such a task, and lives as long as the
+/// actor. Worse, a waiting thread helps with queued work, so two such waits
+/// could nest on one stack with the inner one waiting for what only the
+/// outer one's return would complete. That deadlocked RustNet.Concurrency's
+/// fixture one run in six. Now the outer task is settled by a continuation
+/// on the inner one, and the job returns at once.
+fn unwrap_into(interp: &mut Interpreter, value: Value, outer: Handle) -> ExecResult<()> {
+    let inner = match value.as_handle().filter(|h| !h.is_null()) {
+        Some(h) if is_task(interp, h) => h,
+        _ => return complete(interp, outer, value),
     };
-    if !is_task(interp, handle) {
-        return Ok(value);
-    }
-    settle(interp, handle)?;
-    result_of(interp, handle)
+    let entry = interp.with_roots(&[Value::Obj(inner), Value::Obj(outer)], |i| {
+        let entry = i.alloc_value_array(2);
+        crate::collections::with_values(i, entry, |v| {
+            v[0] = Value::I32(ENTRY_UNWRAP);
+            v[1] = Value::Obj(outer);
+        });
+        entry
+    });
+    let rooted = [Value::Obj(inner), Value::Obj(outer), Value::Obj(entry)];
+    interp.with_roots(&rooted, |i| {
+        if add_continuation(i, inner, Value::Obj(entry)) {
+            // Already final: nothing will run the entry, so do it here.
+            forward_outcome(i, inner, outer)
+        } else {
+            Ok(())
+        }
+    })
+}
+
+/// Gives `outer` the final state `inner` reached: its result, its fault, or
+/// its cancellation, with the same payload.
+fn forward_outcome(interp: &mut Interpreter, inner: Handle, outer: Handle) -> ExecResult<()> {
+    let status = status_of(interp, inner);
+    let payload = match status {
+        COMPLETED => field(interp, inner, RESULT),
+        PENDING => {
+            return Err(ExecutionError::InvalidProgram(
+                "a task's continuation ran while the task was still pending".into(),
+            ))
+        }
+        _ => field(interp, inner, EXCEPTION),
+    };
+    transition(interp, outer, status, payload).map(|_| ())
 }
 
 /// Waits for a task's body to finish, if one is running on another thread.
@@ -1219,6 +1278,9 @@ fn settle(interp: &mut Interpreter, task: Handle) -> ExecResult<()> {
         if status_of(interp, task) != PENDING {
             settled = true;
             break;
+        }
+        if let Some(fatal) = interp.fatal_error() {
+            return Err(fatal);
         }
         if interp.help_with_queued_work() {
             idle = 0;
@@ -1292,10 +1354,19 @@ fn settle_within(interp: &mut Interpreter, task: Handle, _millis: Option<u64>) -
 }
 
 /// The managed exception object an error carries, if it has one.
-fn exception_value(error: &ExecutionError) -> Value {
+///
+/// An error without one is the runtime failing rather than the program
+/// throwing, and is reported as such: the task is still faulted, so nothing
+/// waits on it forever, and the failure itself stops the program.
+fn exception_value(interp: &Interpreter, error: &ExecutionError) -> Value {
     match error {
         ExecutionError::Exception { object, .. } => Value::Obj(*object),
-        _ => Value::Null,
+        _ => {
+            #[cfg(feature = "threads")]
+            interp.report_fatal(error);
+            let _ = interp;
+            Value::Null
+        }
     }
 }
 
@@ -1441,13 +1512,36 @@ fn await_on_completed(
     // another thread completing the task in between — see `transition`.
     let already_done = add_continuation(interp, task, Value::Obj(cell));
 
-    // Finished before we could queue: resume now rather than waiting for a
-    // drain that has already happened. Outside the lock, as resuming runs
-    // managed code — and rooted, since the cell is on no list.
+    // Finished before we could queue: nothing will drain the list again, so
+    // the resumption is this call's to arrange.
     if already_done {
-        interp.with_roots(&[Value::Obj(cell)], |i| resume(i, cell))?;
+        resume_lost_race(interp, cell)?;
     }
     Ok(None)
+}
+
+/// Resumes a machine whose task finished between `IsCompleted` and
+/// `AwaitUnsafeOnCompleted`.
+///
+/// Queued, not run here. Running it here nests the resumed `MoveNext` inside
+/// the one that is suspending, and a loop of awaits that keeps losing the race
+/// keeps nesting: `await Task.Run(…)` in a loop overflowed a worker's stack at
+/// random, a few thousand iterations in. .NET queues it too — a continuation
+/// that could not be added runs on the thread pool, never inline.
+#[cfg(feature = "threads")]
+fn resume_lost_race(interp: &mut Interpreter, cell: Handle) -> ExecResult<()> {
+    queue_rooted(interp, core::time::Duration::ZERO, &[cell], move |worker| {
+        let _ = resume(worker, cell);
+    });
+    Ok(())
+}
+
+/// Without threads no other thread can finish the task in between, so this
+/// is reached only by a task that was final all along; resuming here is the
+/// only option, and cannot repeat without bound.
+#[cfg(not(feature = "threads"))]
+fn resume_lost_race(interp: &mut Interpreter, cell: Handle) -> ExecResult<()> {
+    interp.with_roots(&[Value::Obj(cell)], |i| resume(i, cell))
 }
 
 // -- awaiters ----------------------------------------------------------------
@@ -1808,11 +1902,18 @@ fn register_async_iterators(interp: &mut Interpreter) {
             Ok(Some(Value::I32(completed_or_default(i, a)? as i32)))
         });
         interp.register_native(key(full, "GetResult()"), |i, a| {
-            match value_task_handle(i, a)? {
-                Some(t) => result_of(i, t),
-                None => Ok(Value::Null),
+            let value = match value_task_handle(i, a)? {
+                Some(t) => result_of(i, t)?,
+                None => Value::Null,
+            };
+            // `ValueTaskAwaiter.GetResult()` is void. Answering it with a null
+            // left one value on the caller's evaluation stack per `await` —
+            // a producer looping on `await writer.WriteAsync(i)` had 14,000
+            // of them after 40,000 writes, and every root scan walked them.
+            if returns_void(i) {
+                return Ok(None);
             }
-            .map(Some)
+            Ok(Some(value))
         });
     }
 }
@@ -1928,7 +2029,7 @@ fn task_for_source(interp: &mut Interpreter, source: Handle, token: Value) -> Ex
         match call_get_result(i, source, token.clone()) {
             Ok(value) => complete(i, task, value),
             Err(e) => {
-                let exception = exception_value(&e);
+                let exception = exception_value(i, &e);
                 if exception.as_handle().filter(|h| !h.is_null()).is_some() {
                     fault(i, task, exception)
                 } else {

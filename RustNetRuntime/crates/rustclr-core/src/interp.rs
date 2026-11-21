@@ -194,6 +194,19 @@ pub trait NativeTier: Send {
 /// for a void method.
 pub type NativeFn = fn(&mut Interpreter, &[Value]) -> ExecResult<Option<Value>>;
 
+/// A native that stands in for a method which *has* an IL body.
+///
+/// A [`NativeFn`] is the only implementation of a method; an intrinsic is a
+/// faster second one, and the IL stays the definition. So an intrinsic may
+/// **decline**: `Ok(None)` means "not this shape — run the IL", which is how
+/// one handles the common case and leaves the rest to the code that defines
+/// it, rather than guessing. `Ok(Some(v))` is the method's result (`v` is
+/// `None` for a void method).
+///
+/// `crates/rustclr-bcl/tests/intrinsics.rs` runs every registered intrinsic
+/// against its IL body and fails on any difference.
+pub type IntrinsicFn = fn(&mut Interpreter, &[Value]) -> ExecResult<Option<Option<Value>>>;
+
 /// Execution limits, so a runaway program fails predictably.
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
@@ -219,6 +232,10 @@ pub struct ExecutionStats {
     pub collections: u64,
     /// Calls that ran as compiled machine code rather than being interpreted.
     pub native_tier_calls: u64,
+    /// Calls an intrinsic answered instead of the method's IL.
+    pub intrinsic_calls: u64,
+    /// Calls an intrinsic was offered and declined, so the IL ran.
+    pub intrinsics_declined: u64,
 }
 
 /// Outcome of entering a method.
@@ -261,6 +278,16 @@ pub struct Interpreter {
     /// The native bound to each method, by method index, once looked up:
     /// `Some(None)` records a method with no native.
     native_cache: Vec<Option<Option<NativeFn>>>,
+    /// Natives substituted for methods that have an IL body; see [`IntrinsicFn`].
+    intrinsics: HashMap<String, IntrinsicFn>,
+    /// [`Self::intrinsics`] by method index, as `native_cache` is.
+    intrinsic_cache: Vec<Option<Option<IntrinsicFn>>>,
+    /// Instance-field slots by type and name, for natives that read a managed
+    /// object's own fields; see [`Self::field_slot_named`].
+    field_slot_cache: HashMap<(TypeId, &'static str), Option<usize>>,
+    /// Whether intrinsics are used at all. Off, every method runs its IL —
+    /// which is how a substitution is checked against what it replaces.
+    pub intrinsics_enabled: bool,
     /// Spare frame vectors; see `frame_vec`.
     vec_pool: Vec<Vec<Value>>,
     /// One-slot cells a struct constructor ran against, kept for the next
@@ -501,6 +528,10 @@ impl Interpreter {
             stats: ExecutionStats::default(),
             natives: HashMap::new(),
             native_cache: Vec::new(),
+            intrinsics: HashMap::new(),
+            intrinsic_cache: Vec::new(),
+            field_slot_cache: HashMap::new(),
+            intrinsics_enabled: intrinsics_from_environment(),
             vec_pool: Vec::new(),
             struct_cells: Vec::new(),
             native_tier: None,
@@ -561,6 +592,37 @@ impl Interpreter {
         self.natives.insert(key.into(), f);
         // A binding added later can satisfy a method an earlier lookup missed.
         self.native_cache.clear();
+    }
+
+    /// Registers an intrinsic: a native used *instead of* the IL body of the
+    /// method `key` names, while [`Self::intrinsics_enabled`] is set.
+    pub fn register_intrinsic(&mut self, key: impl Into<String>, f: IntrinsicFn) {
+        self.intrinsics.insert(key.into(), f);
+        self.intrinsic_cache.clear();
+    }
+
+    /// Every intrinsic's binding key.
+    pub fn intrinsic_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self.intrinsics.keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
+    /// The intrinsic standing in for `method`, if there is one and they are on.
+    fn intrinsic_for(&mut self, method: MethodId) -> Option<IntrinsicFn> {
+        if !self.intrinsics_enabled || self.intrinsics.is_empty() {
+            return None;
+        }
+        let slot = method.index();
+        if let Some(found) = self.intrinsic_cache.get(slot).copied().flatten() {
+            return found;
+        }
+        let found = self.loader.native_keys(method).into_iter().find_map(|key| self.intrinsics.get(&key).copied());
+        if slot >= self.intrinsic_cache.len() {
+            self.intrinsic_cache.resize(slot + 1, None);
+        }
+        self.intrinsic_cache[slot] = Some(found);
+        found
     }
 
     pub fn native_count(&self) -> usize {
@@ -756,6 +818,22 @@ impl Interpreter {
             out.extend(self.loader.registry.ty(t).instance_fields.iter().copied());
         }
         out
+    }
+
+    /// The slot of the instance field `name` in an object of type `type_id` —
+    /// the nearest declaration, as a subclass's own field hides a base's.
+    ///
+    /// For an intrinsic, which knows the managed class it stands in for by
+    /// its source and reads that class's fields directly. Cached: the answer
+    /// is fixed when the type loads.
+    pub fn field_slot_named(&mut self, type_id: TypeId, name: &'static str) -> Option<usize> {
+        if let Some(found) = self.field_slot_cache.get(&(type_id, name)) {
+            return *found;
+        }
+        let list = self.instance_field_list(type_id);
+        let found = list.iter().rposition(|f| self.loader.registry.field(*f).name == name);
+        self.field_slot_cache.insert((type_id, name), found);
+        found
     }
 
     /// [`Self::instance_fields`], computed once per type.
@@ -1101,6 +1179,8 @@ impl Interpreter {
         // registered has to be reachable from the worker or the two would run
         // different code.
         worker.natives = self.natives.clone();
+        worker.intrinsics = self.intrinsics.clone();
+        worker.intrinsics_enabled = self.intrinsics_enabled;
         // Interned strings and `System.Type` instances are identity-bearing:
         // `typeof(T) == typeof(T)` and `ReferenceEquals` on an interned string
         // must hold across threads, so the caches come across rather than being
@@ -1261,12 +1341,46 @@ impl Interpreter {
         self.mutators.blocked()
     }
 
+    /// Keeps a runtime failure that happened where nothing could return it —
+    /// inside a pool job — so the program stops with it instead of losing it.
+    ///
+    /// A managed exception is not kept: it has an object, and the task it
+    /// faults carries it to whoever awaits. Everything else — an unresolvable
+    /// token, a missing native — has no object, and faulting a task with
+    /// nothing is how it used to disappear.
+    #[cfg(feature = "threads")]
+    pub fn report_fatal(&self, error: &ExecutionError) {
+        if matches!(error, ExecutionError::Exception { .. }) {
+            return;
+        }
+        if let Some(pool) = &self.pool {
+            pool.record_fatal(error.clone());
+        }
+    }
+
+    /// A failure some pool job recorded with [`Self::report_fatal`].
+    #[cfg(feature = "threads")]
+    pub fn fatal_error(&self) -> Option<ExecutionError> {
+        self.pool.as_ref().and_then(|p| p.fatal())
+    }
+
     /// Runs one queued job here, if there is one. Used by a thread that would
     /// otherwise idle waiting for a task.
     #[cfg(feature = "threads")]
     pub fn help_with_queued_work(&mut self) -> bool {
         let Some(pool) = self.pool.clone() else { return false };
-        pool.run_one(self)
+        // A helped job is a unit of work of its own, run from inside whatever
+        // native is waiting — for the main thread, `GetResult` on `Main`'s
+        // task, which lasts the whole program. Every value managed code hands
+        // back while a native is running is kept as a root until that native
+        // returns, so without this cut a job's results would outlive it for as
+        // long as the wait lasts, held alive and walked by every root scan.
+        // Nothing the waiting native holds is above the mark, so dropping what
+        // the job added is safe.
+        let mark = self.native_roots.len();
+        let ran = pool.run_one(self);
+        self.native_roots.truncate(mark);
+        ran
     }
 
     /// Whether anything could still complete a pending task.
@@ -1617,7 +1731,14 @@ impl Interpreter {
             Vec::new()
         };
 
-        let result = self.invoke(method, args)?;
+        let result = self.invoke(method, args);
+        // A failure on a pool thread outranks however `Main` itself ended:
+        // it is usually *why* `Main` ended — a continuation that never ran.
+        #[cfg(feature = "threads")]
+        if let Some(fatal) = self.fatal_error() {
+            return Err(fatal);
+        }
+        let result = result?;
         if let Some(code) = self.exit_requested {
             return Ok(code);
         }
@@ -1645,6 +1766,28 @@ impl Interpreter {
             let value = self.call_non_il(method, &args);
             self.recycle(args);
             return Ok(Entered::Native(value?));
+        }
+
+        if let Some(f) = self.intrinsic_for(method) {
+            let mark = self.native_roots.len();
+            self.native_roots.extend(args.iter().cloned());
+            self.native_depth += 1;
+            let outcome = f(self, &args);
+            self.native_depth -= 1;
+            self.native_roots.truncate(mark);
+            match outcome {
+                Ok(Some(value)) => {
+                    self.stats.intrinsic_calls += 1;
+                    self.recycle(args);
+                    return Ok(Entered::Native(value));
+                }
+                // Declined: the IL runs, with the arguments untouched.
+                Ok(None) => self.stats.intrinsics_declined += 1,
+                Err(e) => {
+                    self.recycle(args);
+                    return Err(e);
+                }
+            }
         }
 
         // Offer the call to the code generator before building a frame. A
@@ -1805,8 +1948,26 @@ impl Interpreter {
                         let mark = self.native_roots.len();
                         self.native_roots.extend(args.iter().cloned());
                         self.native_depth += 1;
-                        let result = f(self, args);
+                        let mut result = f(self, args);
                         self.native_depth -= 1;
+                        // A void method has nothing to push. A native that
+                        // answers one anyway leaves a value on the caller's
+                        // evaluation stack, which is never popped: the stack of
+                        // a loop's frame grows by one per call, silently, and
+                        // every root scan walks it. Found as a `ValueTask`
+                        // await that made a channel stream five times slower
+                        // by its end than at its start.
+                        //
+                        // A constructor is the exception: it is void in
+                        // metadata, but a native one may build its object —
+                        // `new string('x', 48)` — and `newobj` takes that as
+                        // the result.
+                        if matches!(result, Ok(Some(_))) {
+                            let info = self.loader.registry.method(method);
+                            if info.returns_void() && info.name != ".ctor" {
+                                result = Ok(None);
+                            }
+                        }
                         self.native_roots.truncate(mark);
                         self.current_native = previous;
                         let spent = core::mem::replace(&mut self.current_native_type_args, previous_args);
@@ -2281,4 +2442,16 @@ pub trait DevicePoll: Send {
     /// same reason: this trait is deliberately narrow, and downcasting is
     /// cheaper than widening it with methods only one implementor wants.
     fn into_any(self: alloc::boxed::Box<Self>) -> alloc::boxed::Box<dyn core::any::Any>;
+}
+
+/// Intrinsics are on unless `RUSTCLR_INTRINSICS=0`.
+fn intrinsics_from_environment() -> bool {
+    #[cfg(feature = "std")]
+    {
+        !matches!(std::env::var("RUSTCLR_INTRINSICS").as_deref(), Ok("0") | Ok("off"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
 }

@@ -109,7 +109,7 @@ pub use error::{ClrExceptionKind, ExecResult, ExecutionError};
 pub use host::{CaptureHost, Host};
 #[cfg(feature = "std")]
 pub use host::SystemHost;
-pub use interp::{
+pub use interp::{IntrinsicFn, 
     CompiledMethod, DevicePoll, ExecutionStats, Frame, Interpreter, Limits, NativeFn, NativeTier,
 };
 pub use loader::{

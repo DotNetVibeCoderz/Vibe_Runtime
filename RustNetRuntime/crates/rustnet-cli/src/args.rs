@@ -21,6 +21,8 @@ pub enum Command {
         jit_threshold: Option<u32>,
         /// Splice small static callees into their callers. On by default.
         inline: bool,
+        /// Substitute Rust natives for the methods that have one. On by default.
+        intrinsics: bool,
         /// Install only the bindings a small board can hold.
         minimal_bcl: bool,
         /// Which board `RustNet.Hal` talks to. `None` means no hardware, and
@@ -104,6 +106,7 @@ pub fn parse(argv: &[String]) -> Result<Command, ParseError> {
             let mut jit = true;
             let mut jit_threshold = None;
             let mut inline = true;
+            let mut intrinsics = true;
             let mut minimal_bcl = false;
             let mut board = None;
             let mut capture_display = None;
@@ -124,6 +127,7 @@ pub fn parse(argv: &[String]) -> Result<Command, ParseError> {
                     "--trace" => trace = true,
                     "--no-jit" => jit = false,
                     "--no-inline" => inline = false,
+                    "--no-intrinsics" => intrinsics = false,
                     "--bcl" => {
                         let v = rest.next().ok_or_else(|| {
                             ParseError("--bcl needs `full` or `minimal`".into())
@@ -186,6 +190,7 @@ pub fn parse(argv: &[String]) -> Result<Command, ParseError> {
                 jit,
                 jit_threshold,
                 inline,
+                intrinsics,
                 minimal_bcl,
                 board,
                 capture_display,
@@ -396,12 +401,13 @@ USAGE
 
 COMMANDS
     run <assembly> [--stats] [--trace] [--max-instructions N]
-                   [--no-jit] [--no-inline] [--bcl full|minimal]
+                   [--no-jit] [--no-inline] [--no-intrinsics] [--bcl full|minimal]
                    [--jit-threshold N] [--board NAME] [-- args...]
         Execute an assembly's entry point on RustCLR. Hot methods the code
         generator can take are compiled to machine code; --no-jit interprets
         everything and --no-inline compiles without splicing small callees.
-        All three must produce identical output. --bcl minimal installs only
+        --no-intrinsics runs the IL of every method a Rust native could
+        stand in for. All of them must produce identical output. --bcl minimal installs only
         the bindings a small board can hold, so a program can be checked
         against those limits before it is flashed. --board says which board
         `RustNet.Hal` reaches; `host` is the simulator, and without it a

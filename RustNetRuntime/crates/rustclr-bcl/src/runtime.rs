@@ -307,6 +307,162 @@ pub(crate) fn register_concurrency_exceptions(interp: &mut Interpreter) {
     ] {
         register_exception_ctors(interp, name);
     }
+    register_aggregate_exception(interp);
+}
+
+/// Slot of a framework exception built with `newobj` that holds an
+/// `AggregateException`'s list. Slot 0 is the message and slot 1 the inner
+/// exception — see `exception_with_inner`.
+const AGGREGATE_LIST: usize = 2;
+
+/// `AggregateException`: one exception standing for several.
+///
+/// Its constructors take the inner exceptions as one exception, an array, or
+/// any `IEnumerable<Exception>`, and all of them arrive here by arity, so the
+/// second argument is told apart by what it is. The message is .NET's: the
+/// given text followed by each inner message in parentheses.
+fn register_aggregate_exception(interp: &mut Interpreter) {
+    const DEFAULT: &str = "One or more errors occurred.";
+    interp.register_native("System.AggregateException::.ctor()", |i, a| {
+        let this = arg_handle(i, a, 0)?;
+        build_aggregate(i, this, DEFAULT.into(), Vec::new())?;
+        Ok(None)
+    });
+    interp.register_native("System.AggregateException::.ctor/1", |i, a| {
+        let this = arg_handle(i, a, 0)?;
+        let arg = arg(i, a, 1)?;
+        if is_string(i, &arg) {
+            let message = arg_string_or_empty(i, a, 1)?;
+            build_aggregate(i, this, message, Vec::new())?;
+        } else {
+            let inner = exceptions_in(i, &arg)?;
+            build_aggregate(i, this, DEFAULT.into(), inner)?;
+        }
+        Ok(None)
+    });
+    interp.register_native("System.AggregateException::.ctor/2", |i, a| {
+        let this = arg_handle(i, a, 0)?;
+        let message = arg_string_or_empty(i, a, 1)?;
+        let arg = arg(i, a, 2)?;
+        let inner = exceptions_in(i, &arg)?;
+        build_aggregate(i, this, message, inner)?;
+        Ok(None)
+    });
+    interp.register_native("System.AggregateException::get_InnerExceptions()", |i, a| {
+        let this = arg_handle(i, a, 0)?;
+        let inner = aggregate_inner(i, this);
+        Ok(Some(crate::collections::new_list(i, inner.into_iter().map(Value::Obj).collect())))
+    });
+    interp.register_native("System.AggregateException::Flatten()", |i, a| {
+        let this = arg_handle(i, a, 0)?;
+        let mut flat = Vec::new();
+        let mut pending = aggregate_inner(i, this);
+        pending.reverse();
+        while let Some(e) = pending.pop() {
+            if i.type_name_of(e) == "System.AggregateException" {
+                let mut nested = aggregate_inner(i, e);
+                nested.reverse();
+                pending.extend(nested);
+            } else {
+                flat.push(e);
+            }
+        }
+        let Some(type_id) = i.loader.registry.find_type_by_name("System.AggregateException") else {
+            return Err(rustclr_core::ExecutionError::MissingImplementation("AggregateException".into()));
+        };
+        let base = exception_message(i, this);
+        // The flattened exception keeps the original's own text, without the
+        // parenthesised inner messages it appended.
+        let own = base.split(" (").next().unwrap_or(&base).to_string();
+        let result = i.alloc_object(type_id);
+        build_aggregate(i, result, own, flat)?;
+        Ok(Some(Value::Obj(result)))
+    });
+}
+
+fn is_string(interp: &Interpreter, value: &Value) -> bool {
+    value.as_handle().is_some_and(|h| interp.heap.with::<rustclr_core::ClrString, _>(h, |_| ()).is_some())
+}
+
+/// The exceptions a constructor argument names: one exception, an array of
+/// them, or a list. Anything else is refused rather than guessed at.
+fn exceptions_in(interp: &mut Interpreter, value: &Value) -> rustclr_core::ExecResult<Vec<Handle>> {
+    let Some(handle) = value.as_handle().filter(|h| !h.is_null()) else {
+        return Err(rustclr_core::ExecutionError::exception(
+            rustclr_core::ClrExceptionKind::ArgumentNull,
+            "Value cannot be null. (Parameter 'innerExceptions')",
+        ));
+    };
+    if interp.heap.with::<ClrArray, _>(handle, |_| ()).is_some() {
+        return Ok(crate::collections::elements(interp, handle).iter().filter_map(|v| v.as_handle()).collect());
+    }
+    let type_name = interp.type_name_of(handle);
+    if type_name.starts_with("System.Collections.Generic.List`1") {
+        let items = crate::collections::list_items(interp, handle);
+        return Ok(crate::collections::elements(interp, items).iter().filter_map(|v| v.as_handle()).collect());
+    }
+    // Anything else that is an exception is the single-inner overload.
+    let is_exception = interp
+        .type_of(handle)
+        .is_some_and(|t| interp.loader.registry.base_chain(t).any(|b| b == interp.loader.core().exception));
+    if is_exception {
+        return Ok(alloc::vec![handle]);
+    }
+    Err(rustclr_core::ExecutionError::MissingImplementation(format!(
+        "AggregateException over a {type_name}: only an exception, an array or a List<Exception> is supported"
+    )))
+}
+
+/// Fills a freshly made `AggregateException`.
+fn build_aggregate(
+    interp: &mut Interpreter,
+    this: Handle,
+    message: String,
+    inner: Vec<Handle>,
+) -> rustclr_core::ExecResult<()> {
+    let mut text = message;
+    for e in &inner {
+        text.push_str(" (");
+        text.push_str(&exception_message(interp, *e));
+        text.push(')');
+    }
+    let first = inner.first().copied().unwrap_or(Handle::NULL);
+    let list = interp.alloc_value_array(0);
+    let values: Vec<Value> = inner.iter().map(|h| Value::Obj(*h)).collect();
+    crate::collections::with_values(interp, list, |v| *v = values);
+    let text = interp.alloc_string(&text);
+    let stored_on_exception = interp.heap.with_mut::<ClrException, _>(this, |_| ()).is_some();
+    if stored_on_exception {
+        return Err(rustclr_core::ExecutionError::MissingImplementation(
+            "AggregateException constructed over a runtime exception".into(),
+        ));
+    }
+    interp.heap.with_mut::<rustclr_core::ClrObject, _>(this, |o| {
+        if o.fields.len() <= AGGREGATE_LIST {
+            o.fields.resize(AGGREGATE_LIST + 1, Value::Null);
+        }
+        o.fields[0] = Value::Obj(text);
+        o.fields[1] = if first.is_null() { Value::Null } else { Value::Obj(first) };
+        o.fields[AGGREGATE_LIST] = Value::Obj(list);
+    });
+    Ok(())
+}
+
+/// An `AggregateException`'s inner exceptions, whichever way it was made.
+fn aggregate_inner(interp: &Interpreter, this: Handle) -> Vec<Handle> {
+    // Made by the runtime around one failure — `Task.Wait`, `.Result`.
+    if let Some(inner) = interp.heap.with::<ClrException, _>(this, |e| e.inner) {
+        return if inner.is_null() { Vec::new() } else { alloc::vec![inner] };
+    }
+    let list = interp
+        .heap
+        .with::<rustclr_core::ClrObject, _>(this, |o| o.fields.get(AGGREGATE_LIST).and_then(|v| v.as_handle()))
+        .flatten()
+        .unwrap_or(Handle::NULL);
+    if list.is_null() {
+        return Vec::new();
+    }
+    crate::collections::elements(interp, list).iter().filter_map(|v| v.as_handle()).collect()
 }
 
 fn register_exception_ctors(interp: &mut Interpreter, name: &str) {
@@ -445,6 +601,9 @@ fn register_gc(interp: &mut Interpreter) {
         Ok(Some(Value::I32(0)))
     });
     interp.register_native("System.GC::SuppressFinalize(object)", |_i, _a| Ok(None));
+    // Keeps its argument alive up to the call, which an argument on the
+    // evaluation stack already is. Nothing to do.
+    interp.register_native("System.GC::KeepAlive(object)", |_i, _a| Ok(None));
 
     // -- diagnostics ---------------------------------------------------------
     //

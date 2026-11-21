@@ -84,12 +84,18 @@ pub fn run(
     jit: bool,
     jit_threshold: Option<u32>,
     inline: bool,
+    intrinsics: bool,
     minimal_bcl: bool,
     board: Option<&str>,
     capture_display: Option<&str>,
     scheduler: rustclr_core::SchedulerKind,
 ) -> Result<i32> {
     let mut interp = runtime_with_bcl(args, minimal_bcl);
+    // Like `--no-jit`: intrinsics may change how fast a program runs, never
+    // what it prints, and turning them off is how that is checked.
+    if !intrinsics {
+        interp.intrinsics_enabled = false;
+    }
     // Read when the pool first starts, which is the first `Task.Run`.
     interp.scheduler = scheduler;
     if let Some(name) = board {
@@ -203,6 +209,8 @@ fn print_stats(interp: &Interpreter, elapsed: std::time::Duration) {
     if let Some(tier) = interp.native_tier.as_ref() {
         let (methods, bytes) = tier.stats();
         eprintln!("  compiled calls      {:>14}", s.native_tier_calls);
+        eprintln!("  intrinsic calls     {:>14}", s.intrinsic_calls);
+        eprintln!("  intrinsics declined {:>14}", s.intrinsics_declined);
         eprintln!("  methods compiled    {:>14}", methods);
         eprintln!("  code emitted        {:>14} bytes", bytes);
     }
@@ -629,7 +637,7 @@ pub fn build(project: &str, configuration: &str, then_run: bool) -> Result<i32> 
         .ok_or("build succeeded but no output assembly was found under bin/")?;
 
     println!("Running {} on RustCLR…\n", assembly.display());
-    run(&assembly.to_string_lossy(), Vec::new(), false, false, None, true, None, true, false, None, None, rustclr_core::SchedulerKind::default())
+    run(&assembly.to_string_lossy(), Vec::new(), false, false, None, true, None, true, true, false, None, None, rustclr_core::SchedulerKind::default())
 }
 
 /// Finds the first `.dll` under a build output directory.
@@ -1137,6 +1145,23 @@ Collections and LINQ");
     println!("                               anything but byte buffers, and Span<T> over");
     println!("                               stackalloc - its element width lives in T.");
 
+    println!("  RustNet.Concurrency          yes - ConcurrencyScope, Actor<T> with");
+    println!("                               supervision, Select and Pipeline, in plain");
+    println!("                               C# that also runs on dotnet unchanged.");
+    println!("  intrinsics                   yes - a Rust native may stand in for a");
+    println!("                               method that HAS an IL body; it declines any");
+    println!("                               shape it was not written for and the IL");
+    println!("                               runs. Today: a channel's ring (PopFront,");
+    println!("                               PushBack). --no-intrinsics turns them off,");
+    println!("                               and a test checks each against its IL.");
+    println!("  NuGet package assemblies     yes - read from <app>.deps.json, so");
+    println!("                               Microsoft.Extensions.* and System.* PACKAGES");
+    println!("                               load; the runtime pack never does.");
+    println!("  Akka.NET, Orleans            NO - both load and start, then stop at");
+    println!("                               framework surface RustBCL does not have:");
+    println!("                               Akka at System.Collections.Immutable,");
+    println!("                               Orleans at DiagnosticListener and then the");
+    println!("                               DI container. See docs/limitations.md.");
     println!("\nCompile-time features");
     println!("  source generators            yes - the runtime only ever sees the IL");
     println!("  interceptors                 yes - same reason");

@@ -22,13 +22,19 @@
 //! deque would save little of that and is the kind of code whose bugs are a
 //! job run twice. Measured first, as `Plan.md` asks of 8.4, before anything
 //! cleverer.
+//!
+//! The shared queues — [`GlobalFifo`]'s, and [`WorkStealing`]'s injector —
+//! are the same shape, and used to be the crate's [`crate::LockFreeQueue`].
+//! That queue frees a node only at a quiescent point, and a pool is never
+//! quiescent: every job left one node behind for the life of the process —
+//! native memory a long-running server, an actor system, would grow without
+//! bound.
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use rustclr_thread::sync::Mutex;
 
-use crate::LockFreeQueue;
 
 /// A place queued work waits.
 ///
@@ -88,13 +94,13 @@ impl SchedulerKind {
 
 /// One queue for everyone: the pool as it was before work stealing.
 pub struct GlobalFifo<J> {
-    queue: LockFreeQueue<J>,
+    queue: Mutex<VecDeque<J>>,
     len: AtomicUsize,
 }
 
 impl<J> GlobalFifo<J> {
     pub fn new() -> Self {
-        Self { queue: LockFreeQueue::new(), len: AtomicUsize::new(0) }
+        Self { queue: Mutex::new(VecDeque::new()), len: AtomicUsize::new(0) }
     }
 }
 
@@ -106,12 +112,12 @@ impl<J> Default for GlobalFifo<J> {
 
 impl<J: Send> RunQueue<J> for GlobalFifo<J> {
     fn push(&self, job: J, _worker: Option<usize>) {
-        self.queue.push(job);
+        self.queue.lock().expect("a run queue is poisoned").push_back(job);
         self.len.fetch_add(1, Ordering::SeqCst);
     }
 
     fn pop(&self, _worker: Option<usize>) -> Option<J> {
-        let job = self.queue.pop()?;
+        let job = self.queue.lock().expect("a run queue is poisoned").pop_front()?;
         self.len.fetch_sub(1, Ordering::SeqCst);
         Some(job)
     }
@@ -129,7 +135,7 @@ impl<J: Send> RunQueue<J> for GlobalFifo<J> {
 /// them.
 pub struct WorkStealing<J> {
     /// Work from threads that are not pool workers.
-    injector: LockFreeQueue<J>,
+    injector: Mutex<VecDeque<J>>,
     /// One per worker slot, allocated up front so a pool that grows never has
     /// to move them.
     locals: Vec<Mutex<VecDeque<J>>>,
@@ -142,7 +148,7 @@ impl<J> WorkStealing<J> {
         for _ in 0..slots.max(1) {
             locals.push(Mutex::new(VecDeque::new()));
         }
-        Self { injector: LockFreeQueue::new(), locals, len: AtomicUsize::new(0) }
+        Self { injector: Mutex::new(VecDeque::new()), locals, len: AtomicUsize::new(0) }
     }
 
     fn local(&self, worker: Option<usize>) -> Option<&Mutex<VecDeque<J>>> {
@@ -174,7 +180,7 @@ impl<J: Send> RunQueue<J> for WorkStealing<J> {
     fn push(&self, job: J, worker: Option<usize>) {
         match self.local(worker) {
             Some(local) => local.lock().expect("a run queue is poisoned").push_back(job),
-            None => self.injector.push(job),
+            None => self.injector.lock().expect("a run queue is poisoned").push_back(job),
         }
         self.len.fetch_add(1, Ordering::SeqCst);
     }
@@ -186,7 +192,7 @@ impl<J: Send> RunQueue<J> for WorkStealing<J> {
         let job = self
             .local(worker)
             .and_then(|local| local.lock().expect("a run queue is poisoned").pop_back())
-            .or_else(|| self.injector.pop())
+            .or_else(|| self.injector.lock().expect("a run queue is poisoned").pop_front())
             .or_else(|| self.steal(worker))
             // A pass of `try_lock` can miss a job whose owner held its queue
             // for that instant. The count says one is there, so look once

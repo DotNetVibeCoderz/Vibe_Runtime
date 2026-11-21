@@ -477,6 +477,7 @@ fn a_compiled_loop_survives_collection() {
     // about safe points.
     interp.heap.set_collector(Box::new(rustclr_core::gc::MarkSweep {
         allocation_trigger: 16 * 1024,
+        base_trigger: 16 * 1024,
         minimum_heap: 4 * 1024,
         growth_factor: 1.0,
     }));
@@ -676,6 +677,7 @@ fn a_compiled_loop_does_not_grow_with_its_trip_count() {
         rustclr_bcl::install(&mut interp);
         interp.heap.set_collector(Box::new(rustclr_core::gc::MarkSweep {
             allocation_trigger: 64 * 1024,
+            base_trigger: 64 * 1024,
             minimum_heap: 16 * 1024,
             growth_factor: 1.0,
         }));

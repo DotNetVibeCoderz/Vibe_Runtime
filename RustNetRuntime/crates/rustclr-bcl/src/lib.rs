@@ -127,6 +127,7 @@ pub mod security;
 pub mod storage;
 pub mod console;
 pub mod interpolation;
+pub mod intrinsics;
 pub mod linq;
 pub mod marshal;
 pub mod numerics;
@@ -178,6 +179,7 @@ pub fn install(interp: &mut Interpreter) {
     cancellation::register(interp);
     // After extras: its `Math.Round/2` and friends dispatch decimal and double.
     decimal::register(interp);
+    intrinsics::register(interp);
     #[cfg(feature = "std")]
     net::register(interp);
     // On a board there are no sockets, but there may well be a radio, and

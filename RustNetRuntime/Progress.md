@@ -19,6 +19,65 @@ PrimeSieve     IDENTICAL   (written by Jack from a prompt)
 SensorGateway  IDENTICAL   (edited by Jack from a prompt)
 ```
 
+## 2026-11-21 — Milestones 8.3 to 8.6
+
+- **8.3, `managed/RustNet.Concurrency`.** Structured scopes, actors with
+  supervision, `Select` and pipelines, in plain C#. `tests/fixtures/Concurrency`
+  (39 checks) is identical on `dotnet` and RustCLR, under both schedulers and
+  with intrinsics on or off. What the library needed from the runtime, each
+  with a Conformance check:
+  - `AggregateException` built from a list, `InnerExceptions` and `Flatten`;
+  - an own exception subclass keeping its inner exception (it had been
+    stored in the subclass's first field);
+  - `TaskStatus` printing its name;
+  - `Task.Delay(int, CancellationToken)`, whose key named a type from
+    another assembly and so never matched;
+  - `List<T>.ToArray()` inside a generic class;
+  - `Task.FromException`.
+- **`Task.Run(async …)` no longer holds a worker for its inner task.** The
+  outer task used to be settled by a pool job that *waited*. Three hundred
+  long-lived actor loops left nothing to run anything else, and the fixture
+  hung about one run in six. `ENTRY_UNWRAP` now forwards the inner task's
+  outcome as a continuation.
+- **A failure in a pool job no longer vanishes.** An unresolvable token inside
+  a continuation used to leave a task forever pending, and a program could
+  exit 0 halfway through. The pool keeps the first such failure, and
+  `settle` and `run_entry_point` both return it.
+- **8.4's measurements found four bugs before any native was written.**
+  - **The cause of the slowdown:** a void `ValueTask.GetResult()` answered a
+    value. The producer's evaluation stack grew by one per item and every root
+    scan walked it, so `channel` slowed as it ran. The interpreter now drops
+    a void method's value; constructors are excepted, because a native ctor
+    answers the object `newobj` pushes (the first version broke `new string`
+    in a GC test, which caught it).
+  - **The collector's trigger compounded:** it was multiplied by 1.5 after
+    every collection whatever survived. It is now bounded by 64× the live
+    set, and taking the growth away entirely cost `fanout` 40%.
+  - **The run queues' lock-free queue never freed a node** while running; it
+    is a `Mutex<VecDeque>` now.
+  - **A lost race in `await`** (the task finishing between `IsCompleted` and
+    registration) resumed nested, and enough of them overflowed a stack. It
+    queues now, as .NET does.
+- **8.4, intrinsics.** `register_intrinsic` substitutes a native for a method
+  that has an IL body. It may decline, and the IL runs. Two are in: a channel
+  ring's `PopFront` and `PushBack`, for `channel` −20%, `actors` −14% and
+  `pingpong` −5%. `tests/intrinsics.rs` runs a workload with them on and off,
+  and a canary wrong for one item proves it catches a disagreement.
+  `--no-intrinsics` is the switch.
+- **8.5 measured and declined.** A million waiting tasks cost 232 bytes each
+  (.NET: 112). Their 13 µs is the interpreter running state machines, not the
+  task's representation; the `waiting` row is in `docs/benchmarks.md`.
+- **8.6 not done.** Akka.NET and Orleans are in `tests/fixtures`, unmodified.
+  The loader now reads `.deps.json`, so package assemblies named
+  `Microsoft.*`/`System.*` load; it used to skip them by name, which skipped
+  `Microsoft.Extensions.Hosting` itself. The argument guards
+  (`ThrowIfNull` and friends) are in.
+  - Akka stops at `System.Collections.Immutable`.
+  - Orleans stops at `HostBuilder.Build`, with the DI container behind it.
+  - `docs/limitations.md` has the inventory.
+- Conformance **575**, identical to `dotnet` with and without intrinsics, JIT,
+  fifo scheduling and GC stress.
+
 ## 2026-11-21 — The three gaps 8.2 found, closed
 
 - **The heap is sharded.** With threads, `SharedHeap` is sixteen

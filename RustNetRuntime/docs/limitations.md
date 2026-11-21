@@ -1568,6 +1568,61 @@ the project — the template says so.
 
 ---
 
+## Real-world libraries: Akka.NET and Orleans (Milestone 8.6)
+
+Neither runs yet. Both are in `tests/fixtures/Akka` and
+`tests/fixtures/Orleans`, unmodified, with output that `dotnet` prints
+deterministically — so the day either runs, the check is a diff.
+
+What the attempt fixed on the way, each with a Conformance check:
+
+- **NuGet package assemblies load.** The loader used to skip any reference
+  named `System*` or `Microsoft.*`, to keep a self-contained publish from
+  supplying a second `System.Object`. That also skipped
+  `Microsoft.Extensions.Hosting`, `Microsoft.Extensions.ObjectPool` and
+  `System.Configuration.ConfigurationManager` — packages, copied into `bin/`,
+  that RustBCL does not and should not provide. The program's `.deps.json`
+  now says which assemblies came from a package; those load, and a
+  `runtimepack.*` file never does. With no `.deps.json`, the name rule stands.
+- **`ArgumentNullException.ThrowIfNull`, `ArgumentException.ThrowIfNullOrEmpty`
+  and `ThrowIfNullOrWhiteSpace`**, which library code calls on every argument.
+
+Where each stops, and what stands behind that:
+
+| | stops at | what is missing behind it |
+| --- | --- | --- |
+| Akka.NET 1.5.75 | `ActorSystemSetup..cctor`: `ImmutableDictionary<Type, Setup>.Empty` | `rustnet verify Akka.dll` names **291** unresolved references across about 110 types: `System.Collections.Immutable` (dictionary, list, hash set, array and their builders), `System.Linq.Expressions` (`Props.Create(() => new Actor())` takes an expression tree and reads its constructor), `LinkedList<T>`, `SortedSet<T>`, `SortedDictionary<,>`, `ConditionalWeakTable<,>`, `TaskScheduler`, `Threading.Timer`, `ArrayPool<T>`, sockets, X.509, `TextReader`/`Stream`. |
+| Orleans 9 (in-process silo) | `HostBuilder.Build`: `new DiagnosticListener(...)` | `UseOrleans` and `ConfigureLogging` now run. Behind `Build` is the `Microsoft.Extensions.DependencyInjection` container — constructor discovery by reflection over open generics — then Options, Configuration (environment, command line, JSON), and a console logger, which needs `Console.Out` as a `TextWriter`. `verify` names 308 unresolved references in `Orleans.Core` and 200 in `Orleans.Runtime`. |
+
+The 109 "IL verification failed" lines `verify` prints for Akka's
+dependencies are consequences, not separate problems: each is a branch
+merging two stack depths because a call in between names a member that did
+not resolve — `_reader?.Dispose()` over a `TextReader` that does not exist —
+so its stack effect is unknown.
+
+Running either is the surface above, built out; it is not a runtime feature
+that is missing. `System.Collections.Immutable` alone is a library the size
+of several RustBCL assemblies.
+
+## `Console.Error` and `Console.Out`
+
+There is no `TextWriter` in RustBCL. `Console.WriteLine` and `Console.Write`
+are bound directly; `Console.Out` and `Console.Error` as objects are not, so
+a program that writes to `Console.Error` — or hands `Console.Out` to
+something — is not served. Library loggers reach for exactly that, which is
+one of the things behind Orleans' console logger above.
+
+## Intrinsics
+
+A Rust native may stand in for a method that has an IL body
+(`crates/rustclr-bcl/src/intrinsics.rs`). Only two do — a channel ring's
+`PopFront` and `PushBack` — because only they measured as paying
+(`docs/benchmarks.md`). Each declines any shape it was not written for (a
+ring that must grow, a ring of structs) and the IL runs. They are skipped by
+the profiler and the debugger, which see the call as a native one, and
+`rustnet run --no-intrinsics` (or `RUSTCLR_INTRINSICS=0`) runs the IL instead.
+Compiled code that calls such a method runs its IL, which agrees by test.
+
 ## How to find out for yourself
 
 ```bash

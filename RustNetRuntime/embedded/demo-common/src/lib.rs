@@ -88,10 +88,13 @@ pub const FULL_BCL_BYTES: usize = 640_000;
 /// bindings live in the full tier, which is the one that throws them; they
 /// had cost the console subset another 790 bytes. Raised to 289,400 (measured
 /// 289,354) when `Stopwatch` gained `Elapsed`, `ElapsedTicks`, `GetTimestamp`
-/// and `GetElapsedTime`, which every tier registers with the rest of it. The
-/// host heap's shards are not in that figure: a board has no threads, and the
-/// test measures with the one-shard heap a board has.
-pub const MINIMAL_BCL_BYTES: usize = 289_400;
+/// and `GetElapsedTime`, which every tier registers with the rest of it.
+/// Raised to 289,700 (measured 289,643) when the interpreter gained its
+/// intrinsic table and field-slot cache: empty, they allocate nothing, but
+/// the interpreter itself is larger by their headers. The host heap's shards
+/// are not in that figure: a board has no threads, and the test measures with
+/// the one-shard heap a board has.
+pub const MINIMAL_BCL_BYTES: usize = 289_700;
 
 /// What a board's memory budget allows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

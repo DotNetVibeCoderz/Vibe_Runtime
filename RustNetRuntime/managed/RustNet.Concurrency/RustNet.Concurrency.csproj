@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Plain C# over the official concurrency surface — Task, CancellationToken,
+    System.Threading.Channels — and nothing else. It references no RustNet
+    assembly and calls no InternalCall, so the same DLL runs on `dotnet` and on
+    RustCLR, and a program written against it is portable by construction.
+  -->
+  <PropertyGroup>
+    <Description>Structured concurrency, actors, channel select and pipelines</Description>
+    <Nullable>disable</Nullable>
+  </PropertyGroup>
+
+</Project>

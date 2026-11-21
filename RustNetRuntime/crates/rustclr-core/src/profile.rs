@@ -208,19 +208,13 @@ impl Profiler {
     /// Records an allocation of `bytes` for an instance of `type_id`.
     #[inline]
     pub fn allocated(&mut self, type_id: TypeId, bytes: usize) {
-        if let Some(entry) = self.types.get_mut(type_id.0 as usize) {
-            entry.count += 1;
-            entry.bytes += bytes as u64;
-        }
+        charge(&mut self.types, type_id, bytes);
     }
 
     /// Records an array allocation, charged to its element type.
     #[inline]
     pub fn allocated_array(&mut self, element: TypeId, bytes: usize) {
-        if let Some(entry) = self.arrays.get_mut(element.0 as usize) {
-            entry.count += 1;
-            entry.bytes += bytes as u64;
-        }
+        charge(&mut self.arrays, element, bytes);
     }
 
     /// Records a collection that took `nanos`.
@@ -314,6 +308,24 @@ pub struct MethodRow {
 pub struct TypeRow {
     pub name: String,
     pub profile: AllocProfile,
+}
+
+/// Adds one allocation to `type_id`'s row, growing the table for a type
+/// registered after profiling began.
+///
+/// The tables are sized to the registry when the profiler starts, but a
+/// generic instantiation — `SnapshotList<int>`, a closure class inside a
+/// generic method — is registered when it is first reached. Those used to be
+/// dropped without a word, and the run's allocation total came up short.
+#[inline]
+fn charge(table: &mut Vec<AllocProfile>, type_id: TypeId, bytes: usize) {
+    let index = type_id.0 as usize;
+    if index >= table.len() {
+        table.resize(index + 1, AllocProfile::default());
+    }
+    let entry = &mut table[index];
+    entry.count += 1;
+    entry.bytes += bytes as u64;
 }
 
 /// Everything one run measured.

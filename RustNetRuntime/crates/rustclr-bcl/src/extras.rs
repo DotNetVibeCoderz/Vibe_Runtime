@@ -39,6 +39,7 @@ use crate::prelude::*;
 
 pub fn register(interp: &mut Interpreter) {
     register_collection_interfaces(interp);
+    register_argument_guards(interp);
     // The types these bindings belong to; registered here, not in the
     // loader, so the minimal tier a small board runs does not pay for them.
     interp.loader.register_business_types();
@@ -2110,6 +2111,10 @@ fn native_enum_names(type_name: &str) -> Option<&'static [&'static str]> {
         ],
         "System.MidpointRounding" => &["ToEven", "AwayFromZero", "ToZero", "ToNegativeInfinity", "ToPositiveInfinity"],
         "System.DateTimeKind" => &["Unspecified", "Utc", "Local"],
+        "System.Threading.Tasks.TaskStatus" => &[
+            "Created", "WaitingForActivation", "WaitingToRun", "Running",
+            "WaitingForChildrenToComplete", "RanToCompletion", "Canceled", "Faulted",
+        ],
         _ => return None,
     })
 }
@@ -3478,11 +3483,7 @@ fn register_misc(interp: &mut Interpreter) {
     interp.register_native("System.Collections.Generic.KeyNotFoundException::.ctor/2", exception_with_inner);
     interp.register_native("System.Exception::get_InnerException()", |i, a| {
         let h = arg_handle(i, a, 0)?;
-        let mut inner = i.heap.with::<ClrException, _>(h, |e| e.inner).unwrap_or(Handle::NULL);
-        let framework = i.type_of(h).map(|t| i.loader.registry.ty(t).assembly == i.loader.bcl_assembly()).unwrap_or(false);
-        if inner.is_null() && framework {
-            inner = i.heap.with::<ClrObject, _>(h, |o| o.fields.get(1).and_then(|v| v.as_handle())).flatten().unwrap_or(Handle::NULL);
-        }
+        let inner = inner_exception(i, h);
         Ok(Some(if inner.is_null() { Value::Null } else { Value::Obj(inner) }))
     });
     interp.register_native("System.Exception::GetType()", |i, a| {
@@ -3493,7 +3494,7 @@ fn register_misc(interp: &mut Interpreter) {
     interp.register_native("System.Exception::GetBaseException()", |i, a| {
         let mut h = arg_handle(i, a, 0)?;
         loop {
-            let inner = i.heap.with::<ClrException, _>(h, |e| e.inner).unwrap_or(Handle::NULL);
+            let inner = inner_exception(i, h);
             if inner.is_null() {
                 return Ok(Some(Value::Obj(h)));
             }
@@ -4151,6 +4152,19 @@ fn same_assembly(i: &Interpreter, x: &Value, y: &Value) -> bool {
     id(x) == id(y)
 }
 
+/// An exception's inner exception, whichever shape it has: a runtime-raised
+/// `ClrException`, or an object `newobj` built, where slot 1 is
+/// `Exception._innerException` — declared, so the same slot in every subclass.
+fn inner_exception(i: &Interpreter, h: Handle) -> Handle {
+    if let Some(inner) = i.heap.with::<ClrException, _>(h, |e| e.inner) {
+        return inner;
+    }
+    i.heap
+        .with::<ClrObject, _>(h, |o| o.fields.get(1).and_then(|v| v.as_handle()))
+        .flatten()
+        .unwrap_or(Handle::NULL)
+}
+
 fn exception_with_inner(i: &mut Interpreter, a: &[Value]) -> ExecResult<Option<Value>> {
     let this = arg_handle(i, a, 0)?;
     let message = arg_string_or_empty(i, a, 1)?;
@@ -4163,22 +4177,14 @@ fn exception_with_inner(i: &mut Interpreter, a: &[Value]) -> ExecResult<Option<V
     if stored.is_none() {
         let text = message.unwrap_or_default();
         let h = i.alloc_string(&text);
-        // A framework exception allocated as a plain object has no fields of
-        // its own, so slot 1 is free for the inner exception. A user type's
-        // slots are its own fields and are left alone.
-        let framework = i.type_of(this).map(|t| i.loader.registry.ty(t).assembly == i.loader.bcl_assembly()).unwrap_or(false);
+        // Slots 0 and 1 are `Exception`'s own `_message` and
+        // `_innerException`, so a subclass's fields start after them.
         i.heap.with_mut::<ClrObject, _>(this, |o| {
-            if o.fields.is_empty() {
-                o.fields.push(Value::Obj(h));
-            } else {
-                o.fields[0] = Value::Obj(h);
+            if o.fields.len() < 2 {
+                o.fields.resize(2, Value::Null);
             }
-            if framework {
-                if o.fields.len() < 2 {
-                    o.fields.resize(2, Value::Null);
-                }
-                o.fields[1] = Value::Obj(inner);
-            }
+            o.fields[0] = Value::Obj(h);
+            o.fields[1] = if inner.is_null() { Value::Null } else { Value::Obj(inner) };
         });
     }
     Ok(None)
@@ -4394,4 +4400,44 @@ pub(crate) fn register_surrogates(interp: &mut Interpreter) {
         let (hi, lo) = (arg_i32(i, a, 0)? as u32, arg_i32(i, a, 1)? as u32);
         Ok(Some(Value::I32(((0xD800..0xDC00).contains(&hi) && (0xDC00..0xE000).contains(&lo)) as i32)))
     });
+}
+
+/// The `ThrowIf…` guards .NET 6 onward put on the exception types themselves —
+/// what library code (`Microsoft.Extensions.*`, Orleans) checks every
+/// argument with. The parameter name arrives through
+/// `[CallerArgumentExpression]`, so it is already a string here.
+fn register_argument_guards(interp: &mut Interpreter) {
+    fn null_message(name: &str) -> String {
+        format!("Value cannot be null. (Parameter '{name}')")
+    }
+    interp.register_native("System.ArgumentNullException::ThrowIfNull(object,string)", |i, a| {
+        if arg(i, a, 0)?.as_handle().is_none_or(|h| h.is_null()) {
+            let name = arg_string_or_empty(i, a, 1)?;
+            return Err(ExecutionError::exception(ClrExceptionKind::ArgumentNull, null_message(&name)));
+        }
+        Ok(None)
+    });
+    fn guard_string(i: &mut Interpreter, a: &[Value], whitespace: bool) -> ExecResult<Option<Value>> {
+        let name = arg_string_or_empty(i, a, 1)?;
+        let value = arg(i, a, 0)?;
+        if value.as_handle().is_none_or(|h| h.is_null()) {
+            return Err(ExecutionError::exception(ClrExceptionKind::ArgumentNull, null_message(&name)));
+        }
+        let text = arg_string_or_empty(i, a, 0)?;
+        if text.is_empty() {
+            return Err(ExecutionError::exception(
+                ClrExceptionKind::Argument,
+                format!("The value cannot be an empty string. (Parameter '{name}')"),
+            ));
+        }
+        if whitespace && text.chars().all(char::is_whitespace) {
+            return Err(ExecutionError::exception(
+                ClrExceptionKind::Argument,
+                format!("The value cannot be an empty string or composed entirely of whitespace. (Parameter '{name}')"),
+            ));
+        }
+        Ok(None)
+    }
+    interp.register_native("System.ArgumentException::ThrowIfNullOrEmpty(string,string)", |i, a| guard_string(i, a, false));
+    interp.register_native("System.ArgumentException::ThrowIfNullOrWhiteSpace(string,string)", |i, a| guard_string(i, a, true));
 }

@@ -1529,6 +1529,7 @@ static partial class Program
         TextChecks();
         CancellationChecks();
         ConcurrencyApiChecks();
+        StructuredConcurrencyChecks();
         DateChecks();
         SortChecks();
         HexChecks();

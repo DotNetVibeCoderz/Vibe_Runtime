@@ -191,6 +191,12 @@ pub struct Loader {
     pub registry: TypeRegistry,
     assemblies: Vec<LoadedAssembly>,
     by_name: HashMap<String, AssemblyId>,
+    /// Assemblies a program's `.deps.json` says came from a *package*, not
+    /// the framework: `Microsoft.Extensions.Hosting`,
+    /// `System.Configuration.ConfigurationManager`. See
+    /// [`Self::load_references_beside`].
+    #[cfg(feature = "std")]
+    package_assemblies: alloc::collections::BTreeSet<String>,
     #[cfg(feature = "std")]
     search_paths: Vec<PathBuf>,
     /// Portable PDBs, per assembly. Only ever loaded when asked for: a program
@@ -312,6 +318,8 @@ impl Loader {
             registry: TypeRegistry::new(),
             assemblies: Vec::new(),
             by_name: HashMap::new(),
+            #[cfg(feature = "std")]
+            package_assemblies: alloc::collections::BTreeSet::new(),
             #[cfg(feature = "std")]
             search_paths: Vec::new(),
             primitives: HashMap::new(),
@@ -577,6 +585,10 @@ impl Loader {
         // its fields out after it. Without the slot, the message and the
         // subclass's first field shared slot 0, and `e.Message` read back
         // whatever the constructor assigned last — an int, an empty string.
+        // The inner exception is a slot for the same reason: kept past the
+        // declared fields, it landed on a subclass's first field, so
+        // `base(message, inner)` in a program's own exception lost `inner`
+        // the moment its constructor assigned that field.
         let bcl = self.bcl;
         let exception = self.add_native_type_with_fields_of_kind(
             "System",
@@ -584,7 +596,7 @@ impl Loader {
             TypeKind::Class,
             Some(object),
             synth(),
-            &["_message"],
+            &["_message", "_innerException"],
             bcl,
         );
         let type_handle = self.add_native_type(
@@ -910,6 +922,23 @@ impl Loader {
                 bcl,
             );
             self.registry.ty_mut(id).generic_param_count = arity;
+        }
+
+        // `ReadOnlyCollection<T>` is a `List<T>` here, which is what
+        // `List.AsReadOnly()` and `AggregateException.InnerExceptions` hand
+        // back. Declaring it a subclass lets a member reference on it — `Count`,
+        // the indexer, `GetEnumerator` — resolve to the list's own natives. No
+        // mutator is reachable through it: C# only lets a program call what
+        // `ReadOnlyCollection` declares.
+        if let Some(list) = self.registry.find_type_by_name("System.Collections.Generic.List`1") {
+            let id = self.add_native_type(
+                "System.Collections.ObjectModel",
+                "ReadOnlyCollection`1",
+                TypeKind::Class,
+                Some(list),
+                synth(),
+            );
+            self.registry.ty_mut(id).generic_param_count = 1;
         }
 
         // `Dictionary<K,V>.Keys` and `.Values` are views, not copies: each
@@ -1570,7 +1599,14 @@ impl Loader {
     /// # What is probed, and what is not
     ///
     /// Only `<dir>/<name>.dll`, and only for references that are not part of
-    /// the framework. That is not a heuristic about what a file contains: the
+    /// the framework. Which those are is read from the program's
+    /// `<name>.deps.json` when it has one: an assembly the SDK copied in from a
+    /// NuGet package is the program's library whatever its name, so
+    /// `Microsoft.Extensions.Hosting.dll` and
+    /// `System.Configuration.ConfigurationManager.dll` load, while a
+    /// self-contained publish's `runtimepack` files do not. Without a
+    /// `.deps.json`, a name under `System` or `Microsoft.` is taken to be the
+    /// framework. That is not a heuristic about what a file contains: the
     /// framework's own types are supplied natively by RustBCL, and loading
     /// `System.Runtime.dll` from a self-contained publish would give the
     /// program a second, conflicting `System.Object`. A reference with no file
@@ -1584,13 +1620,19 @@ impl Loader {
     #[cfg(feature = "std")]
     fn load_references_beside(&mut self, image: &Image, path: &Path) -> ExecResult<()> {
         let Some(directory) = path.parent() else { return Ok(()) };
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            if let Ok(text) = std::fs::read_to_string(directory.join(format!("{stem}.deps.json"))) {
+                self.package_assemblies.extend(package_assemblies_in(&text));
+            }
+        }
         let md = image.metadata();
         let names: Vec<String> = (1..=md.row_count(TableId::AssemblyRef))
             .filter_map(|r| md.assembly_ref(r).ok().map(|a| a.name.to_string()))
             .collect();
 
         for name in names {
-            if is_framework_assembly(&name) || self.by_name.contains_key(&name) {
+            let framework = is_framework_assembly(&name) && !self.package_assemblies.contains(&name);
+            if framework || self.by_name.contains_key(&name) {
                 continue;
             }
             let candidate = directory.join(format!("{name}.dll"));
@@ -2790,6 +2832,9 @@ impl Loader {
             ("System", "DateTimeKind"),
             ("System.Globalization", "NumberStyles"),
             ("System.Globalization", "DateTimeStyles"),
+            // `task.Status`, which a program prints or compares. The numbers
+            // are the ones RustBCL's task status field already uses.
+            ("System.Threading.Tasks", "TaskStatus"),
         ] {
             let id = self.add_native_type(ns, name, TypeKind::Enum, Some(enum_type), synth());
             self.registry.ty_mut(id).underlying = Some(Primitive::Int32);
@@ -3806,6 +3851,138 @@ fn is_framework_assembly(name: &str) -> bool {
         || name.starts_with("Microsoft.")
 }
 
+/// The assemblies a `.deps.json` lists as coming from a package or project —
+/// every `targets.<framework>.<library>.runtime` file — except a
+/// `runtimepack.*` library, which *is* the framework, published beside a
+/// self-contained program.
+///
+/// The format is JSON; this reads exactly that shape and nothing else, and
+/// anything it cannot follow yields an empty list, which leaves the
+/// name-based rule in force.
+#[cfg(feature = "std")]
+fn package_assemblies_in(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut parser = DepsJson { bytes: text.as_bytes(), at: 0, path: Vec::new(), out: &mut out };
+    if parser.value().is_none() {
+        return Vec::new();
+    }
+    out
+}
+
+#[cfg(feature = "std")]
+struct DepsJson<'a, 'o> {
+    bytes: &'a [u8],
+    at: usize,
+    path: Vec<String>,
+    out: &'o mut Vec<String>,
+}
+
+#[cfg(feature = "std")]
+impl DepsJson<'_, '_> {
+    fn skip_space(&mut self) {
+        while self.at < self.bytes.len() && self.bytes[self.at].is_ascii_whitespace() {
+            self.at += 1;
+        }
+    }
+
+    fn string(&mut self) -> Option<String> {
+        self.skip_space();
+        if self.bytes.get(self.at) != Some(&b'"') {
+            return None;
+        }
+        self.at += 1;
+        let mut out = Vec::new();
+        loop {
+            match *self.bytes.get(self.at)? {
+                b'"' => {
+                    self.at += 1;
+                    return String::from_utf8(out).ok();
+                }
+                b'\\' => {
+                    // No name or path this reads needs an escape decoded;
+                    // the escaped byte is kept so the string ends where it should.
+                    out.push(*self.bytes.get(self.at + 1)?);
+                    self.at += 2;
+                }
+                b => {
+                    out.push(b);
+                    self.at += 1;
+                }
+            }
+        }
+    }
+
+    fn value(&mut self) -> Option<()> {
+        self.skip_space();
+        match *self.bytes.get(self.at)? {
+            b'{' => {
+                self.at += 1;
+                loop {
+                    self.skip_space();
+                    if self.bytes.get(self.at) == Some(&b'}') {
+                        self.at += 1;
+                        return Some(());
+                    }
+                    let key = self.string()?;
+                    self.skip_space();
+                    if self.bytes.get(self.at) != Some(&b':') {
+                        return None;
+                    }
+                    self.at += 1;
+                    self.record(&key);
+                    self.path.push(key);
+                    self.value()?;
+                    self.path.pop();
+                    self.skip_space();
+                    match self.bytes.get(self.at) {
+                        Some(b',') => self.at += 1,
+                        Some(b'}') => {}
+                        _ => return None,
+                    }
+                }
+            }
+            b'[' => {
+                self.at += 1;
+                loop {
+                    self.skip_space();
+                    if self.bytes.get(self.at) == Some(&b']') {
+                        self.at += 1;
+                        return Some(());
+                    }
+                    self.value()?;
+                    self.skip_space();
+                    match self.bytes.get(self.at) {
+                        Some(b',') => self.at += 1,
+                        Some(b']') => {}
+                        _ => return None,
+                    }
+                }
+            }
+            b'"' => self.string().map(|_| ()),
+            _ => {
+                // A number, `true`, `false` or `null`.
+                let start = self.at;
+                while self.at < self.bytes.len() && !matches!(self.bytes[self.at], b',' | b'}' | b']') {
+                    self.at += 1;
+                }
+                (self.at > start).then_some(())
+            }
+        }
+    }
+
+    /// `key` is about to be entered at `self.path`.
+    fn record(&mut self, key: &str) {
+        let [targets, _framework, library, runtime] = self.path.as_slice() else { return };
+        if targets != "targets" || runtime != "runtime" || library.starts_with("runtimepack.") {
+            return;
+        }
+        let file = key.rsplit('/').next().unwrap_or(key);
+        if let Some(stem) = file.strip_suffix(".dll") {
+            self.out.push(stem.to_string());
+        }
+    }
+}
+
 /// The full name of the type a custom attribute's constructor belongs to.
 fn attribute_type_name(md: &rustclr_metadata::Metadata<'_>, constructor: Token) -> Option<String> {
     let class = match constructor.table()? {
@@ -3959,4 +4136,38 @@ fn decode_constant(element_type: u8, bytes: &[u8]) -> Option<Value> {
         // String constants are materialised on the heap at first use.
         _ => return None,
     })
+}
+
+#[cfg(all(test, feature = "std"))]
+mod deps_json_tests {
+    use super::package_assemblies_in;
+
+    #[test]
+    fn packages_are_listed_and_the_runtime_pack_is_not() {
+        let text = r#"{
+          "runtimeTarget": { "name": ".NETCoreApp,Version=v10.0", "signature": "" },
+          "targets": {
+            ".NETCoreApp,Version=v10.0/win-x64": {
+              "App/1.0.0": { "dependencies": { "Akka": "1.5.75" }, "runtime": { "App.dll": {} } },
+              "Akka/1.5.75": { "runtime": { "lib/net6.0/Akka.dll": { "assemblyVersion": "1.5.75.0" } } },
+              "System.Configuration.ConfigurationManager/6.0.1": {
+                "runtime": { "lib/net6.0/System.Configuration.ConfigurationManager.dll": {} }
+              },
+              "runtimepack.Microsoft.NETCore.App.Runtime.win-x64/10.0.0": {
+                "runtime": { "System.Private.CoreLib.dll": {}, "System.Runtime.dll": {} },
+                "native": { "coreclr.dll": {} }
+              }
+            }
+          },
+          "libraries": { "Akka/1.5.75": { "type": "package", "serviceable": true, "sha512": "x" } }
+        }"#;
+        let names = package_assemblies_in(text);
+        assert_eq!(names, ["App", "Akka", "System.Configuration.ConfigurationManager"]);
+    }
+
+    #[test]
+    fn what_cannot_be_read_lists_nothing() {
+        assert!(package_assemblies_in("{ \"targets\": [").is_empty());
+        assert!(package_assemblies_in("").is_empty());
+    }
 }

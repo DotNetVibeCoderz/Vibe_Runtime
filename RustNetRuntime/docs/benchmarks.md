@@ -80,6 +80,58 @@ What moved them, in the order it was measured:
 `pingpong` is a chain of dependent hops, so no amount of parallelism helps it:
 it runs as fast as one thread can interpret each hop, and that is the gap.
 
+### Milestone 8.3–8.5: channels, actors, a million waiting tasks
+
+| Workload | .NET (ms) | first measured | **now** | What it stresses |
+| --- | ---: | ---: | ---: | --- |
+| `channel` | 191–215 | 33,567 | **3,729** (19×) | 200,000 items through a bounded(64) channel, producer and consumer on the pool |
+| `actors` | 169–182 | 4,213 | **3,864** (21×) | 200,000 messages to one `RustNet.Concurrency` actor, then an `Ask` |
+| `waiting` | 664 | — | **13,402** (20×) | a million `async` methods all parked on one `TaskCompletionSource`, then released |
+
+`channel` was not slow for the reason it looked slow. It slowed *as it ran* —
+each 10,000 items took longer than the last — and four fixes found on the way
+were real but not that: the collector's trigger compounded (a 3.5 KB live
+set had a 31 MB trigger after six collections), the run queues' lock-free
+queue never freed a node, a lost race in `await` resumed nested and could
+overflow a pool thread's stack, and an `Unwrap` held a worker. The cause was
+`ValueTaskAwaiter.GetResult()` on a void `ValueTask` answering a value: the
+interpreter pushed it, nothing popped it, and the producer's evaluation stack
+grew by one per item — every root scan walked all of them. The interpreter now
+drops a value a void method returns, and a test swaps in a native that makes
+the mistake and measures what a loop keeps alive.
+
+**Intrinsics (8.4)** are what is left, measured by running each row with and
+without them, alternating, six runs each:
+
+| Row | intrinsics on (ms) | `--no-intrinsics` (ms) | |
+| --- | ---: | ---: | --- |
+| `channel` | 3,746–4,434 | 5,063–5,553 | **−20%** |
+| `actors` | 3,638–4,088 | 4,217–4,758 | **−14%** |
+| `pingpong` | 4,423–4,483 | 4,593–4,732 | **−5%** |
+
+Two natives are substituted: a channel ring's `PopFront` and `PushBack`, each a
+dozen field and element accesses — each a trip through a heap lock — turned
+into one look at the object and one at the array. Nothing else was
+substituted, because nothing else measured as worth it: the rest of a
+channel's time is the interpreter running ordinary C#, spread thinly across a
+dozen methods.
+
+**`waiting` is the 8.5 question, and the answer is that tasks are not the
+problem.** Parked, a waiting `async` method costs **232 bytes** on RustCLR
+against 112 on .NET — 240 MB for a million, linear in the count (100,000 is
+24 MB) — and that is the stated bound. The time, 13 µs per task against
+0.6 µs, is the interpreter running each state machine's `MoveNext` and its
+builder, not the task's representation: a task here is already a heap object
+and a state machine, with no machine stack to park. Making tasks cheaper
+would not move this row; making the interpreter faster would.
+
+The GC policy changed with these rows. The trigger still grows by 1.5× after
+each collection — taking that away made `fanout` 40% slower, because it then
+collected after every 4 MB — but it may grow to at most **64× what survived**
+the last collection, and falls back to its base when the live set does.
+`channel` and `pingpong` now run in 4 MB instead of 39; `fanout`, which keeps
+a lot alive, is where it was (about 2.0–2.4 s).
+
 Every row's checksum is compared between the two runtimes before it is timed;
 a mismatch prints `MISMATCH` instead of a number, because a faster wrong answer
 is not a result.

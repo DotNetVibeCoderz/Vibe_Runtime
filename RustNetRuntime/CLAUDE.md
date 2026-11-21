@@ -4,8 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status: milestones 1-3 and 5 complete, 4 and 6 partly done, and it works
 
-The runtime executes real Roslyn-compiled assemblies. `cargo test --workspace` runs 484 tests;
-the conformance fixture prints `checks=548 failures=0` on RustCLR, byte-identical to `dotnet`,
+The runtime executes real Roslyn-compiled assemblies. `cargo test --workspace` runs 492 tests;
+the conformance fixture prints `checks=575 failures=0` on RustCLR, byte-identical to `dotnet`,
 and `ModernSyntax` prints `checks=35 failures=0`. Generic collections, LINQ and
 `async`/`await` all run, `Span<T>` and `unsafe` pointers work, and reflection works on
 real `System.Type` objects.
@@ -154,9 +154,18 @@ captured, because a device program loops forever and a captured console prints
 nothing; and attaching the panel is what raises the backlight, since the
 backlight rail hangs off the panel's reset line.
 
+**A Rust native can stand in for a method that has IL** — an *intrinsic*
+(`crates/rustclr-bcl/src/intrinsics.rs`). It may decline any shape it was not
+written for, and the IL runs; `tests/intrinsics.rs` compares on and off, and
+`--no-intrinsics` is the switch. Only a channel ring's `PopFront`/`PushBack`
+are substituted, because only they measured as paying. Akka.NET and Orleans
+(`tests/fixtures/Akka`, `Orleans`) do **not** run yet; `docs/limitations.md`
+says where each stops.
+
 The loader now **follows assembly references** from the directory a program sits
 in, skipping framework names so a self-contained publish cannot supply a second
-`System.Object`.
+`System.Object` — except an assembly the program's `.deps.json` says came
+from a NuGet package, which loads whatever its name.
 
 **The device layers are all in**, ported from the Gravicode RustNet reference:
 `hal` + four chip HALs (K210, ESP32-C3, RP2040, STM32), `flashfs`, `crypto`,
@@ -254,7 +263,7 @@ the C# side is one project built by path.
 ```bash
 # Runtime
 cargo build --release                      # produces target/release/rustnet
-cargo test --workspace                     # 484 tests; must stay green
+cargo test --workspace                     # 492 tests; must stay green
 bash tests/embedded.sh                     # 14 crates x 4 bare-metal targets; must stay green
 bash tests/firmware.sh                     # seven board firmwares; must stay green
 cargo test -p rustclr-core                 # one crate
@@ -276,7 +285,7 @@ Before claiming a runtime change works, run a real assembly through both runtime
 
 ```bash
 cd tests/fixtures/Conformance && dotnet build -c Release
-dotnet bin/Release/net10.0/Conformance.dll                    # expect: checks=548 failures=0
+dotnet bin/Release/net10.0/Conformance.dll                    # expect: checks=575 failures=0
 ../../../target/debug/rustnet.exe run bin/Release/net10.0/Conformance.dll
 ```
 

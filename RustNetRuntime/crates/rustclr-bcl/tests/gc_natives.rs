@@ -24,6 +24,7 @@ fn values_held_by_a_native_survive_a_collection_inside_its_callbacks() {
     rustclr_bcl::install(&mut interp);
     interp.heap.set_collector(Box::new(rustclr_core::gc::MarkSweep {
         allocation_trigger: 2 * 1024,
+        base_trigger: 2 * 1024,
         minimum_heap: 0,
         growth_factor: 1.0,
     }));
@@ -49,4 +50,31 @@ fn values_held_by_a_native_survive_a_collection_inside_its_callbacks() {
 {}", wrong.join("
 "));
     assert!(collections > 10, "the collector should have run many times, ran {collections}");
+}
+
+/// A void method has nothing to push. A native that answers one anyway used
+/// to leave the value on the caller's evaluation stack, where it stayed, a
+/// root, for as long as the frame ran: a `ValueTask` await in a loop grew a
+/// producer's stack by one value per item, and every root scan walked them.
+/// The interpreter now drops it. This swaps `GC.KeepAlive`'s native for one
+/// that makes exactly that mistake, and measures what a loop keeps alive.
+#[test]
+fn a_value_from_a_void_native_is_not_left_on_the_stack() {
+    if !std::path::Path::new(FIXTURE).exists() {
+        eprintln!("skipping: conformance fixture not built");
+        return;
+    }
+    let mut interp = Interpreter::with_host(Box::new(CaptureHost::new()));
+    rustclr_bcl::install(&mut interp);
+    interp.register_native("System.GC::KeepAlive(object)", |_i, a| Ok(a.first().cloned()));
+    interp.loader.load_from_file(FIXTURE).expect("fixture loads");
+    let method = (0..interp.loader.registry.method_count())
+        .map(|n| rustclr_core::MethodId(n as u32))
+        .find(|m| interp.loader.registry.method(*m).name == "VoidCallsKeepNothing")
+        .expect("the fixture declares VoidCallsKeepNothing");
+    let kept = match interp.invoke(method, vec![Value::I32(500)]).expect("runs") {
+        Some(Value::I64(bytes)) => bytes,
+        other => panic!("expected a byte count, got {other:?}"),
+    };
+    assert!(kept < 100_000, "500 void calls kept {kept} bytes alive: their answers stayed on the stack");
 }

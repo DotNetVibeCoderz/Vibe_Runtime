@@ -441,6 +441,11 @@ Built only on 8.1.
 *Done when:* `tests/fixtures/Concurrency` prints identical output under
 `dotnet` and RustCLR, and the library references nothing that exists only on
 RustCLR.
+**✓ Done 2026-11-21.** `managed/RustNet.Concurrency`: `ConcurrencyScope`, `Actor<T>`
+with `Mailbox<T>` and a `SupervisorStrategy`, `Selector`/`Select`, and
+`Pipeline` stages with ordered parallelism. The fixture's 39 checks print
+identically on both runtimes, twenty runs in a row. What it needed from the
+runtime has Conformance checks; with 8.4–8.6's the fixture went 548 → 575.
 
 **8.4 — Native fast paths.** The intrinsic-substitution mechanism, then Rust
 implementations of whichever 8.3 methods a benchmark shows are worth it —
@@ -448,6 +453,12 @@ channel send/receive and mailbox dispatch are the likely ones.
 *Done when:* the Concurrency fixture matches with substitution on and off, a
 substitution whose native disagrees with its IL body is caught by a test, and
 each substitution has a benchmark row showing it pays.
+**✓ Done 2026-11-21.** `Interpreter::register_intrinsic`; an intrinsic may decline and
+the IL runs. Two substitutions, a channel ring's `PopFront` and `PushBack`:
+`channel` −20%, `actors` −14%, `pingpong` −5%. `tests/intrinsics.rs` compares
+on and off, and catches a native wrong for one item in several hundred.
+Measuring first found the real cause of the channel slowdown — a void
+`ValueTask.GetResult` leaving a value on the stack — and three other bugs.
 
 **8.5 — Cheap tasks, if the interpreter allows it.** The interpreter already
 keeps an iterative frame stack, so an interpreted task can be parked without a
@@ -456,12 +467,24 @@ exists only if 8.2's measurements show task cost is still the bottleneck, and
 it must not change thread identity as any program sees it.
 *Done when:* a benchmark of a million concurrent waiting tasks fits a stated
 memory bound, and every thread-identity check in Conformance still passes.
+**✓ Measured 2026-11-21, and not built.** The `waiting` row: a million parked
+`async` methods cost 232 bytes each (.NET: 112), linear in the count — the
+bound. Their time is the interpreter running each state machine, which a
+cheaper task representation would not change, so the phase's own condition
+for existing was not met. `docs/benchmarks.md` has the numbers.
 
 **8.6 — Real-world libraries.** Run Akka.NET, and if that holds, Orleans'
 in-process silo, unmodified.
 *Done when:* a sample from each runs on RustCLR with output matching `dotnet`,
 and every gap found is either fixed with a Conformance check or named in
 `docs/limitations.md`.
+**Not done (2026-11-21).** Both samples are in `tests/fixtures`, unmodified.
+Package assemblies now load (from `.deps.json`) and the argument guards are
+in, each checked; Orleans gets as far as `HostBuilder.Build`. What stands
+behind each — `System.Collections.Immutable` and expression trees for Akka,
+the DI container, Options, Configuration and a `TextWriter` for Orleans — is
+named in `docs/limitations.md` with `verify`'s counts. It is a large body
+of framework surface, not a missing runtime feature.
 
 ---
 
