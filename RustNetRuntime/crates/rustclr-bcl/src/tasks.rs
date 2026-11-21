@@ -65,10 +65,24 @@ const CONTINUATIONS: usize = 3;
 /// There are no OS threads without `std`, so nothing reads it there.
 #[cfg(feature = "threads")]
 const THREAD: usize = 4;
+/// The `TaskCreationOptions` a completion source asked for.
+const OPTIONS: usize = 5;
+/// `TaskCreationOptions.RunContinuationsAsynchronously`.
+const RUN_CONTINUATIONS_ASYNCHRONOUSLY: i32 = 64;
 
 const PENDING: i32 = 0;
 const COMPLETED: i32 = 1;
 const FAULTED: i32 = 2;
+/// Cancelled: `EXCEPTION` holds the `TaskCanceledException` an `await` throws.
+const CANCELED: i32 = 3;
+
+/// A waiting-list entry that is not a suspended state machine.
+///
+/// The list holds state-machine cells (ordinary objects) for `await`, and
+/// these — a small array whose first element says which — for the other ways
+/// of waiting on a task without blocking a thread.
+const ENTRY_CONTINUE_WITH: i32 = 1;
+const ENTRY_WHEN_ANY: i32 = 2;
 
 /// Leaks a stable key string; the native table holds it for the process life.
 fn key(type_name: &str, member: &str) -> &'static str {
@@ -327,28 +341,32 @@ fn register_parallel(interp: &mut Interpreter) {
 // -- the task object ---------------------------------------------------------
 
 fn task_type(interp: &Interpreter, generic: bool) -> Option<TypeId> {
-    let name = if generic { "Task`1" } else { "Task" };
-    interp.loader.registry.find_type_by_name(&format!("{TASKS}.{name}"))
+    // Literal names: this runs for every task, and building the name with
+    // `format!` was an allocation per task for a string that never changes.
+    let name = if generic { "System.Threading.Tasks.Task`1" } else { "System.Threading.Tasks.Task" };
+    interp.loader.registry.find_type_by_name(name)
 }
 
 /// Allocates a task in the pending state.
+///
+/// One allocation, fields written before it is published. A fresh object's
+/// fields are null, and null already means what each slot needs: `status_of`
+/// reads a null status as pending, and a null waiting list as empty — the
+/// list is made by the first `await`, which most tasks from `Task.Run` never
+/// see. This used to be two allocations and four separate heap locks.
 fn new_task(interp: &mut Interpreter, generic: bool) -> Handle {
     let Some(type_id) = task_type(interp, generic) else { return Handle::NULL };
-    let handle = interp.alloc_object(type_id);
-    set_field(interp, handle, STATUS, Value::I32(PENDING));
-    set_field(interp, handle, RESULT, Value::Null);
-    set_field(interp, handle, EXCEPTION, Value::Null);
-    let list = interp.alloc_value_array(0);
-    set_field(interp, handle, CONTINUATIONS, Value::Obj(list));
-    handle
+    let mut object = ClrObject::new(type_id, 6);
+    object.fields[STATUS] = Value::I32(PENDING);
+    interp.alloc_clr_object(object)
 }
 
 /// A task already carrying its result.
 pub(crate) fn completed_task(interp: &mut Interpreter, result: Value) -> Handle {
     let generic = !matches!(result, Value::Null);
     let handle = new_task(interp, generic);
-    set_field(interp, handle, STATUS, Value::I32(COMPLETED));
     set_field(interp, handle, RESULT, result);
+    set_field(interp, handle, STATUS, Value::I32(COMPLETED));
     handle
 }
 
@@ -358,57 +376,265 @@ fn status_of(interp: &Interpreter, task: Handle) -> i32 {
 
 /// Marks a task finished and resumes everything waiting on it.
 fn complete(interp: &mut Interpreter, task: Handle, result: Value) -> ExecResult<()> {
-    // Settling the status and taking the waiting list happen together, against
-    // `await_on_completed` doing its check-and-add. Otherwise a task that
-    // finishes between another thread's "is it pending?" and its "then wait for
-    // it" loses that continuation, and the `await` never resumes.
-    let taken = interp.interlocked(|i| {
-        if status_of(i, task) != PENDING {
-            return Err(ExecutionError::exception(
-                ClrExceptionKind::InvalidOperation,
-                "An attempt was made to transition a task to a final state when it had already completed.",
-            ));
-        }
-        set_field(i, task, STATUS, Value::I32(COMPLETED));
-        set_field(i, task, RESULT, result);
-        Ok(take_continuations(i, task))
-    })?;
-    // Resuming runs managed code, which may await again — so it happens after
-    // the lock is released, never under it.
-    resume_all(interp, taken)
+    if transition(interp, task, COMPLETED, result)? {
+        Ok(())
+    } else {
+        Err(already_final())
+    }
 }
 
+fn already_final() -> ExecutionError {
+    ExecutionError::exception(
+        ClrExceptionKind::InvalidOperation,
+        "An attempt was made to transition a task to a final state when it had already completed.",
+    )
+}
+
+/// Faults a task that is still pending; one already final is left alone.
 fn fault(interp: &mut Interpreter, task: Handle, exception: Value) -> ExecResult<()> {
-    let taken = interp.interlocked(|i| {
-        set_field(i, task, STATUS, Value::I32(FAULTED));
-        set_field(i, task, EXCEPTION, exception);
-        take_continuations(i, task)
-    });
-    resume_all(interp, taken)
+    transition(interp, task, FAULTED, exception).map(|_| ())
 }
 
-/// Empties a task's waiting list and hands it back.
-fn take_continuations(interp: &mut Interpreter, task: Handle) -> Vec<Value> {
-    let list = field_handle(interp, task, CONTINUATIONS);
-    if list.is_null() {
-        return Vec::new();
+/// Cancels a task that is still pending. Reports whether it did.
+fn cancel(interp: &mut Interpreter, task: Handle) -> ExecResult<bool> {
+    if status_of(interp, task) != PENDING {
+        return Ok(false);
     }
-    let waiting = elements(interp, list);
-    if !waiting.is_empty() {
-        let fresh = interp.alloc_value_array(0);
-        set_field(interp, task, CONTINUATIONS, Value::Obj(fresh));
-    }
-    waiting
+    // Allocated before the lock: allocating can collect, and a collection
+    // must not start while this thread holds the task lock.
+    let exception = new_exception(
+        interp,
+        "System.Threading.Tasks.TaskCanceledException",
+        "A task was canceled.",
+        Handle::NULL,
+    );
+    interp.with_roots(&[Value::Obj(exception)], |i| {
+        transition(i, task, CANCELED, Value::Obj(exception))
+    })
 }
 
-/// Resumes every state machine that was waiting.
-fn resume_all(interp: &mut Interpreter, waiting: Vec<Value>) -> ExecResult<()> {
-    for cell in waiting {
-        if let Some(handle) = cell.as_handle().filter(|h| !h.is_null()) {
-            resume(interp, handle)?;
+/// Moves a pending task to a final state and resumes what was waiting on it.
+///
+/// Answers `false`, changing nothing, when the task was already final — which
+/// is what every `TrySet…` reports and what a racing completion must see.
+///
+/// Settling the status and taking the waiting list happen together, against
+/// `add_continuation` doing its check-and-add. Otherwise a task that finishes
+/// between another thread's "is it pending?" and its "then wait for it" loses
+/// that continuation, and the `await` never resumes.
+///
+/// `task` and `payload` are rooted across the lock. Taking it can mean
+/// waiting, a thread that waits is one a collection proceeds without, and a
+/// payload made by the caller — a fresh `TaskCanceledException`, a result
+/// object — is otherwise held only by this Rust frame.
+fn transition(interp: &mut Interpreter, task: Handle, status: i32, payload: Value) -> ExecResult<bool> {
+    let rooted = [Value::Obj(task), payload.clone()];
+    // Under one heap lock, which is what `add_continuation` takes too: the two
+    // cannot interleave, so a continuation is either added before this takes
+    // the list or sees the task final and runs itself.
+    let taken = interp.with_roots(&rooted, |interp| interp.heap.atomically(|heap| {
+        let object = heap.get_as_mut::<ClrObject>(task)?;
+        if object.fields.get(STATUS).and_then(|v| v.as_i32()).unwrap_or(PENDING) != PENDING {
+            return None;
         }
+        // The payload first, the status last. A reader checks the status
+        // without this lock — `IsCompleted`, `settle` — and then reads the
+        // result, so a status published before its result let `.Result` see a
+        // finished task holding nothing: a ping-pong benchmark printed 0.
+        let slot = if status == COMPLETED { RESULT } else { EXCEPTION };
+        object.fields[slot] = payload;
+        object.fields[STATUS] = Value::I32(status);
+        let list = core::mem::replace(&mut object.fields[CONTINUATIONS], Value::Null);
+        let waiting = match list.as_handle().filter(|h| !h.is_null()) {
+            Some(list) => heap
+                .get_as::<rustclr_core::ClrArray>(list)
+                .map(|a| (0..a.len()).filter_map(|n| a.storage.get(n)).collect())
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        Some(waiting)
+    }));
+    match taken {
+        // Resuming runs managed code, which may await again — so it happens
+        // after the lock is released, never under it.
+        Some(waiting) if !waiting.is_empty() && runs_continuations_asynchronously(interp, task) => {
+            resume_elsewhere(interp, task, waiting);
+            Ok(true)
+        }
+        Some(waiting) => {
+            resume_all(interp, task, waiting)?;
+            Ok(true)
+        }
+        None => Ok(false),
     }
-    Ok(())
+}
+
+fn runs_continuations_asynchronously(interp: &Interpreter, task: Handle) -> bool {
+    field(interp, task, OPTIONS).as_i32().unwrap_or(0) & RUN_CONTINUATIONS_ASYNCHRONOUSLY != 0
+}
+
+/// Resumes the waiters on a pool worker instead of the completing thread.
+///
+/// What `RunContinuationsAsynchronously` asks for, and what it is for: the
+/// thread that completes a source may be holding a lock, and a continuation
+/// run inline would run *under* it — re-entrantly, since `Monitor` is
+/// re-entrant, so the lock would exclude nothing.
+#[cfg(feature = "threads")]
+fn resume_elsewhere(interp: &mut Interpreter, task: Handle, waiting: Vec<Value>) {
+    let mut held: Vec<Handle> = waiting.iter().filter_map(|v| v.as_handle()).filter(|h| !h.is_null()).collect();
+    held.push(task);
+    queue_rooted(interp, core::time::Duration::ZERO, &held, move |worker| {
+        let _ = resume_all(worker, task, waiting);
+    });
+}
+
+/// With one thread there is nowhere else to run them.
+#[cfg(not(feature = "threads"))]
+fn resume_elsewhere(interp: &mut Interpreter, task: Handle, waiting: Vec<Value>) {
+    let _ = resume_all(interp, task, waiting);
+}
+
+/// An exception object of a framework type, built without throwing it.
+fn new_exception(interp: &mut Interpreter, type_name: &str, message: &str, inner: Handle) -> Handle {
+    let mut error = ExecutionError::exception(ClrExceptionKind::Managed(type_name.into()), message);
+    let handle = interp.materialise_exception(&mut error);
+    if !inner.is_null() {
+        interp.heap.with_mut::<rustclr_core::ClrException, _>(handle, |e| e.inner = inner);
+    }
+    handle
+}
+
+/// `AggregateException` around one exception, as `Wait` and `Result` throw.
+fn aggregate(interp: &mut Interpreter, inner: Handle) -> Handle {
+    // Either shape: a runtime-raised `ClrException`, or an object `newobj`
+    // built, which keeps its message in its first field.
+    let message = crate::runtime::exception_message(interp, inner);
+    let text = format!("One or more errors occurred. ({message})");
+    new_exception(interp, "System.AggregateException", &text, inner)
+}
+
+/// An error carrying an exception object that already exists.
+fn rethrow(interp: &mut Interpreter, object: Handle) -> ExecutionError {
+    let message = crate::runtime::exception_message(interp, object);
+    ExecutionError::Exception {
+        kind: ClrExceptionKind::Managed(interp.type_name_of(object)),
+        message,
+        object,
+    }
+}
+
+/// Adds an entry to a pending task's waiting list.
+///
+/// Answers `true` when the task had already finished, in which case nothing
+/// was added and the caller runs the entry itself — outside the lock, since
+/// that runs managed code.
+///
+/// The entry is rooted across the lock, for the reason `transition` gives:
+/// an `await` boxes its state machine into a fresh cell just before this, and
+/// until the cell is on the task's list nothing else holds it. A collection
+/// run by another thread while this one queued for the lock freed it, and the
+/// method then never resumed — or resumed into whatever reused the slot.
+fn add_continuation(interp: &mut Interpreter, task: Handle, entry: Value) -> bool {
+    if status_of(interp, task) != PENDING {
+        return true;
+    }
+    // A list is made outside the lock, which must not allocate, and only when
+    // the task has none yet. Another thread may make one at the same moment;
+    // whichever is installed first is used, and the other is garbage.
+    let fresh = if field_handle(interp, task, CONTINUATIONS).is_null() {
+        interp.alloc_value_array(0)
+    } else {
+        Handle::NULL
+    };
+    let rooted = [Value::Obj(task), entry.clone(), Value::Obj(fresh)];
+    interp.with_roots(&rooted, |interp| interp.heap.atomically(|heap| {
+        let Some(object) = heap.get_as_mut::<ClrObject>(task) else { return true };
+        if object.fields.get(STATUS).and_then(|v| v.as_i32()).unwrap_or(PENDING) != PENDING {
+            return true;
+        }
+        let list = match object.fields[CONTINUATIONS].as_handle().filter(|h| !h.is_null()) {
+            Some(list) => list,
+            None if !fresh.is_null() => {
+                object.fields[CONTINUATIONS] = Value::Obj(fresh);
+                fresh
+            }
+            // Pending, with no list, and none made: the list was taken by a
+            // completion that then — impossibly — left the task pending.
+            // Refusing to lose the entry, the caller runs it.
+            None => return true,
+        };
+        match heap.get_as_mut::<rustclr_core::ClrArray>(list).and_then(|a| a.storage.values_mut()) {
+            Some(values) => {
+                values.push(entry);
+                false
+            }
+            None => true,
+        }
+    }))
+}
+
+/// Resumes everything that was waiting on `task`.
+///
+/// The list was taken off the task, so until each entry runs it is reachable
+/// only from this Rust local — and running the first one runs managed code,
+/// which can collect. Rooting the whole list for the duration is what keeps
+/// the second entry alive while the first resumes.
+fn resume_all(interp: &mut Interpreter, task: Handle, waiting: Vec<Value>) -> ExecResult<()> {
+    if waiting.is_empty() {
+        return Ok(());
+    }
+    let mut roots = waiting.clone();
+    roots.push(Value::Obj(task));
+    interp.with_roots(&roots, |i| {
+        let mut first_error = None;
+        for entry in waiting {
+            if let Some(handle) = entry.as_handle().filter(|h| !h.is_null()) {
+                // One continuation failing must not strand the others: each is
+                // somebody's `await`, and skipping it hangs that method.
+                if let Err(e) = run_entry(i, task, handle) {
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    })
+}
+
+/// Runs one waiting-list entry for a task that has just become final.
+fn run_entry(interp: &mut Interpreter, task: Handle, entry: Handle) -> ExecResult<()> {
+    let parts = interp.heap.with::<rustclr_core::ClrArray, _>(entry, |a| {
+        (0..a.len()).filter_map(|n| a.storage.get(n)).collect::<Vec<Value>>()
+    });
+    let Some(parts) = parts else {
+        // Not an array: a suspended state machine.
+        return resume(interp, entry);
+    };
+    match parts.first().and_then(|v| v.as_i32()) {
+        Some(ENTRY_CONTINUE_WITH) => {
+            let body = parts.get(1).cloned().unwrap_or(Value::Null);
+            let result = parts.get(2).and_then(|v| v.as_handle()).unwrap_or(Handle::NULL);
+            match invoke_delegate(interp, &body, &[Value::Obj(task)]) {
+                Ok(value) => {
+                    let _ = transition(interp, result, COMPLETED, value)?;
+                }
+                Err(e) => {
+                    let exception = exception_value(&e);
+                    fault(interp, result, exception)?;
+                }
+            }
+            Ok(())
+        }
+        Some(ENTRY_WHEN_ANY) => {
+            // The first of the set to finish wins; the rest find it final.
+            let result = parts.get(1).and_then(|v| v.as_handle()).unwrap_or(Handle::NULL);
+            let _ = transition(interp, result, COMPLETED, Value::Obj(task))?;
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 
@@ -472,25 +698,35 @@ fn as_task(interp: &mut Interpreter, args: &[Value], index: usize) -> ExecResult
     v.as_handle().filter(|h| !h.is_null()).ok_or_else(ExecutionError::null_reference)
 }
 
-/// Reads a finished task's value, rethrowing if it faulted.
+/// Reads a finished task's value the way `await` does: a fault rethrows the
+/// original exception, a cancellation throws `TaskCanceledException`.
 fn result_of(interp: &mut Interpreter, task: Handle) -> ExecResult<Value> {
+    observe(interp, task, false)
+}
+
+/// Reads a finished task's value the way `Wait()` and `Result` do: the
+/// exception arrives wrapped in an `AggregateException`.
+///
+/// The two differ on .NET and code relies on the difference — a `catch
+/// (AggregateException)` around `.Wait()` catches nothing if the inner
+/// exception arrives bare.
+fn result_of_blocking(interp: &mut Interpreter, task: Handle) -> ExecResult<Value> {
+    observe(interp, task, true)
+}
+
+fn observe(interp: &mut Interpreter, task: Handle, wrapped: bool) -> ExecResult<Value> {
     settle(interp, task)?;
     match status_of(interp, task) {
-        FAULTED => {
+        FAULTED | CANCELED => {
             let exception = field(interp, task, EXCEPTION);
             match exception.as_handle().filter(|h| !h.is_null()) {
                 // Rethrow the original instance, so `catch` sees the exception
                 // the failing task actually threw rather than a stand-in.
-                Some(object) => {
-                    let message = interp
-                        .heap.with::<rustclr_core::ClrException, _>(object, |e| e.message.clone())
-                        .unwrap_or_default();
-                    Err(ExecutionError::Exception {
-                        kind: ClrExceptionKind::InvalidOperation,
-                        message,
-                        object,
-                    })
+                Some(object) if wrapped => {
+                    let outer = aggregate(interp, object);
+                    Err(rethrow(interp, outer))
                 }
+                Some(object) => Err(rethrow(interp, object)),
                 None => Err(ExecutionError::exception(
                     ClrExceptionKind::InvalidOperation,
                     "A task failed without recording an exception.",
@@ -526,7 +762,7 @@ fn register_task(interp: &mut Interpreter) {
 
         interp.register_native(key(name, "get_Result()"), |i, a| {
             let task = as_task(i, a, 0)?;
-            Ok(Some(result_of(i, task)?))
+            Ok(Some(result_of_blocking(i, task)?))
         });
         interp.register_native(key(name, "get_IsCompleted()"), |i, a| {
             let task = as_task(i, a, 0)?;
@@ -540,21 +776,59 @@ fn register_task(interp: &mut Interpreter) {
             let task = as_task(i, a, 0)?;
             Ok(Some(Value::I32((status_of(i, task) == FAULTED) as i32)))
         });
-        interp.register_native(key(name, "get_IsCanceled()"), |_i, _a| Ok(Some(Value::I32(0))));
+        interp.register_native(key(name, "get_IsCanceled()"), |i, a| {
+            let task = as_task(i, a, 0)?;
+            Ok(Some(Value::I32((status_of(i, task) == CANCELED) as i32)))
+        });
+        // `Exception` is the `AggregateException` for a fault and null for a
+        // cancellation — a cancelled task has not *failed*.
         interp.register_native(key(name, "get_Exception()"), |i, a| {
             let task = as_task(i, a, 0)?;
-            Ok(Some(field(i, task, EXCEPTION)))
+            if status_of(i, task) != FAULTED {
+                return Ok(Some(Value::Null));
+            }
+            match field(i, task, EXCEPTION).as_handle().filter(|h| !h.is_null()) {
+                Some(inner) => Ok(Some(Value::Obj(aggregate(i, inner)))),
+                None => Ok(Some(Value::Null)),
+            }
+        });
+        // `TaskStatus`: RanToCompletion 5, Canceled 6, Faulted 7. A pending
+        // task reports WaitingForActivation (1), which is what .NET reports for
+        // a promise-style task — an `async` method or a completion source. A
+        // `Task.Run` body already running would say Running (3) there.
+        interp.register_native(key(name, "get_Status()"), |i, a| {
+            let task = as_task(i, a, 0)?;
+            Ok(Some(Value::I32(match status_of(i, task) {
+                COMPLETED => 5,
+                CANCELED => 6,
+                FAULTED => 7,
+                _ => 1,
+            })))
         });
         interp.register_native(key(name, "Wait()"), |i, a| {
             let task = as_task(i, a, 0)?;
-            result_of(i, task)?;
+            result_of_blocking(i, task)?;
             Ok(None)
         });
-        interp.register_native(key(name, "Wait(int)"), |i, a| {
-            let task = as_task(i, a, 0)?;
-            result_of(i, task)?;
-            Ok(Some(Value::I32(1)))
-        });
+        // `Wait(milliseconds)` and `Wait(TimeSpan)` give up at the deadline
+        // and say so; only a task that *finished* rethrows.
+        for member in ["Wait(int)", "Wait(System.TimeSpan)"] {
+            interp.register_native(key(name, member), |i, a| {
+                let task = as_task(i, a, 0)?;
+                let millis = timeout_millis(i, a, 1)?;
+                if !settle_within(i, task, millis)? {
+                    return Ok(Some(Value::I32(0)));
+                }
+                result_of_blocking(i, task)?;
+                Ok(Some(Value::I32(1)))
+            });
+        }
+        // `ContinueWith(Action<Task>)` and `ContinueWith(Func<Task, T>)`, plus
+        // the overloads adding a token, options or scheduler — which run the
+        // continuation the same way, since this runtime has one scheduler.
+        for member in ["ContinueWith/1", "ContinueWith/2", "ContinueWith/3", "ContinueWith/4"] {
+            interp.register_native(key(name, member), continue_with);
+        }
     }
 
     // Statics. `Task.Run` invokes its delegate at once — see the module note.
@@ -577,9 +851,7 @@ fn register_task(interp: &mut Interpreter) {
     interp.register_native(key(&format!("{TASKS}.Task"), "Delay(int)"), |i, a| {
         let ms = arg_i32(i, a, 0)?.max(0) as u64;
         let task = new_task(i, false);
-        i.queue_work_after(core::time::Duration::from_millis(ms), Box::new(move |worker| {
-            let _ = complete(worker, task, Value::Null);
-        }));
+        delay_then(i, ms, task);
         Ok(Some(Value::Obj(task)))
     });
     // Without threads there is nothing to overlap with, so the delay is a sleep
@@ -626,14 +898,153 @@ fn register_task(interp: &mut Interpreter) {
         });
         Ok(Some(Value::Obj(completed_task(i, Value::Obj(array)))))
     });
-    interp.register_native(key(&format!("{TASKS}.Task"), "WhenAny/1"), |i, a| {
-        let source = arg(i, a, 0)?;
-        let tasks = sequence_values(i, &source);
-        // Every task is already finished here, so the first one is the answer,
-        // exactly as .NET would report if all had completed before the call.
-        let first = tasks.into_iter().next().unwrap_or(Value::Null);
-        Ok(Some(Value::Obj(completed_task(i, first))))
+    // `WhenAny` hands back a task that completes with whichever of the set
+    // finishes first. It does not wait: each task gets a waiting-list entry
+    // pointing at the result, and the first to finish completes it.
+    for member in ["WhenAny/1", "WhenAny/2"] {
+        interp.register_native(key(&format!("{TASKS}.Task"), member), |i, a| {
+            let mut tasks = Vec::new();
+            for n in 0..a.len() {
+                let value = arg(i, a, n)?;
+                match value.as_handle().filter(|h| !h.is_null()) {
+                    Some(h) if is_task(i, h) => tasks.push(Value::Obj(h)),
+                    // An array, a list or a span of tasks.
+                    _ => tasks.extend(awaited_tasks(i, &value)),
+                }
+            }
+            if tasks.is_empty() {
+                return Err(ExecutionError::exception(
+                    ClrExceptionKind::Argument,
+                    "The tasks argument contained no tasks.",
+                ));
+            }
+            let result = new_task(i, true);
+            i.with_roots(&[Value::Obj(result)], |i| {
+                for t in &tasks {
+                    let Some(h) = t.as_handle().filter(|h| !h.is_null()) else { continue };
+                    let entry = i.alloc_value_array(2);
+                    crate::collections::with_values(i, entry, |v| {
+                        v[0] = Value::I32(ENTRY_WHEN_ANY);
+                        v[1] = Value::Obj(result);
+                    });
+                    if add_continuation(i, h, Value::Obj(entry)) {
+                        // Already finished: it wins, unless an earlier one did.
+                        let _ = transition(i, result, COMPLETED, Value::Obj(h))?;
+                        break;
+                    }
+                }
+                Ok::<_, ExecutionError>(())
+            })?;
+            Ok(Some(Value::Obj(result)))
+        });
+    }
+    for member in [
+        "Delay(System.TimeSpan)",
+        "Delay(int,System.Threading.CancellationToken)",
+        "Delay(System.TimeSpan,System.Threading.CancellationToken)",
+    ] {
+        interp.register_native(key(&format!("{TASKS}.Task"), member), delay_with);
+    }
+}
+
+/// `Task.Delay` with a `TimeSpan` or a token.
+///
+/// The token is honoured: cancelling it cancels the delay at once rather than
+/// at the deadline, which is what a program cancelling a wait is asking for.
+fn delay_with(interp: &mut Interpreter, args: &[Value]) -> ExecResult<Option<Value>> {
+    let ms = timeout_millis(interp, args, 0)?;
+    let token = if args.len() > 1 { arg(interp, args, 1)? } else { Value::Null };
+    let task = new_task(interp, false);
+    if crate::cancellation::token_is_canceled(interp, &token) {
+        cancel(interp, task)?;
+        return Ok(Some(Value::Obj(task)));
+    }
+    crate::cancellation::cancel_task_on(interp, &token, task)?;
+    if let Some(ms) = ms {
+        delay_then(interp, ms, task);
+    }
+    Ok(Some(Value::Obj(task)))
+}
+
+#[cfg(feature = "threads")]
+fn delay_then(interp: &mut Interpreter, ms: u64, task: Handle) {
+    queue_rooted(interp, core::time::Duration::from_millis(ms), &[task], move |worker| {
+        let _ = transition(worker, task, COMPLETED, Value::Null);
     });
+}
+
+#[cfg(not(feature = "threads"))]
+fn delay_then(interp: &mut Interpreter, ms: u64, task: Handle) {
+    sleep_millis(interp, ms);
+    let _ = transition(interp, task, COMPLETED, Value::Null);
+}
+
+/// A timeout argument in milliseconds: an `int`, or a `TimeSpan` (ticks).
+/// `None` is infinite (`-1`, `Timeout.Infinite`, `Timeout.InfiniteTimeSpan`).
+fn timeout_millis(interp: &mut Interpreter, args: &[Value], index: usize) -> ExecResult<Option<u64>> {
+    let value = arg(interp, args, index)?;
+    // A `TimeSpan` is ticks in a 64-bit slot; an `int` is milliseconds in a
+    // 32-bit one. The slot's shape says which overload this is.
+    let millis = match value {
+        Value::I64(ticks) => {
+            if ticks < 0 {
+                -1
+            } else {
+                ticks / 10_000
+            }
+        }
+        other => other.as_i32().map(i64::from).unwrap_or(0),
+    };
+    if millis < 0 {
+        return Ok(None);
+    }
+    Ok(Some(millis as u64))
+}
+
+/// `ContinueWith`: a new task that runs `body(antecedent)` once the
+/// antecedent is final, however it got there.
+fn continue_with(interp: &mut Interpreter, args: &[Value]) -> ExecResult<Option<Value>> {
+    let antecedent = as_task(interp, args, 0)?;
+    let body = arg(interp, args, 1)?;
+    let result = new_task(interp, true);
+    let entry = interp.with_roots(&[Value::Obj(result), body.clone()], |i| {
+        let entry = i.alloc_value_array(3);
+        crate::collections::with_values(i, entry, |v| {
+            v[0] = Value::I32(ENTRY_CONTINUE_WITH);
+            v[1] = body.clone();
+            v[2] = Value::Obj(result);
+        });
+        entry
+    });
+    if add_continuation(interp, antecedent, Value::Obj(entry)) {
+        interp.with_roots(&[Value::Obj(entry), Value::Obj(result)], |i| run_entry(i, antecedent, entry))?;
+    }
+    Ok(Some(Value::Obj(result)))
+}
+
+/// Queues work for after `delay`, keeping `handles` alive until it has run.
+///
+/// A queued job holds its handles in a Rust closure, which no collection can
+/// see — so without a pin, an object reachable only from a job still waiting
+/// in the queue is swept, and the job finds a dead handle when it runs.
+#[cfg(feature = "threads")]
+pub(crate) fn queue_rooted(
+    interp: &mut Interpreter,
+    delay: core::time::Duration,
+    handles: &[Handle],
+    job: impl FnOnce(&mut Interpreter) + Send + 'static,
+) {
+    interp.heap.pin_all(handles);
+    let pinned: Vec<Handle> = handles.to_vec();
+    let run = Box::new(move |worker: &mut Interpreter| {
+        job(worker);
+        worker.heap.unpin_all(&pinned);
+    });
+    if delay.is_zero() {
+        interp.queue_work(run);
+    } else {
+        interp.queue_work_after(delay, run);
+    }
 }
 
 /// `Task.Run(Func<T>)` / `Task.Run(Action)`.
@@ -657,7 +1068,13 @@ fn run_delegate(interp: &mut Interpreter, args: &[Value]) -> ExecResult<Option<V
     // Queued on the pool rather than given a thread of its own. A thousand
     // tasks used to mean a thousand OS threads, each paying for a copy of the
     // loader on the way up; now they share one worker per core.
-    interp.queue_work(Box::new(move |worker| {
+    // The task and the delegate are pinned while queued: the closure is the
+    // only thing holding the delegate, and nothing a collection can see.
+    let mut held = alloc::vec![task];
+    if let Some(h) = body.as_handle().filter(|h| !h.is_null()) {
+        held.push(h);
+    }
+    queue_rooted(interp, core::time::Duration::ZERO, &held, move |worker| {
         let outcome = match invoke_delegate(worker, &body, &[]) {
             Ok(value) => {
                 // `Task.Run(async () => …)` hands back a task, and .NET's
@@ -685,7 +1102,7 @@ fn run_delegate(interp: &mut Interpreter, args: &[Value]) -> ExecResult<Option<V
         if outcome.is_err() {
             let _ = fault(worker, task, Value::Null);
         }
-    }));
+    });
     Ok(Some(Value::Obj(task)))
 }
 
@@ -813,6 +1230,38 @@ fn settle(interp: &mut Interpreter, task: Handle) -> ExecResult<()> {
 #[cfg(not(feature = "threads"))]
 fn settle(_i: &mut Interpreter, _task: Handle) -> ExecResult<()> {
     Ok(())
+}
+
+/// Waits up to `millis` (forever for `None`) for a task to become final.
+/// Answers whether it did.
+///
+/// Unlike [`settle`] this never concludes that nothing can complete the task:
+/// a bounded wait is allowed to wait for something that never happens, and
+/// the answer then is `false`, not an error.
+#[cfg(feature = "threads")]
+fn settle_within(interp: &mut Interpreter, task: Handle, millis: Option<u64>) -> ExecResult<bool> {
+    let Some(millis) = millis else {
+        settle(interp, task)?;
+        return Ok(true);
+    };
+    let deadline = rustclr_thread::time::Instant::now() + core::time::Duration::from_millis(millis);
+    loop {
+        if status_of(interp, task) != PENDING {
+            return Ok(true);
+        }
+        if rustclr_thread::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        if interp.help_with_queued_work() {
+            continue;
+        }
+        interp.blocking(|_| rustclr_thread::thread::sleep(core::time::Duration::from_millis(1)));
+    }
+}
+
+#[cfg(not(feature = "threads"))]
+fn settle_within(interp: &mut Interpreter, task: Handle, _millis: Option<u64>) -> ExecResult<bool> {
+    Ok(status_of(interp, task) != PENDING)
 }
 
 /// The managed exception object an error carries, if it has one.
@@ -962,26 +1411,14 @@ fn await_on_completed(
     let cell = interp.alloc_clr_object(cell);
 
     // Checking the status and joining the queue happen together, against
-    // another thread completing the task in between — see `complete`.
-    let already_done = interp.interlocked(|i| {
-        if status_of(i, task) != PENDING {
-            return true;
-        }
-        let list = field_handle(i, task, CONTINUATIONS);
-        if list.is_null() {
-            let fresh = i.alloc_value_array(0);
-            set_field(i, task, CONTINUATIONS, Value::Obj(fresh));
-        }
-        let list = field_handle(i, task, CONTINUATIONS);
-        crate::collections::push_value(i, list, Value::Obj(cell));
-        false
-    });
+    // another thread completing the task in between — see `transition`.
+    let already_done = add_continuation(interp, task, Value::Obj(cell));
 
     // Finished before we could queue: resume now rather than waiting for a
     // drain that has already happened. Outside the lock, as resuming runs
-    // managed code.
+    // managed code — and rooted, since the cell is on no list.
     if already_done {
-        resume(interp, cell)?;
+        interp.with_roots(&[Value::Obj(cell)], |i| resume(i, cell))?;
     }
     Ok(None)
 }
@@ -1085,20 +1522,12 @@ fn register_value_task(interp: &mut Interpreter) {
                     Some(h) if is_task(i, h) => h,
                     // `new ValueTask<T>(source, token)` — an `IValueTaskSource`.
                     // An async iterator's `MoveNextAsync` returns this shape,
-                    // with the state machine as its own source.
-                    //
-                    // The result is read *now* rather than when the value task
-                    // is awaited. That is sound only because nothing overlaps:
-                    // the body has already run to the next `yield return`, so
-                    // the promise is settled before the value task exists. On a
-                    // runtime where it could still be pending this would be
-                    // wrong, which is why it is written down here.
+                    // with the state machine as its own source. Settled, it
+                    // is read now; pending, it is waited for — see
+                    // `task_for_source`.
                     Some(h) if a.len() > 2 => {
                         let token = arg(i, a, 2)?;
-                        let value = call_get_result(i, h, token)?;
-                        let t = new_task(i, true);
-                        complete(i, t, value)?;
-                        t
+                        task_for_source(i, h, token)?
                     }
                     // `new ValueTask<T>(result)` wraps a value already in hand.
                     _ => {
@@ -1135,7 +1564,10 @@ fn register_value_task(interp: &mut Interpreter) {
             Ok(Some(Value::I32(completed_or_default(i, a)? as i32)))
         });
         interp.register_native(key(full, "get_IsCompletedSuccessfully()"), |i, a| {
-            Ok(Some(Value::I32(completed_or_default(i, a)? as i32)))
+            Ok(Some(Value::I32(match value_task_handle(i, a)? {
+                Some(t) => (status_of(i, t) == COMPLETED) as i32,
+                None => 1,
+            })))
         });
         interp.register_native(key(full, "get_IsFaulted()"), |i, a| {
             match value_task_handle(i, a)? {
@@ -1143,7 +1575,12 @@ fn register_value_task(interp: &mut Interpreter) {
                 None => Ok(Some(Value::I32(0))),
             }
         });
-        interp.register_native(key(full, "get_IsCanceled()"), |_i, _a| Ok(Some(Value::I32(0))));
+        interp.register_native(key(full, "get_IsCanceled()"), |i, a| {
+            match value_task_handle(i, a)? {
+                Some(t) => Ok(Some(Value::I32((status_of(i, t) == CANCELED) as i32))),
+                None => Ok(Some(Value::I32(0))),
+            }
+        });
         interp.register_native(key(full, "get_Result()"), |i, a| match value_task_handle(i, a)? {
             Some(t) => result_of(i, t),
             None => Ok(Value::Null),
@@ -1223,7 +1660,14 @@ use rustclr_thread::sync::{Arc, Mutex};
 
 /// Slots of `ManualResetValueTaskSourceCore<T>`.
 const PROMISE_RESULT: usize = 0;
+/// `ValueTaskSourceStatus`: 0 pending, 1 succeeded, 2 faulted.
 const PROMISE_HAS_RESULT: usize = 1;
+/// (continuation, state) pairs waiting for the promise.
+const PROMISE_WAITERS: usize = 2;
+
+const PROMISE_PENDING: i32 = 0;
+const PROMISE_SUCCEEDED: i32 = 1;
+const PROMISE_FAULTED: i32 = 2;
 
 /// `async IAsyncEnumerable<T>` and the `await foreach` that consumes it.
 ///
@@ -1233,10 +1677,12 @@ const PROMISE_HAS_RESULT: usize = 1;
 /// are the runtime's to supply: the builder that drives `MoveNext`, and the
 /// promise `MoveNextAsync` hands back.
 ///
-/// Both are simple here for the same reason the rest of `async` is: nothing
-/// overlaps. By the time `MoveNextAsync` returns, the body has already run to
-/// the next `yield return`, so the promise always has its answer and the
-/// "reset, await, complete later" cycle it exists to manage never happens.
+/// The promise is usually settled by the time `MoveNextAsync` returns — the
+/// body ran to its next `yield return` — and then the value task is built
+/// already complete. But an iterator that awaits something slow (a channel
+/// with nothing in it yet) suspends *inside* `MoveNextAsync`, and the promise
+/// is genuinely pending. Then the value task is a pending task registered as a
+/// waiter, and settling the promise completes it.
 fn register_async_iterators(interp: &mut Interpreter) {
     let builder: &'static str =
         Box::leak(format!("{CS}.AsyncIteratorMethodBuilder").into_boxed_str());
@@ -1257,34 +1703,63 @@ fn register_async_iterators(interp: &mut Interpreter) {
     interp.register_native(key(promise, "SetResult(!0)"), |i, a| {
         let cell = promise_cell(i, a)?;
         let value = arg(i, a, 1)?;
-        set_field(i, cell, PROMISE_RESULT, value);
-        set_field(i, cell, PROMISE_HAS_RESULT, Value::I32(1));
+        settle_promise(i, cell, PROMISE_SUCCEEDED, value)?;
         Ok(None)
     });
     interp.register_native(key(promise, "SetException/1"), |i, a| {
-        // A faulting iterator: the promise is completed with the exception, and
-        // since nothing overlaps the consumer is already waiting for it.
         let cell = promise_cell(i, a)?;
         let exception = arg(i, a, 1)?;
-        set_field(i, cell, PROMISE_RESULT, exception);
-        set_field(i, cell, PROMISE_HAS_RESULT, Value::I32(1));
+        settle_promise(i, cell, PROMISE_FAULTED, exception)?;
         Ok(None)
     });
     interp.register_native(key(promise, "GetResult/1"), |i, a| {
         let cell = promise_cell(i, a)?;
-        Ok(Some(field(i, cell, PROMISE_RESULT)))
+        let value = field(i, cell, PROMISE_RESULT);
+        if field(i, cell, PROMISE_HAS_RESULT).as_i32() == Some(PROMISE_FAULTED) {
+            if let Some(object) = value.as_handle().filter(|h| !h.is_null()) {
+                return Err(rethrow(i, object));
+            }
+        }
+        Ok(Some(value))
     });
     interp.register_native(key(promise, "GetStatus/1"), |i, a| {
         let cell = promise_cell(i, a)?;
-        // 0 Pending, 1 Succeeded — the only two this runtime produces.
-        let done = field(i, cell, PROMISE_HAS_RESULT).as_i32().unwrap_or(0);
-        Ok(Some(Value::I32(done)))
+        let status = field(i, cell, PROMISE_HAS_RESULT).as_i32().unwrap_or(PROMISE_PENDING);
+        Ok(Some(Value::I32(status)))
     });
-    interp.register_native(key(promise, "OnCompleted/4"), |_i, _a| Ok(None));
+    // `OnCompleted(continuation, state, token, flags)`. The runtime's own
+    // value tasks register with no continuation and their pending task as the
+    // state; anything else registers a delegate, called with the state.
+    interp.register_native(key(promise, "OnCompleted/4"), |i, a| {
+        let cell = promise_cell(i, a)?;
+        let continuation = arg(i, a, 1)?;
+        let state = arg(i, a, 2)?;
+        let settled = i.interlocked(|i| {
+            if field(i, cell, PROMISE_HAS_RESULT).as_i32().unwrap_or(0) != PROMISE_PENDING {
+                return true;
+            }
+            let list = match field(i, cell, PROMISE_WAITERS).as_handle().filter(|h| !h.is_null()) {
+                Some(h) => h,
+                None => {
+                    let h = i.alloc_value_array(0);
+                    set_field(i, cell, PROMISE_WAITERS, Value::Obj(h));
+                    h
+                }
+            };
+            crate::collections::push_value(i, list, continuation.clone());
+            crate::collections::push_value(i, list, state.clone());
+            false
+        });
+        if settled {
+            wake_promise_waiter(i, cell, &continuation, &state)?;
+        }
+        Ok(None)
+    });
     interp.register_native(key(promise, "Reset()"), |i, a| {
         let cell = promise_cell(i, a)?;
         set_field(i, cell, PROMISE_RESULT, Value::Null);
-        set_field(i, cell, PROMISE_HAS_RESULT, Value::I32(0));
+        set_field(i, cell, PROMISE_HAS_RESULT, Value::I32(PROMISE_PENDING));
+        set_field(i, cell, PROMISE_WAITERS, Value::Null);
         Ok(None)
     });
     interp.register_native(key(promise, "get_Version()"), |_i, _a| Ok(Some(Value::I32(0))));
@@ -1313,6 +1788,129 @@ fn register_async_iterators(interp: &mut Interpreter) {
             .map(Some)
         });
     }
+}
+
+/// Settles a promise and wakes whoever registered while it was pending.
+fn settle_promise(interp: &mut Interpreter, cell: Handle, status: i32, payload: Value) -> ExecResult<()> {
+    // Rooted across the lock, as in `transition`.
+    let rooted = [Value::Obj(cell), payload.clone()];
+    let waiting = interp.with_roots(&rooted, |interp| interp.interlocked(|i| {
+        set_field(i, cell, PROMISE_RESULT, payload);
+        set_field(i, cell, PROMISE_HAS_RESULT, Value::I32(status));
+        let list = field(i, cell, PROMISE_WAITERS).as_handle().filter(|h| !h.is_null());
+        set_field(i, cell, PROMISE_WAITERS, Value::Null);
+        list.map(|h| elements(i, h)).unwrap_or_default()
+    }));
+    if waiting.is_empty() {
+        return Ok(());
+    }
+    interp.with_roots(&waiting, |i| {
+        for pair in waiting.chunks(2) {
+            if let [continuation, state] = pair {
+                wake_promise_waiter(i, cell, continuation, state)?;
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Hands a settled promise's outcome to one waiter.
+fn wake_promise_waiter(interp: &mut Interpreter, cell: Handle, continuation: &Value, state: &Value) -> ExecResult<()> {
+    if continuation.as_handle().filter(|h| !h.is_null()).is_some() {
+        // A delegate: `Action<object>`, called with its state.
+        invoke_delegate(interp, continuation, &[state.clone()])?;
+        return Ok(());
+    }
+    let Some(task) = state.as_handle().filter(|h| !h.is_null()) else { return Ok(()) };
+    let value = field(interp, cell, PROMISE_RESULT);
+    if field(interp, cell, PROMISE_HAS_RESULT).as_i32() == Some(PROMISE_FAULTED) {
+        fault(interp, task, value)
+    } else {
+        transition(interp, task, COMPLETED, value).map(|_| ())
+    }
+}
+
+/// Calls a method of a value-task source by name and arity.
+///
+/// The compiler implements `IValueTaskSource` *explicitly* on an async
+/// iterator, so the name carries the interface prefix — matching the suffix
+/// covers both spellings.
+fn call_source(
+    interp: &mut Interpreter,
+    source: Handle,
+    name: &str,
+    args: Vec<Value>,
+) -> ExecResult<Option<Value>> {
+    let Some(method) = source_method(interp, source, name, args.len())? else { return Ok(None) };
+    let mut call = alloc::vec![Value::Obj(source)];
+    call.extend(args);
+    interp.invoke(method, call)
+}
+
+/// The source's implementation of `name`, explicit or not.
+///
+/// Separate from [`call_source`] because `OnCompleted` returns `void`: a call
+/// that ran and a method that does not exist both come back as `None`, and
+/// treating the first as the second refused every pending source.
+fn source_method(
+    interp: &mut Interpreter,
+    source: Handle,
+    name: &str,
+    arity: usize,
+) -> ExecResult<Option<rustclr_core::MethodId>> {
+    let Some(ty) = interp.type_of(source) else {
+        return Err(ExecutionError::null_reference());
+    };
+    let suffix = format!(".{name}");
+    Ok(interp
+        .loader
+        .registry
+        .base_chain(ty)
+        .into_iter()
+        .flat_map(|t| interp.loader.registry.ty(t).methods.clone())
+        .find(|m| {
+            let info = interp.loader.registry.method(*m);
+            (info.name == name || info.name.ends_with(&suffix)) && info.signature.params.len() == arity
+        }))
+}
+
+/// The value task for `new ValueTask<T>(source, token)`.
+///
+/// Settled sources become a finished task now. A pending one becomes a
+/// pending task, registered on the source so settling it completes the task.
+fn task_for_source(interp: &mut Interpreter, source: Handle, token: Value) -> ExecResult<Handle> {
+    let status = call_source(interp, source, "GetStatus", alloc::vec![token.clone()])?
+        .and_then(|v| v.as_i32())
+        .unwrap_or(PROMISE_SUCCEEDED);
+    let task = new_task(interp, true);
+    interp.with_roots(&[Value::Obj(task), Value::Obj(source)], |i| {
+        if status == PROMISE_PENDING {
+            if source_method(i, source, "OnCompleted", 4)?.is_none() {
+                return Err(ExecutionError::MissingImplementation(
+                    "a pending ValueTask source without OnCompleted".into(),
+                ));
+            }
+            call_source(
+                i,
+                source,
+                "OnCompleted",
+                alloc::vec![Value::Null, Value::Obj(task), token.clone(), Value::I32(0)],
+            )?;
+            return Ok(());
+        }
+        match call_get_result(i, source, token.clone()) {
+            Ok(value) => complete(i, task, value),
+            Err(e) => {
+                let exception = exception_value(&e);
+                if exception.as_handle().filter(|h| !h.is_null()).is_some() {
+                    fault(i, task, exception)
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    })?;
+    Ok(task)
 }
 
 /// The storage behind a `ManualResetValueTaskSourceCore<T>` field.
@@ -1355,10 +1953,23 @@ fn register_completion_source(interp: &mut Interpreter) {
     for name in ["TaskCompletionSource", "TaskCompletionSource`1"] {
         let full: &'static str = Box::leak(format!("{TASKS}.{name}").into_boxed_str());
 
-        for ctor in [".ctor()", ".ctor/0", ".ctor/1"] {
+        // `new TaskCompletionSource()`, `(TaskCreationOptions)`, `(object
+        // state)` and `(state, options)`. Only the options change behaviour,
+        // and an `int` argument is how they arrive.
+        for ctor in [".ctor()", ".ctor/0", ".ctor/1", ".ctor/2"] {
             interp.register_native(key(full, ctor), |i, a| {
                 let this = arg_handle(i, a, 0)?;
                 let task = new_task(i, true);
+                let options = a
+                    .iter()
+                    .skip(1)
+                    .filter_map(|v| match v {
+                        Value::I32(n) => Some(*n),
+                        _ => None,
+                    })
+                    .last()
+                    .unwrap_or(0);
+                set_field(i, task, OPTIONS, Value::I32(options));
                 set_field(i, this, 0, Value::Obj(task));
                 Ok(None)
             });
@@ -1380,41 +1991,57 @@ fn register_completion_source(interp: &mut Interpreter) {
             complete(i, task, Value::Null)?;
             Ok(None)
         });
+        // The `TrySet…` family is one atomic step: two threads racing to
+        // complete the same source get one `true` between them.
         interp.register_native(key(full, "TrySetResult/1"), |i, a| {
             let this = arg_handle(i, a, 0)?;
             let task = field_handle(i, this, 0);
-            if status_of(i, task) != PENDING {
-                return Ok(Some(Value::I32(0)));
-            }
             let value = arg(i, a, 1)?;
-            complete(i, task, value)?;
-            Ok(Some(Value::I32(1)))
+            Ok(Some(Value::I32(transition(i, task, COMPLETED, value)? as i32)))
         });
         interp.register_native(key(full, "TrySetException/1"), |i, a| {
             let this = arg_handle(i, a, 0)?;
             let task = field_handle(i, this, 0);
-            if status_of(i, task) != PENDING {
-                return Ok(Some(Value::I32(0)));
-            }
             let exception = arg(i, a, 1)?;
-            fault(i, task, exception)?;
-            Ok(Some(Value::I32(1)))
+            Ok(Some(Value::I32(transition(i, task, FAULTED, exception)? as i32)))
         });
         interp.register_native(key(full, "TrySetResult()"), |i, a| {
             let this = arg_handle(i, a, 0)?;
             let task = field_handle(i, this, 0);
-            if status_of(i, task) != PENDING {
-                return Ok(Some(Value::I32(0)));
-            }
-            complete(i, task, Value::Null)?;
-            Ok(Some(Value::I32(1)))
+            Ok(Some(Value::I32(transition(i, task, COMPLETED, Value::Null)? as i32)))
         });
+        for member in ["TrySetCanceled()", "TrySetCanceled/1"] {
+            interp.register_native(key(full, member), |i, a| {
+                let this = arg_handle(i, a, 0)?;
+                let task = field_handle(i, this, 0);
+                Ok(Some(Value::I32(cancel(i, task)? as i32)))
+            });
+        }
+        for member in ["SetCanceled()", "SetCanceled/1"] {
+            interp.register_native(key(full, member), |i, a| {
+                let this = arg_handle(i, a, 0)?;
+                let task = field_handle(i, this, 0);
+                if cancel(i, task)? {
+                    Ok(None)
+                } else {
+                    Err(already_final())
+                }
+            });
+        }
         interp.register_native(key(full, "SetException/1"), |i, a| {
             let this = arg_handle(i, a, 0)?;
             let task = field_handle(i, this, 0);
             let exception = arg(i, a, 1)?;
-            fault(i, task, exception)?;
-            Ok(None)
+            if transition(i, task, FAULTED, exception)? {
+                Ok(None)
+            } else {
+                Err(already_final())
+            }
         });
     }
+}
+
+/// Completes `task` as cancelled. For `cancellation`, which owns the tokens.
+pub(crate) fn cancel_task(interp: &mut Interpreter, task: Handle) -> ExecResult<bool> {
+    cancel(interp, task)
 }

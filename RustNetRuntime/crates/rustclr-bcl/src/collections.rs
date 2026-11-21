@@ -132,8 +132,10 @@ pub(crate) fn invalid_operation(message: &str) -> ExecutionError {
 
 fn key_not_found(interp: &mut Interpreter, k: &Value) -> ExecutionError {
     let rendered = display(interp, k);
+    // .NET's type, not `InvalidOperationException`: a `catch` names the type,
+    // and a matching message under the wrong type catches nothing.
     ExecutionError::exception(
-        ClrExceptionKind::InvalidOperation,
+        ClrExceptionKind::Managed("System.Collections.Generic.KeyNotFoundException".into()),
         format!("The given key '{rendered}' was not present in the dictionary."),
     )
 }

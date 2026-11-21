@@ -87,8 +87,11 @@ pub fn run(
     minimal_bcl: bool,
     board: Option<&str>,
     capture_display: Option<&str>,
+    scheduler: rustclr_core::SchedulerKind,
 ) -> Result<i32> {
     let mut interp = runtime_with_bcl(args, minimal_bcl);
+    // Read when the pool first starts, which is the first `Task.Run`.
+    interp.scheduler = scheduler;
     if let Some(name) = board {
         install_board(&mut interp, name)?;
     }
@@ -626,7 +629,7 @@ pub fn build(project: &str, configuration: &str, then_run: bool) -> Result<i32> 
         .ok_or("build succeeded but no output assembly was found under bin/")?;
 
     println!("Running {} on RustCLR…\n", assembly.display());
-    run(&assembly.to_string_lossy(), Vec::new(), false, false, None, true, None, true, false, None, None)
+    run(&assembly.to_string_lossy(), Vec::new(), false, false, None, true, None, true, false, None, None, rustclr_core::SchedulerKind::default())
 }
 
 /// Finds the first `.dll` under a build output directory.
@@ -1011,6 +1014,14 @@ Collections and LINQ");
     println!("                               The pool GROWS when workers block, up to a");
     println!("                               ceiling, so queued work is not stuck behind");
     println!("                               a worker that is only sleeping.");
+    println!("                               SCHEDULER is a swappable module: per-worker");
+    println!("                               queues with work stealing (default), or one");
+    println!("                               FIFO queue with --scheduler fifo.");
+    println!("                               Not every worker always RUNS: every field");
+    println!("                               access takes ONE HEAP LOCK, and a governor");
+    println!("                               runs fewer workers while they mostly queue");
+    println!("                               for it. Heap-heavy tasks are therefore not");
+    println!("                               faster on more cores; see limitations.md.");
     println!("  Task, Task<T>, WhenAll       yes");
     println!("  TaskCompletionSource         yes - a real suspend and resume");
     println!("  Task Parallel Library        yes - see Parallel.* below");
@@ -1035,6 +1046,32 @@ Collections and LINQ");
     println!("                               Wait(obj, ms) honours its timeout, reports");
     println!("                               whether it was pulsed, and comes back");
     println!("                               HOLDING the monitor either way.");
+    println!("  Task states, ContinueWith    yes - Canceled is a real state; Wait and");
+    println!("                               Result wrap a fault in AggregateException");
+    println!("                               while await rethrows the inner one;");
+    println!("                               Wait(ms) honours its timeout; WhenAny does");
+    println!("                               not block. A pending Task reports Status");
+    println!("                               WaitingForActivation, whatever stage it is");
+    println!("                               in - see docs/limitations.md.");
+    println!("  CancellationToken            yes - thread-safe Cancel, CancelAfter,");
+    println!("                               linked sources, Register and a Dispose");
+    println!("                               that really unregisters.");
+    println!("  System.Collections.          yes - ConcurrentQueue, ConcurrentStack,");
+    println!("  Concurrent                   ConcurrentBag, ConcurrentDictionary and");
+    println!("                               BlockingCollection. Written in C# and");
+    println!("                               embedded in RustBCL, so they behave as");
+    println!("                               .NET's do. They take a LOCK where .NET's");
+    println!("                               are lock-free: correct, not as fast under");
+    println!("                               contention.");
+    println!("  System.Threading.Channels    yes - bounded and unbounded, all four");
+    println!("                               BoundedChannelFullMode values, completion,");
+    println!("                               ReadAllAsync and WaitToRead/WriteAsync.");
+    println!("                               Also C# in RustBCL, also lock-based.");
+    println!("  SemaphoreSlim                yes - Wait, WaitAsync with timeout and");
+    println!("                               cancellation, Release(n).");
+    println!("  ThreadLocal<T>,              yes. ThreadLocal keeps the value of a");
+    println!("  [ThreadStatic]               thread that has exited until it is");
+    println!("                               disposed.");
 
     println!("\nMemory and resources");
     println!("  IDisposable, using           yes");
@@ -1042,10 +1079,12 @@ Collections and LINQ");
     println!("                               underneath. Disposal runs after the body.");
     println!("  IAsyncEnumerable, await      yes - an async iterator runs, including");
     println!("  foreach                      yield break, an empty sequence, and break");
-    println!("                               out of the loop. Still no overlap: the body");
-    println!("                               runs to the next yield before MoveNextAsync");
-    println!("                               returns, so the sequence is produced eagerly");
-    println!("                               one element at a time rather than awaited.");
+    println!("                               out of the loop. An iterator whose body");
+    println!("                               awaits something pending SUSPENDS: its");
+    println!("                               MoveNextAsync is a pending ValueTask that");
+    println!("                               completes when the next element is ready,");
+    println!("                               which is what ChannelReader.ReadAllAsync");
+    println!("                               needs to wait for a writer.");
     println!("  Span<T>, Memory<T>           yes - over an array, a string, or");
     println!("                               stackalloc memory. Length, IsEmpty,");
     println!("                               indexing, Slice, CopyTo, ToArray, foreach,");

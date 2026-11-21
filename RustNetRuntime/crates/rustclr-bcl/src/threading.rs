@@ -33,6 +33,7 @@ pub fn register(interp: &mut Interpreter) {
     register_thread(interp);
     register_monitor(interp);
     register_interlocked(interp);
+    register_interlocked_rest(interp);
     register_volatile(interp);
     register_type(interp);
     register_operating_system(interp);
@@ -334,6 +335,117 @@ fn register_interlocked(interp: &mut Interpreter) {
             Ok(Some(Value::I32(previous)))
         })
     });
+}
+
+/// The rest of `Interlocked`: `long`, `double` and reference overloads,
+/// `CompareExchange`, `Read`, `And` and `Or`.
+///
+/// Keyed by arity, so they serve every overload the typed `int` keys above do
+/// not. Each works on whatever shape the slot holds — `I32`, `I64`, `F64`, a
+/// reference — because the slot's value already carries its type.
+fn register_interlocked_rest(interp: &mut Interpreter) {
+    const I: &str = "System.Threading.Interlocked::";
+    let k = |m: &str| -> &'static str { Box::leak(format!("{I}{m}").into_boxed_str()) };
+    interp.register_native(k("Increment/1"), |i, a| add_to(i, a, Value::I32(1)));
+    interp.register_native(k("Decrement/1"), |i, a| add_to(i, a, Value::I32(-1)));
+    interp.register_native(k("Add/2"), |i, a| {
+        let operand = arg(i, a, 1)?;
+        add_to(i, a, operand)
+    });
+    interp.register_native(k("Exchange/2"), |i, a| {
+        let slot = slot_of(a)?;
+        let replacement = arg(i, a, 1)?;
+        i.interlocked(|i| {
+            let previous = i.load_indirect_public(slot.clone())?;
+            i.store_indirect_public(slot, replacement)?;
+            Ok(Some(previous))
+        })
+    });
+    interp.register_native(k("CompareExchange/3"), |i, a| {
+        let slot = slot_of(a)?;
+        let replacement = arg(i, a, 1)?;
+        let comparand = arg(i, a, 2)?;
+        i.interlocked(|i| {
+            let current = i.load_indirect_public(slot.clone())?;
+            if same(&current, &comparand) {
+                i.store_indirect_public(slot, replacement)?;
+            }
+            Ok(Some(current))
+        })
+    });
+    interp.register_native(k("Read/1"), |i, a| {
+        let slot = slot_of(a)?;
+        i.interlocked(|i| Ok(Some(i.load_indirect_public(slot)?)))
+    });
+    interp.register_native(k("And/2"), |i, a| bitwise(i, a, false));
+    interp.register_native(k("Or/2"), |i, a| bitwise(i, a, true));
+    interp.register_native(k("MemoryBarrier()"), |_i, _a| Ok(None));
+}
+
+/// `Interlocked.And` / `Or`, which return the slot's *original* value.
+fn bitwise(interp: &mut Interpreter, args: &[Value], or: bool) -> ExecResult<Option<Value>> {
+    let slot = slot_of(args)?;
+    let operand = arg(interp, args, 1)?;
+    interp.interlocked(|i| {
+        let current = i.load_indirect_public(slot.clone())?;
+        let updated = match &current {
+            Value::I64(x) => {
+                let y = operand.as_i64().unwrap_or(0);
+                Value::I64(if or { x | y } else { x & y })
+            }
+            x => {
+                let (x, y) = (x.as_i32().unwrap_or(0), operand.as_i32().unwrap_or(0));
+                Value::I32(if or { x | y } else { x & y })
+            }
+        };
+        i.store_indirect_public(slot, updated)?;
+        Ok(Some(current))
+    })
+}
+
+fn slot_of(args: &[Value]) -> ExecResult<ByRef> {
+    match args.first() {
+        Some(Value::Ref(slot)) => Ok(slot.clone()),
+        _ => Err(ExecutionError::null_reference()),
+    }
+}
+
+/// `Interlocked.Add`/`Increment`/`Decrement` on an `int` or a `long` slot,
+/// returning the new value with the slot's own width.
+fn add_to(interp: &mut Interpreter, args: &[Value], operand: Value) -> ExecResult<Option<Value>> {
+    let slot = slot_of(args)?;
+    interp.interlocked(|i| {
+        let current = i.load_indirect_public(slot.clone())?;
+        let updated = match current {
+            Value::I64(x) => Value::I64(x.wrapping_add(operand.as_i64().unwrap_or(0))),
+            other => match operand {
+                // A `long` operand on a slot that was never written (null).
+                Value::I64(y) => Value::I64(other.as_i64().unwrap_or(0).wrapping_add(y)),
+                y => Value::I32(other.as_i32().unwrap_or(0).wrapping_add(y.as_i32().unwrap_or(0))),
+            },
+        };
+        i.store_indirect_public(slot, updated.clone())?;
+        Ok(Some(updated))
+    })
+}
+
+/// The comparison `CompareExchange` makes: numeric equality for numbers (by
+/// bits for floating point, as the hardware instruction compares), identity
+/// for references.
+fn same(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::I32(x), Value::I32(y)) => x == y,
+        (Value::I64(x), Value::I64(y)) => x == y,
+        (Value::F(x), Value::F(y)) => x.to_bits() == y.to_bits(),
+        (Value::Null, Value::Null) => true,
+        (Value::Null, Value::Obj(h)) | (Value::Obj(h), Value::Null) => h.is_null(),
+        (Value::Obj(x), Value::Obj(y)) => x == y,
+        // A slot never written holds null, which is the zero of every type.
+        (Value::Null, other) | (other, Value::Null) => {
+            other.as_i64() == Some(0) || matches!(other, Value::F(f) if *f == 0.0)
+        }
+        _ => false,
+    }
 }
 
 fn atomic_update(

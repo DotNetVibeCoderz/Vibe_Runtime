@@ -368,6 +368,9 @@ impl Interpreter {
                 self.push(Value::Ref(address));
             }
             Op::Ldsfld => {
+                // A static is shared, so what it holds may have been made on
+                // another thread; one atomic load when nothing has grown.
+                self.loader.catch_up();
                 let token = ins.operand.as_token().ok_or_else(|| self.bad_operand(ins))?;
                 let field = self.resolve_field(token)?;
                 let field = self.static_in_construction(field);
@@ -1323,7 +1326,16 @@ impl Interpreter {
         if let Some(outcome) = self.md_array_call(token)? {
             return Ok(outcome);
         }
-        let construction = self.constructed_owner(token);
+        // A call written inside a generic type to one of its own statics —
+        // `Box<T>.Check(k)` from `Box<T>.Add` — names `Box<!0>`, which only the
+        // calling frame can close. Loading bound it to a placeholder,
+        // `Box<object>`, so the callee boxed `!0` as nothing and `k == null`
+        // was true for `0`. The frame's answer comes first, the load-time
+        // one only for a reference that was closed already.
+        let construction = match self.frame_construction(token) {
+            Some(c) => Some(c),
+            None => self.constructed_owner(token),
+        };
         let call_site_args = self.call_site_type_arguments(token);
 
         let declared = self.resolve_method(token)?;
@@ -1657,20 +1669,14 @@ impl Interpreter {
     }
 
     /// `method` instantiated with `generic_args`, made once and remembered.
+    ///
+    /// Made by the loader, so it is logged like every other growth and every
+    /// thread's copy of the registry agrees on the id.
     fn instantiate_like(&mut self, method: MethodId, generic_args: &[TypeId]) -> MethodId {
         if generic_args.is_empty() || !self.loader.registry.method(method).generic_args.is_empty() {
             return method;
         }
-        if let Some(known) = self.virtual_instantiations.get(&method).and_then(|list| {
-            list.iter().find(|(args, _)| args.as_slice() == generic_args).map(|(_, id)| *id)
-        }) {
-            return known;
-        }
-        let mut clone = self.loader.registry.method(method).clone();
-        clone.generic_args = generic_args.to_vec();
-        let id = self.loader.registry.add_method(clone);
-        self.virtual_instantiations.entry(method).or_default().push((generic_args.to_vec(), id));
-        id
+        self.loader.instantiate_method(method, generic_args)
     }
 
     /// Whether `ctor` can be skipped entirely, remembered after the first ask.
@@ -1742,8 +1748,7 @@ impl Interpreter {
                 }
             };
             let receiver = args.first().and_then(|v| v.as_handle()).unwrap_or(Handle::NULL);
-            self.stats.allocations += 1;
-            let h = self.heap.alloc(ClrDelegate {
+            let h = self.alloc_counted(type_id, ClrDelegate {
                 type_id,
                 targets: vec![DelegateTarget { receiver, method }],
             });
@@ -1769,8 +1774,7 @@ impl Interpreter {
                     let object_type = self.loader.core().object;
                     let mut cell = ClrObject::new(object_type, 1);
                     cell.fields[0] = zero;
-                    self.stats.allocations += 1;
-                    self.heap.alloc(cell)
+                    self.alloc_clr_object(cell)
                 }
             };
 
@@ -1977,8 +1981,7 @@ impl Interpreter {
             .registry
             .find_sz_array(element_type)
             .unwrap_or_else(|| self.loader.core().array);
-        self.stats.allocations += 1;
-        self.heap.alloc(ClrArray {
+        self.alloc_counted_array(ClrArray {
             array_type,
             element_type,
             storage: ArrayStorage::U8(vec![0u8; size]),

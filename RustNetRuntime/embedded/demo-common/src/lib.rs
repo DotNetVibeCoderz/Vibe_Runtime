@@ -81,8 +81,13 @@ pub const FULL_BCL_BYTES: usize = 640_000;
 /// `MathF` and the `float` overloads of `Math` joined the numerics every tier
 /// has: the extra bindings tip the host's binding `HashMap` over a capacity
 /// step (as the regex bindings did for the full tier); a chip's `BTreeMap`
-/// pays only for the entries.
-pub const MINIMAL_BCL_BYTES: usize = 288_500;
+/// pays only for the entries. Raised to 289,100 (measured 289,073) when
+/// `KeyNotFoundException`, `TimeoutException` and `ObjectDisposedException`
+/// became types every tier registers, so they can be caught, and the loader
+/// gained the log that keeps per-thread copies identical. Their constructors'
+/// bindings live in the full tier, which is the one that throws them; they
+/// had cost the console subset another 790 bytes.
+pub const MINIMAL_BCL_BYTES: usize = 289_100;
 
 /// What a board's memory budget allows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

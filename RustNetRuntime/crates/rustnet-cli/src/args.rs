@@ -28,6 +28,8 @@ pub enum Command {
         board: Option<String>,
         /// Write the board's screen to this path as a PNG when the run ends.
         capture_display: Option<String>,
+        /// The task pool's scheduling policy: `stealing` (default) or `fifo`.
+        scheduler: rustclr_core::SchedulerKind,
     },
     /// Serve RNDP over TCP as a virtual device.
     Serve {
@@ -105,11 +107,20 @@ pub fn parse(argv: &[String]) -> Result<Command, ParseError> {
             let mut minimal_bcl = false;
             let mut board = None;
             let mut capture_display = None;
+            let mut scheduler = rustclr_core::SchedulerKind::default();
             let mut rest = argv[1..].iter();
 
             while let Some(a) = rest.next() {
                 match a.as_str() {
                     "--stats" => stats = true,
+                    "--scheduler" => {
+                        let v = rest.next().ok_or_else(|| {
+                            ParseError("--scheduler needs `stealing` or `fifo`".into())
+                        })?;
+                        scheduler = rustclr_core::SchedulerKind::parse(v).ok_or_else(|| {
+                            ParseError(format!("--scheduler takes `stealing` or `fifo`, not `{v}`"))
+                        })?;
+                    }
                     "--trace" => trace = true,
                     "--no-jit" => jit = false,
                     "--no-inline" => inline = false,
@@ -178,6 +189,7 @@ pub fn parse(argv: &[String]) -> Result<Command, ParseError> {
                 minimal_bcl,
                 board,
                 capture_display,
+                scheduler,
             })
         }
 

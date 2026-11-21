@@ -235,6 +235,10 @@ impl Mutators {
         // reproducible; a single collection never shows it.
         while state.stopping || state.parked > 0 {
             if state.stopping {
+                // Parked is "stopped, with roots published", like `poll`. A
+                // would-be collector that parked without its roots let the
+                // collection it deferred to sweep everything this thread held.
+                state.roots.extend(own_roots.iter().copied());
                 let waiting_for = state.epoch;
                 state.parked += 1;
                 self.inner.parked.notify_all();
@@ -307,6 +311,15 @@ impl Mutators {
         state.blocked += 1;
         state.next_blocked_id = state.next_blocked_id.wrapping_add(1).max(1);
         let id = state.next_blocked_id;
+        // A collection already under way copied `blocked_roots` when it
+        // started, and counts this thread as stopped from here on. Roots
+        // handed over only to the list would be in neither place, and every
+        // object this thread holds would be swept — an `await`'s boxed state
+        // machine, the string a caller had on its stack. So they are
+        // published to the running collection too.
+        if state.stopping {
+            state.roots.extend(roots.iter().copied());
+        }
         state.blocked_roots.push((id, roots));
         // A collector may already be waiting for this thread. It will not park
         // now, so wake the collector to re-check against the blocked count.
@@ -604,6 +617,79 @@ mod tests {
             out
         });
         assert!(!after.contains(&kept), "and are gone once it returns");
+    }
+
+    /// Waits, without a timeout, until a collection is under way.
+    fn until_stopping(mutators: &Mutators) {
+        while !mutators.stopping() {
+            std::thread::yield_now();
+        }
+    }
+
+    fn roots_seen(all: &AllRoots) -> Vec<Handle> {
+        let mut out = Vec::new();
+        all.collect_roots(&mut out);
+        out
+    }
+
+    /// A thread that blocks *after* a collection has started.
+    ///
+    /// The collector copies `blocked_roots` once, when it starts, and from
+    /// then on counts a newly blocked thread as stopped. Roots handed only to
+    /// the list were therefore in neither place, and were swept: under a
+    /// channel ping-pong this surfaced as "Field 'waiter' was not found", a
+    /// `NullReferenceException`, and a string that lost its prefix.
+    #[test]
+    fn a_thread_that_blocks_during_a_collection_still_owns_its_roots() {
+        let mutators = Mutators::default();
+        let _mine = mutators.register();
+        let kept = Handle::from_bits(0x0000_0002_0000_0011);
+
+        let other = mutators.clone();
+        let thread = std::thread::spawn(move || {
+            let _registration = other.register();
+            until_stopping(&other);
+            let guard = other.blocked_with(alloc::vec![kept]);
+            // Held until the collection is over, as a real blocking wait is.
+            while other.stopping() {
+                std::thread::yield_now();
+            }
+            drop(guard);
+        });
+        // Not before the thread registers, or the collector would not wait.
+        while mutators.registered() < 2 {
+            std::thread::yield_now();
+        }
+
+        let seen = mutators.stop_the_world(Vec::new(), roots_seen);
+        thread.join().unwrap();
+        assert!(seen.contains(&kept), "roots of a thread that blocked mid-collection were seen");
+    }
+
+    /// A second would-be collector parks behind the first, and parking is
+    /// "stopped, with roots published" — for it as for any thread at a poll.
+    #[test]
+    fn a_deferring_collector_still_owns_its_roots() {
+        let mutators = Mutators::default();
+        let mine = mutators.register();
+        let kept = Handle::from_bits(0x0000_0003_0000_0013);
+
+        let other = mutators.clone();
+        let thread = std::thread::spawn(move || {
+            let _registration = other.register();
+            until_stopping(&other);
+            // Defers to the collection in progress, then runs its own.
+            other.stop_the_world(alloc::vec![kept], |_| ());
+        });
+        while mutators.registered() < 2 {
+            std::thread::yield_now();
+        }
+
+        let seen = mutators.stop_the_world(Vec::new(), roots_seen);
+        // Out of the way, so the other thread's own collection can finish.
+        drop(mine);
+        thread.join().unwrap();
+        assert!(seen.contains(&kept), "a deferring collector's roots were seen");
     }
 }
 

@@ -51,11 +51,18 @@ type Cell = core::cell::RefCell<Heap>;
 #[derive(Clone)]
 pub struct SharedHeap {
     inner: Arc<Cell>,
+    /// Lock acquisitions that found the heap already held.
+    #[cfg(feature = "threads")]
+    contended: Arc<core::sync::atomic::AtomicUsize>,
 }
 
 impl SharedHeap {
     pub fn new(heap: Heap) -> Self {
-        Self { inner: Arc::new(Cell::new(heap)) }
+        Self {
+            inner: Arc::new(Cell::new(heap)),
+            #[cfg(feature = "threads")]
+            contended: Arc::new(core::sync::atomic::AtomicUsize::new(0)),
+        }
     }
 
     /// Runs `f` with the heap locked.
@@ -68,7 +75,18 @@ impl SharedHeap {
         // A poisoned heap means another thread panicked mid-mutation. There is
         // no recovery from a half-updated object graph, so this propagates
         // rather than pretending the heap is usable.
-        let mut heap = self.inner.lock().expect("the managed heap is poisoned");
+        let mut heap = match self.inner.try_lock() {
+            Ok(heap) => heap,
+            // Contended: counted, then waited for. The count is the pool's
+            // signal that more threads are only queueing here — see
+            // `contended_acquisitions`. Counting only on this path keeps the
+            // uncontended lock, which is nearly every one, exactly as cheap as
+            // before.
+            Err(_) => {
+                self.contended.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                self.inner.lock().expect("the managed heap is poisoned")
+            }
+        };
         f(&mut heap)
     }
 
@@ -78,11 +96,29 @@ impl SharedHeap {
     }
 
     pub fn alloc<T: GcObject>(&self, object: T) -> Handle {
+        count_on_this_thread();
         self.locked(|h| h.alloc(object))
     }
 
     pub fn try_alloc<T: GcObject>(&self, object: T) -> Option<Handle> {
-        self.locked(|h| h.try_alloc(object))
+        let handle = self.locked(|h| h.try_alloc(object));
+        if handle.is_some() {
+            count_on_this_thread();
+        }
+        handle
+    }
+
+    /// Allocations the calling OS thread has made, through any heap.
+    ///
+    /// `stats()` is the heap's total, every thread together. The profiler
+    /// watches one interpreter, so comparing it against the total says nothing
+    /// once a program starts threads — a fixture with four workers updating a
+    /// dictionary showed 87% "attributed" with no allocation site missed.
+    /// Host builds only: a board has one thread, where the total is the same
+    /// number.
+    #[cfg(feature = "std")]
+    pub fn allocations_on_this_thread() -> u64 {
+        THREAD_ALLOCATIONS.with(|c| c.get())
     }
 
     /// Reads an object, if the handle names a live one of that type.
@@ -117,6 +153,55 @@ impl SharedHeap {
 
     pub fn unpin(&self, handle: Handle) -> bool {
         self.locked(|h| h.unpin(handle))
+    }
+
+    /// Pins several handles under one lock. A queued job pins what it will
+    /// need, and taking the lock once per handle was a measurable share of
+    /// starting a task.
+    pub fn pin_all(&self, handles: &[Handle]) {
+        self.locked(|h| {
+            for handle in handles {
+                h.pin(*handle);
+            }
+        })
+    }
+
+    pub fn unpin_all(&self, handles: &[Handle]) {
+        self.locked(|h| {
+            for handle in handles {
+                h.unpin(*handle);
+            }
+        })
+    }
+
+    /// Runs `f` with the heap locked, for an update that spans several
+    /// objects and must be seen whole.
+    ///
+    /// The narrow exception to `locked` being private, and the rules that make
+    /// it safe are the caller's: `f` must be short, must not allocate (an
+    /// allocation here bypasses the interpreter's counting), and must not
+    /// reach this heap through any other handle to it — the lock is not
+    /// re-entrant, and doing so deadlocks.
+    ///
+    /// What it is for: a task's "is it still pending? then add me to its
+    /// waiting list" and "mark it finished and take the list". Each touches
+    /// the task and its list, and doing them under a separate monitor plus
+    /// one heap lock per field read was most of what completing a task cost.
+    pub fn atomically<R>(&self, f: impl FnOnce(&mut Heap) -> R) -> R {
+        self.locked(f)
+    }
+
+    /// How many times a thread found the heap locked and had to wait.
+    ///
+    /// Every field read and write takes this lock, so it is where threads
+    /// running managed code meet. A count rising faster than work completes
+    /// says the threads are mostly queueing for the heap, and the task pool
+    /// reads it to decide how many workers to keep running: measured on a
+    /// fan-out of a million tasks, one worker finished in 6.1 s and eight in
+    /// 15.5 s.
+    #[cfg(feature = "threads")]
+    pub fn contended_acquisitions(&self) -> usize {
+        self.contended.load(core::sync::atomic::Ordering::Relaxed)
     }
 
     /// Swaps the collection policy, returning the previous one.
@@ -258,3 +343,15 @@ mod tests {
         }
     }
 }
+
+#[cfg(feature = "std")]
+std::thread_local! {
+    static THREAD_ALLOCATIONS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+#[inline]
+fn count_on_this_thread() {
+    #[cfg(feature = "std")]
+    THREAD_ALLOCATIONS.with(|c| c.set(c.get() + 1));
+}
+

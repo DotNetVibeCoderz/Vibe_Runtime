@@ -80,6 +80,7 @@ fn run() -> ExitCode {
             minimal_bcl,
             board,
             capture_display,
+            scheduler,
         } => commands::run(
             &assembly,
             args,
@@ -92,6 +93,7 @@ fn run() -> ExitCode {
             minimal_bcl,
             board.as_deref(),
             capture_display.as_deref(),
+            scheduler,
         ),
         Command::Serve { address, image } => serve::serve(&address, image.as_deref()),
         Command::Info { assembly, verbose } => commands::info(&assembly, verbose),

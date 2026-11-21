@@ -213,6 +213,19 @@ pub struct Loader {
     /// `Counter.Total`; everything else in a loader is settled by the time
     /// anything runs.
     statics: SharedStatics,
+    /// Fields marked `[ThreadStatic]`, by `FieldId` index, each with the value
+    /// a thread sees before it writes one.
+    ///
+    /// Settled at load like the rest of the registry, so every loader copy
+    /// agrees on which fields these are.
+    thread_static_defaults: HashMap<u32, Value>,
+    /// *This* thread's values for them.
+    ///
+    /// The one piece of a loader that is neither shared nor copied: a worker
+    /// starts with this empty, which is what makes `[ThreadStatic]` mean what
+    /// it says. A `RefCell` because static reads take `&self`, and a loader is
+    /// only ever used by the thread that owns it.
+    thread_values: core::cell::RefCell<HashMap<u32, Value>>,
     /// Internal-call stubs synthesised for interface dispatch onto native
     /// types, keyed by the receiver type and the native binding name.
     interned_calls: HashMap<(TypeId, String), MethodId>,
@@ -223,6 +236,71 @@ pub struct Loader {
     generic_constructions: HashMap<TypeId, Vec<(Vec<TypeId>, TypeId)>>,
     /// `T[]` as reflection names it, one per element type. See `array_type_of`.
     array_types: HashMap<TypeId, TypeId>,
+    /// Framework assemblies written in C#, offered but not yet loaded.
+    ///
+    /// See [`Loader::offer_framework_assembly`]. An offer is loaded the first
+    /// time an assembly being loaded names one of its types, and only then:
+    /// a loaded assembly's types are all registered whether used or not, so
+    /// loading every offer up front would make every program carry them.
+    framework_offers: Vec<FrameworkOffer>,
+    /// Generic method instantiations made at run time — a virtual call that
+    /// lands on an override with the caller's method type arguments.
+    method_instantiations: HashMap<MethodId, Vec<(Vec<TypeId>, MethodId)>>,
+    /// The growth every copy of this loader agrees on. See [`GrowthLog`].
+    #[cfg(feature = "threads")]
+    growth: rustclr_thread::sync::Arc<GrowthLog>,
+    /// How many of the log's events this copy has applied.
+    #[cfg(feature = "threads")]
+    applied: usize,
+    /// Methods this copy added by applying logged growth, for
+    /// `Interpreter::diverged`, which looks for growth that bypassed the log.
+    logged_methods: usize,
+}
+
+/// One way the registry grows after loading.
+///
+/// Each is a call to an idempotent function behind a cache, so applying an
+/// event that already happened changes nothing, and applying the same events
+/// in the same order to two identical registries leaves them identical.
+#[derive(Clone)]
+enum Growth {
+    Construct { open: TypeId, args: Vec<TypeId> },
+    ArrayOf(TypeId),
+    Intern { type_id: TypeId, name: String, signature: MethodSig, qualified_name: String },
+    Instantiate { method: MethodId, args: Vec<TypeId> },
+}
+
+/// Registry growth, shared by every copy of one loader.
+///
+/// A thread gets a *copy* of the loader so that reading the registry — which
+/// happens on nearly every instruction — takes no lock. That only works while
+/// the copies are identical, and they stop being identical the moment one
+/// thread meets a generic construction the others have not: `Dictionary<int,
+/// int>` inside a concurrent collection is made lazily, by whichever thread
+/// calls into it first, and two threads doing that independently hand out the
+/// same `TypeId` for different types.
+///
+/// So growth is serialised here instead. A thread that needs to grow takes the
+/// lock, first applies every event other threads logged since it last looked,
+/// then applies its own and logs it if the registry actually grew. Every copy
+/// therefore applies the same events in the same order and stays identical.
+/// A thread that is merely behind catches up at the points where another
+/// thread's objects can reach it — taking a lock, an interlocked operation, a
+/// static read, starting a pool job — which is a check of one atomic counter.
+#[cfg(feature = "threads")]
+#[derive(Default)]
+struct GrowthLog {
+    events: rustclr_thread::sync::Mutex<Vec<Growth>>,
+    published: core::sync::atomic::AtomicUsize,
+}
+
+/// A framework assembly the loader can pull in on demand.
+#[derive(Clone)]
+struct FrameworkOffer {
+    /// The image's bytes; taken when it is loaded, so it loads once.
+    bytes: Option<&'static [u8]>,
+    /// Full names of the types it defines.
+    types: Vec<String>,
 }
 
 impl Loader {
@@ -252,9 +330,18 @@ impl Loader {
             },
             bcl: AssemblyId(0),
             statics: SharedStatics::default(),
+            thread_static_defaults: HashMap::new(),
+            thread_values: core::cell::RefCell::new(HashMap::new()),
             interned_calls: HashMap::new(),
             generic_constructions: HashMap::new(),
             array_types: HashMap::new(),
+            framework_offers: Vec::new(),
+            method_instantiations: HashMap::new(),
+            #[cfg(feature = "threads")]
+            growth: Default::default(),
+            #[cfg(feature = "threads")]
+            applied: 0,
+            logged_methods: 0,
         };
         loader.install_core_types();
         loader
@@ -353,6 +440,18 @@ impl Loader {
     /// behind a lock and nothing may hold a reference into it. That is the same
     /// bargain [`crate::gc::SharedHeap`] makes, for the same reason.
     pub fn static_value(&self, field: FieldId) -> Value {
+        // One emptiness check when no field is `[ThreadStatic]`, which is
+        // nearly every program.
+        if !self.thread_static_defaults.is_empty() {
+            if let Some(default) = self.thread_static_defaults.get(&(field.index() as u32)) {
+                return self
+                    .thread_values
+                    .borrow()
+                    .get(&(field.index() as u32))
+                    .cloned()
+                    .unwrap_or_else(|| default.clone());
+            }
+        }
         self.statics
             .lock()
             .get(field.index())
@@ -362,6 +461,12 @@ impl Loader {
 
     /// Writes a static field. `&self`, because the storage is shared.
     pub fn set_static(&self, field: FieldId, value: Value) {
+        if !self.thread_static_defaults.is_empty()
+            && self.thread_static_defaults.contains_key(&(field.index() as u32))
+        {
+            self.thread_values.borrow_mut().insert(field.index() as u32, value);
+            return;
+        }
         let mut statics = self.statics.lock();
         if statics.len() <= field.index() {
             statics.resize(field.index() + 1, Value::Null);
@@ -374,6 +479,19 @@ impl Loader {
         for v in self.statics.lock().iter() {
             v.trace_handles(out);
         }
+        // This thread's `[ThreadStatic]` values. Every thread hands in its own
+        // roots, so each one's values are traced by the thread that owns them.
+        for v in self.thread_values.borrow().values() {
+            v.trace_handles(out);
+        }
+        for v in self.thread_static_defaults.values() {
+            v.trace_handles(out);
+        }
+    }
+
+    /// Whether a static field has one value per thread.
+    pub fn is_thread_static(&self, field: FieldId) -> bool {
+        self.thread_static_defaults.contains_key(&(field.index() as u32))
     }
 
     fn ensure_static_slot(&mut self, field: FieldId) {
@@ -553,6 +671,22 @@ impl Loader {
         }
         let system_exception = exceptions.iter().find(|(n, _)| *n == "SystemException").map(|(_, id)| *id).unwrap_or(exception);
         self.add_native_type("System.IO", "IOException", TypeKind::Class, Some(system_exception), synth());
+        // `catch (KeyNotFoundException)` around a dictionary read is ordinary
+        // code, and it only catches if the type exists under its real name.
+        self.add_native_type(
+            "System.Collections.Generic",
+            "KeyNotFoundException",
+            TypeKind::Class,
+            Some(system_exception),
+            synth(),
+        );
+        self.add_native_type("System", "TimeoutException", TypeKind::Class, Some(system_exception), synth());
+        let invalid_operation = exceptions
+            .iter()
+            .find(|(n, _)| *n == "InvalidOperationException")
+            .map(|(_, id)| *id)
+            .unwrap_or(exception);
+        self.add_native_type("System", "ObjectDisposedException", TypeKind::Class, Some(invalid_operation), synth());
 
         // Non-generic framework delegates. `new Thread(() => …)` allocates a
         // `ThreadStart` first, so the delegate type has to resolve before the
@@ -982,8 +1116,10 @@ impl Loader {
         // managed array so a suspended state machine stays reachable to the
         // collector for exactly as long as the task that will resume it.
         // `_thread` holds the id of the OS thread running a `Task.Run` body, so
-        // anything observing the task can wait for it.
-        let task_fields = &["_status", "_result", "_exception", "_continuations", "_thread"];
+        // anything observing the task can wait for it. `_options` holds the
+        // `TaskCreationOptions` a completion source was made with, of which
+        // the runtime acts on `RunContinuationsAsynchronously`.
+        let task_fields = &["_status", "_result", "_exception", "_continuations", "_thread", "_options"];
         let task = self.add_native_type_with_fields_of_kind(
             TASKS,
             "Task",
@@ -1042,16 +1178,17 @@ impl Loader {
             self.add_native_type(SOURCES, name, TypeKind::Enum, Some(value_type), synth());
         }
 
-        // The promise behind one `MoveNextAsync`. Its two slots hold the
-        // result and whether it has been set; nothing here needs a version,
-        // because a synchronous runtime never reuses one before it is read.
+        // The promise behind one `MoveNextAsync`: the result (or exception),
+        // its state (pending, succeeded, faulted), and whoever is waiting for
+        // it. An iterator awaiting something slow is genuinely pending when
+        // its consumer asks, so the waiters are what resume that consumer.
         let promise = self.add_native_type_with_fields_of_kind(
             SOURCES,
             "ManualResetValueTaskSourceCore`1",
             TypeKind::ValueType,
             Some(value_type),
             synth(),
-            &["_result", "_hasResult"],
+            &["_result", "_hasResult", "_waiters"],
             self.bcl,
         );
         self.registry.ty_mut(promise).generic_param_count = 1;
@@ -1473,6 +1610,9 @@ impl Loader {
         if let Some(existing) = self.by_name.get(&name) {
             return Ok(*existing);
         }
+        // Before anything is numbered: an offer this image needs is loaded
+        // first, so its types are registered when the `TypeRef`s bind.
+        self.load_offers_named_by(&image)?;
 
         let id = AssemblyId(self.assemblies.len() as u32);
         let md = image.metadata();
@@ -2248,6 +2388,27 @@ impl Loader {
                 }
                 _ => None,
             };
+            // `[ThreadStatic]` changes where a field lives, so it is acted on
+            // here rather than kept for reflection. Matched by the attribute
+            // type's *name*: it is a framework type, and its constructor may
+            // not resolve to anything this runtime registered.
+            if ca.parent.table() == Some(TableId::Field)
+                && attribute_type_name(&md, ca.constructor).as_deref() == Some("System.ThreadStaticAttribute")
+            {
+                if let Some(&field_id) = assembly.field_by_row.get(&ca.parent.row()) {
+                    if self.registry.field(field_id).is_static {
+                        // A typed zero, not null: a thread that has not
+                        // written `[ThreadStatic] static int n` reads `0`.
+                        // (Ordinary statics are zeroed where they are read;
+                        // this default is returned as it is.)
+                        let initial = match self.static_value(field_id) {
+                            Value::Null => self.zero_for(&self.registry.field(field_id).signature),
+                            v => v,
+                        };
+                        self.thread_static_defaults.insert(field_id.index() as u32, initial);
+                    }
+                }
+            }
             let Some(constructor) = constructor else { continue };
             assembly
                 .attributes
@@ -2405,27 +2566,90 @@ impl Loader {
         sig: &MethodSig,
         from: &LoadedAssembly,
     ) -> Option<MethodId> {
-        for id in self.registry.base_chain(ty) {
-            for m in &self.registry.ty(id).methods {
-                let info = self.registry.method(*m);
-                if info.name != name {
-                    continue;
-                }
-                // A natively-registered framework method has no tables, so
-                // there is nothing to resolve its signature against and the
-                // structural comparison is already the right one.
-                let matched = match self.assembly_opt(info.assembly) {
-                    Some(defined_in) => {
-                        self.signatures_match_across(&info.signature, defined_in, sig, from)
+        // Exact first, then lenient. A `MemberRef` names a member of a generic
+        // type in the definition's own terms — `!1` is "the second type
+        // parameter" on both sides — so a parameter matching only the same
+        // parameter is the precise test. Treating `!1` as a wildcard instead
+        // made `GetOrAdd(!0, !1)` bind to `GetOrAdd(!0, Func<!0, !1>)`, the
+        // first overload declared. The lenient pass is kept for whatever the
+        // exact one cannot place, so this only ever picks a better overload.
+        for exact in [true, false] {
+            for id in self.registry.base_chain(ty) {
+                for m in &self.registry.ty(id).methods {
+                    let info = self.registry.method(*m);
+                    if info.name != name {
+                        continue;
                     }
-                    None => signatures_match(&info.signature, sig),
-                };
-                if matched {
-                    return Some(*m);
+                    // A natively-registered framework method has no tables, so
+                    // there is nothing to resolve its signature against and the
+                    // structural comparison is already the right one.
+                    let matched = match self.assembly_opt(info.assembly) {
+                        Some(defined_in) if exact => {
+                            self.signatures_match_exactly(&info.signature, defined_in, sig, from)
+                        }
+                        Some(defined_in) => {
+                            self.signatures_match_across(&info.signature, defined_in, sig, from)
+                        }
+                        None => signatures_match(&info.signature, sig),
+                    };
+                    if matched {
+                        return Some(*m);
+                    }
                 }
             }
         }
         None
+    }
+
+    /// [`Self::signatures_match_across`] with generic parameters compared by
+    /// position rather than matching anything.
+    fn signatures_match_exactly(
+        &self,
+        a: &MethodSig,
+        a_from: &LoadedAssembly,
+        b: &MethodSig,
+        b_from: &LoadedAssembly,
+    ) -> bool {
+        if a.params.len() != b.params.len() || a.has_this != b.has_this || a.generic_param_count != b.generic_param_count {
+            return false;
+        }
+        a.params.iter().zip(&b.params).all(|(x, y)| {
+            self.type_sigs_match_exactly(x.unwrap_modifiers(), a_from, y.unwrap_modifiers(), b_from)
+        })
+    }
+
+    fn type_sigs_match_exactly(
+        &self,
+        a: &TypeSig,
+        a_from: &LoadedAssembly,
+        b: &TypeSig,
+        b_from: &LoadedAssembly,
+    ) -> bool {
+        use TypeSig::*;
+        match (a, b) {
+            (Var(x), Var(y)) | (MVar(x), MVar(y)) => x == y,
+            (Var(_) | MVar(_), _) | (_, Var(_) | MVar(_)) => false,
+            (
+                GenericInst { definition: d1, args: a1, .. },
+                GenericInst { definition: d2, args: a2, .. },
+            ) => {
+                let same_definition = match (
+                    self.resolve_type_token(a_from, *d1),
+                    self.resolve_type_token(b_from, *d2),
+                ) {
+                    (Some(x), Some(y)) => x == y,
+                    _ => d1 == d2,
+                };
+                same_definition
+                    && a1.len() == a2.len()
+                    && a1.iter().zip(a2).all(|(x, y)| {
+                        self.type_sigs_match_exactly(x.unwrap_modifiers(), a_from, y.unwrap_modifiers(), b_from)
+                    })
+            }
+            (SzArray(x), SzArray(y)) | (ByRef(x), ByRef(y)) | (Ptr(x), Ptr(y)) => self
+                .type_sigs_match_exactly(x.unwrap_modifiers(), a_from, y.unwrap_modifiers(), b_from),
+            _ => self.type_sigs_match_across(a, a_from, b, b_from),
+        }
     }
 
     /// [`signatures_match`], with each side's type tokens resolved first.
@@ -2698,11 +2922,119 @@ impl Loader {
     /// by a `TypeSpec` at load time, cache included, so `MakeGenericType` and
     /// `typeof` agree by reference.
     pub fn construct_generic(&mut self, open: TypeId, args: &[TypeId]) -> TypeId {
-        if let Some(existing) = self
-            .generic_constructions
+        if let Some(existing) = self.existing_construction(open, args) {
+            return existing;
+        }
+        self.grow(Growth::Construct { open, args: args.to_vec() })
+    }
+
+    fn existing_construction(&self, open: TypeId, args: &[TypeId]) -> Option<TypeId> {
+        self.generic_constructions
             .get(&open)
             .and_then(|list| list.iter().find(|(a, _)| a.as_slice() == args).map(|(_, id)| *id))
+    }
+
+    /// `method` with its method type arguments filled in, made once.
+    pub fn instantiate_method(&mut self, method: MethodId, args: &[TypeId]) -> MethodId {
+        if let Some(known) = self.existing_instantiation(method, args) {
+            return known;
+        }
+        MethodId(self.grow(Growth::Instantiate { method, args: args.to_vec() }).index() as u32)
+    }
+
+    fn existing_instantiation(&self, method: MethodId, args: &[TypeId]) -> Option<MethodId> {
+        self.method_instantiations
+            .get(&method)
+            .and_then(|list| list.iter().find(|(a, _)| a.as_slice() == args).map(|(_, id)| *id))
+    }
+
+    /// Applies one growth event, logging it if the registry grew.
+    ///
+    /// Returns the id the event produced; a method id travels as a `TypeId`
+    /// holding the same index and is unwrapped by the caller.
+    fn grow(&mut self, event: Growth) -> TypeId {
+        #[cfg(feature = "threads")]
         {
+            let log = self.growth.clone();
+            let mut events = log.events.lock().expect("the growth log is poisoned");
+            self.replay(&events);
+            let before = self.registry_size();
+            let out = self.apply(&event);
+            if self.registry_size() != before {
+                events.push(event);
+                self.applied = events.len();
+                log.published.store(events.len(), core::sync::atomic::Ordering::Release);
+            }
+            out
+        }
+        #[cfg(not(feature = "threads"))]
+        {
+            self.apply(&event)
+        }
+    }
+
+    /// Applies the events other threads logged that this copy has not.
+    #[cfg(feature = "threads")]
+    fn replay(&mut self, events: &[Growth]) {
+        while self.applied < events.len() {
+            let event = events[self.applied].clone();
+            self.apply(&event);
+            self.applied += 1;
+        }
+    }
+
+    /// Brings this copy up to date with growth on other threads.
+    ///
+    /// One atomic load when nothing has grown, which is nearly always.
+    pub fn catch_up(&mut self) {
+        #[cfg(feature = "threads")]
+        if self.growth.published.load(core::sync::atomic::Ordering::Acquire) != self.applied {
+            let log = self.growth.clone();
+            let events = log.events.lock().expect("the growth log is poisoned");
+            self.replay(&events);
+        }
+    }
+
+    /// Methods added by applying logged growth. See `Interpreter::diverged`.
+    pub fn logged_method_count(&self) -> usize {
+        self.logged_methods
+    }
+
+    fn registry_size(&self) -> (usize, usize, usize) {
+        (self.registry.type_count(), self.registry.method_count(), self.registry.field_count())
+    }
+
+    fn apply(&mut self, event: &Growth) -> TypeId {
+        let methods = self.registry.method_count();
+        let out = match event {
+            Growth::Construct { open, args } => self.construct_generic_now(*open, args),
+            Growth::ArrayOf(element) => self.array_type_now(*element),
+            Growth::Intern { type_id, name, signature, qualified_name } => {
+                let id = self.intern_internal_call_now(*type_id, name, signature.clone(), qualified_name.clone());
+                TypeId(id.index() as u32)
+            }
+            Growth::Instantiate { method, args } => {
+                let id = self.instantiate_method_now(*method, args);
+                TypeId(id.index() as u32)
+            }
+        };
+        self.logged_methods += self.registry.method_count() - methods;
+        out
+    }
+
+    fn instantiate_method_now(&mut self, method: MethodId, args: &[TypeId]) -> MethodId {
+        if let Some(known) = self.existing_instantiation(method, args) {
+            return known;
+        }
+        let mut clone = self.registry.method(method).clone();
+        clone.generic_args = args.to_vec();
+        let id = self.registry.add_method(clone);
+        self.method_instantiations.entry(method).or_default().push((args.to_vec(), id));
+        id
+    }
+
+    fn construct_generic_now(&mut self, open: TypeId, args: &[TypeId]) -> TypeId {
+        if let Some(existing) = self.existing_construction(open, args) {
             return existing;
         }
 
@@ -2724,6 +3056,9 @@ impl Loader {
             let info = self.registry.field(field).clone();
             let cloned = self.registry.add_constructed_field(info);
             self.ensure_static_slot(cloned);
+            if let Some(default) = self.thread_static_defaults.get(&(field.index() as u32)).cloned() {
+                self.thread_static_defaults.insert(cloned.index() as u32, default);
+            }
             statics.push(cloned);
         }
         constructed.static_fields = statics;
@@ -2743,6 +3078,13 @@ impl Loader {
     /// does: it reads `PropertyType` to learn what to build. It is not
     /// registered by name, so it shadows nothing.
     pub fn array_type_of(&mut self, element: TypeId) -> TypeId {
+        if let Some(existing) = self.array_types.get(&element) {
+            return *existing;
+        }
+        self.grow(Growth::ArrayOf(element))
+    }
+
+    fn array_type_now(&mut self, element: TypeId) -> TypeId {
         if let Some(existing) = self.array_types.get(&element) {
             return *existing;
         }
@@ -2888,6 +3230,80 @@ impl Loader {
         })
     }
 
+    /// Offers a framework assembly written in C#.
+    ///
+    /// Most of the framework is native — RustBCL binds a `MemberRef` to a Rust
+    /// function by name. Some of it is far easier to get right as ordinary
+    /// managed code over the primitives that *are* native (`Monitor`,
+    /// `Interlocked`, `Task`): `System.Collections.Concurrent` and
+    /// `System.Threading.Channels` are written that way. Such an assembly
+    /// defines types under their real framework names, and a program's
+    /// `TypeRef` binds to them by name exactly as it binds to a native type.
+    ///
+    /// It is loaded only when an assembly being loaded names one of its types,
+    /// so a program that never mentions a channel never carries one.
+    ///
+    /// A type the runtime already supplies natively is refused rather than
+    /// shadowed. Two definitions of one name would bind a program's reference
+    /// to one and the offer's own code to the other — the same type, twice,
+    /// with `catch` and casts disagreeing about which is which.
+    pub fn offer_framework_assembly(&mut self, bytes: &'static [u8]) -> ExecResult<()> {
+        let image = Image::from_bytes(bytes.to_vec()).map_err(ExecutionError::Metadata)?;
+        let md = image.metadata();
+        let mut types = Vec::new();
+        for row in 1..=md.row_count(TableId::TypeDef) {
+            let td = md.type_def(row).map_err(ExecutionError::Metadata)?;
+            // Nested types are reached through their outer type, and `<Module>`
+            // and compiler-generated types have no namespace a program names.
+            if td.namespace.is_empty() {
+                continue;
+            }
+            let full = format!("{}.{}", td.namespace, td.name);
+            if self.registry.find_type_by_name(&full).is_some() {
+                return Err(ExecutionError::InvalidProgram(format!(
+                    "the framework assembly {} defines {full}, which this runtime already supplies natively",
+                    image.assembly_name()
+                )));
+            }
+            types.push(full);
+        }
+        self.framework_offers.push(FrameworkOffer { bytes: Some(bytes), types });
+        Ok(())
+    }
+
+    /// Loads every offer that defines a type `image` references.
+    fn load_offers_named_by(&mut self, image: &Image) -> ExecResult<()> {
+        if self.framework_offers.iter().all(|o| o.bytes.is_none()) {
+            return Ok(());
+        }
+        let md = image.metadata();
+        let mut wanted = Vec::new();
+        for row in 1..=md.row_count(TableId::TypeRef) {
+            let Ok(full) = type_ref_full_name(&md, row) else { continue };
+            // A nested reference names its outer type first.
+            let outer = full.split('+').next().unwrap_or(&full);
+            if self.registry.find_type_by_name(outer).is_some() {
+                continue;
+            }
+            for (n, offer) in self.framework_offers.iter().enumerate() {
+                if offer.bytes.is_some() && offer.types.iter().any(|t| t == outer) && !wanted.contains(&n) {
+                    wanted.push(n);
+                }
+            }
+        }
+        for n in wanted {
+            let Some(bytes) = self.framework_offers[n].bytes.take() else { continue };
+            let offered = Image::from_bytes(bytes.to_vec()).map_err(ExecutionError::Metadata)?;
+            self.load_image(offered)?;
+        }
+        Ok(())
+    }
+
+    /// Names of the offered framework assemblies that have been loaded.
+    pub fn loaded_framework_offers(&self) -> usize {
+        self.framework_offers.iter().filter(|o| o.bytes.is_none()).count()
+    }
+
     /// Custom attributes applied to a metadata token, across every assembly.
     ///
     /// Searched by token rather than by declaring assembly because a caller has
@@ -2924,6 +3340,55 @@ impl Loader {
                 }
             }
         }
+        self.explicit_implementation_of_stub(type_id, declared)
+    }
+
+    /// The same search when `declared` is a synthesised stub.
+    ///
+    /// A natively implemented interface — `IAsyncEnumerable<T>` — has no
+    /// `MethodDef`s, so every assembly that names one of its methods gets a
+    /// stub of its own, and the stub's signature still carries that
+    /// assembly's tokens. A `MethodImpl` in a library and a call in a program
+    /// then name two different `MethodId`s for one interface method, and the
+    /// lookup by id misses: the program's `await foreach` over a library's
+    /// async iterator found no `GetAsyncEnumerator`.
+    ///
+    /// So a stub is matched by what it names — declaring type, name, and
+    /// parameter count — and only when exactly one implementation fits.
+    /// Two would be overloads that differ by a parameter's type, which these
+    /// tokens cannot tell apart, and picking one would be a guess.
+    fn explicit_implementation_of_stub(&self, type_id: TypeId, declared: MethodId) -> Option<MethodId> {
+        let want = self.registry.method(declared);
+        if !matches!(want.kind, MethodKind::InternalCall) {
+            return None;
+        }
+        for base in self.registry.base_chain(type_id) {
+            let definition = self.registry.ty(base).generic_definition;
+            for owner in core::iter::once(base).chain(definition) {
+                let mut found = None;
+                for assembly in &self.assemblies {
+                    for ((impl_owner, decl), body) in assembly.method_impls.iter() {
+                        if *impl_owner != owner {
+                            continue;
+                        }
+                        let d = self.registry.method(*decl);
+                        if d.declaring_type == want.declaring_type
+                            && d.name == want.name
+                            && d.signature.params.len() == want.signature.params.len()
+                            && d.signature.generic_param_count == want.signature.generic_param_count
+                        {
+                            if found.is_some_and(|f| f != *body) {
+                                return None;
+                            }
+                            found = Some(*body);
+                        }
+                    }
+                }
+                if found.is_some() {
+                    return found;
+                }
+            }
+        }
         None
     }
 
@@ -2936,6 +3401,20 @@ impl Loader {
     /// which would run the wrong implementation, or none — this synthesises the
     /// missing link on first use and caches it, so the second call is a lookup.
     pub fn intern_internal_call(
+        &mut self,
+        type_id: TypeId,
+        name: &str,
+        signature: MethodSig,
+        qualified_name: String,
+    ) -> MethodId {
+        let cache_key = (type_id, qualified_name.clone());
+        if let Some(id) = self.interned_calls.get(&cache_key) {
+            return *id;
+        }
+        MethodId(self.grow(Growth::Intern { type_id, name: name.to_string(), signature, qualified_name }).index() as u32)
+    }
+
+    fn intern_internal_call_now(
         &mut self,
         type_id: TypeId,
         name: &str,
@@ -3259,6 +3738,9 @@ impl Loader {
     /// What makes two loaders one runtime rather than two.
     pub fn share_statics_with(&mut self, other: &Loader) {
         self.statics = other.statics.clone();
+        // A new thread has written no `[ThreadStatic]` yet, whatever the thread
+        // that started it had.
+        self.thread_values = core::cell::RefCell::new(HashMap::new());
     }
 
     /// Initial bytes of a field that carries an RVA.
@@ -3321,6 +3803,20 @@ fn is_framework_assembly(name: &str) -> bool {
         || name == "WindowsBase"
         || name.starts_with("System")
         || name.starts_with("Microsoft.")
+}
+
+/// The full name of the type a custom attribute's constructor belongs to.
+fn attribute_type_name(md: &rustclr_metadata::Metadata<'_>, constructor: Token) -> Option<String> {
+    let class = match constructor.table()? {
+        TableId::MemberRef => md.member_ref(constructor.row()).ok()?.class,
+        // A `[ThreadStatic]` declared in the same assembly is not the
+        // framework's, and is left alone.
+        _ => return None,
+    };
+    match class.table()? {
+        TableId::TypeRef => type_ref_full_name(md, class.row()).ok(),
+        _ => None,
+    }
 }
 
 /// The name a `TypeRef` row binds under, nesting included.

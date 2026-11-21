@@ -393,7 +393,7 @@ pub struct Interpreter {
     /// Keyed by the open method, then searched by argument list: a lookup
     /// keyed by `(MethodId, Vec<TypeId>)` had to build that `Vec` on every
     /// generic call just to ask. A method has few instantiations.
-    virtual_instantiations: HashMap<MethodId, Vec<(Vec<TypeId>, MethodId)>>,
+
     /// Virtual and interface dispatch, remembered per (declared method,
     /// receiver type). The answer is a property of the two types, fixed once
     /// loaded; finding it by name and shape — and, for a natively implemented
@@ -421,6 +421,12 @@ pub struct Interpreter {
     /// the pool. Only a worker's blocking should make the pool grow.
     #[cfg(feature = "threads")]
     is_pool_worker: bool,
+    /// This worker's slot in the pool's run queue, when it is a pool worker.
+    #[cfg(feature = "threads")]
+    pool_worker_index: Option<usize>,
+    /// The scheduling policy a pool started from this interpreter uses.
+    #[cfg(feature = "threads")]
+    pub scheduler: rustclr_sched::SchedulerKind,
     /// Threads started by this one, waiting to be joined.
     #[cfg(feature = "threads")]
     threads: HashMap<u64, rustclr_thread::thread::JoinHandle<(ExecResult<()>, bool)>>,
@@ -488,7 +494,7 @@ impl Interpreter {
             frame_floor: 0,
             code_cache: Vec::new(),
             trivial_ctors: crate::rowmap::RowMap::new(),
-            virtual_instantiations: HashMap::new(),
+
             dispatch_cache: HashMap::new(),
             field_defaults: crate::rowmap::RowMap::new(),
             field_slots: crate::rowmap::RowMap::new(),
@@ -522,6 +528,10 @@ impl Interpreter {
             pool: None,
             #[cfg(feature = "threads")]
             is_pool_worker: false,
+            #[cfg(feature = "threads")]
+            pool_worker_index: None,
+            #[cfg(feature = "threads")]
+            scheduler: rustclr_sched::SchedulerKind::default(),
             #[cfg(feature = "threads")]
             threads: HashMap::new(),
             #[cfg(feature = "threads")]
@@ -683,6 +693,25 @@ impl Interpreter {
         self.stats.allocations += 1;
         self.attribute(obj.type_id, obj.size_hint());
         self.heap.alloc(obj)
+    }
+
+    /// The counted way to allocate any other heap object — a delegate, an
+    /// exception, a cloned array — charged to `type_id`.
+    ///
+    /// Every allocation an interpreter makes goes through a function like
+    /// this one, so the profiler's attribution and the heap's own count agree;
+    /// a site that called `heap.alloc` directly was invisible to both.
+    pub fn alloc_counted<T: GcObject>(&mut self, type_id: TypeId, object: T) -> Handle {
+        self.stats.allocations += 1;
+        self.attribute(type_id, object.size_hint());
+        self.heap.alloc(object)
+    }
+
+    /// [`Self::alloc_counted`] for an array, charged to its element type.
+    pub fn alloc_counted_array(&mut self, array: ClrArray) -> Handle {
+        self.stats.allocations += 1;
+        self.attribute_array(array.element_type, array.size_hint());
+        self.heap.alloc(array)
     }
 
     /// The value each instance field of `type_id` starts at.
@@ -1061,7 +1090,7 @@ impl Interpreter {
         worker.interned = self.interned.clone();
         worker.literal_cache = self.literal_cache.clone();
         worker.type_objects = self.type_objects.clone();
-        worker.loaded_size = self.loader.registry.method_count();
+        worker.loaded_size = self.loader.registry.method_count() - self.loader.logged_method_count();
         // A thread this worker starts in turn gets the same console.
         worker.host_factory = self.host_factory.clone();
         worker
@@ -1142,6 +1171,9 @@ impl Interpreter {
             return Ok(());
         };
         let joined = self.blocking(|_| handle.join());
+        // The joined thread may have grown the registry; its results can name
+        // what it grew.
+        self.loader.catch_up();
         match joined {
             Ok((result, diverged)) => {
                 if diverged {
@@ -1168,7 +1200,7 @@ impl Interpreter {
         // The pool's workers get whatever console this interpreter hands out,
         // so a redirected console reaches `Task.Run` as well as `Main`.
         let factory = self.host_factory.clone();
-        let pool = crate::pool::TaskPool::start(self, move || match &factory {
+        let pool = crate::pool::TaskPool::start(self, self.scheduler, move || match &factory {
             Some(build) => build(),
             None => crate::pool::default_host(),
         });
@@ -1182,7 +1214,14 @@ impl Interpreter {
         &mut self,
         job: Box<dyn FnOnce(&mut Interpreter) + Send>,
     ) {
-        self.task_pool().submit(job);
+        let worker = self.pool_worker_index();
+        self.task_pool().submit(job, worker);
+    }
+
+    /// This thread's slot in the pool's run queue, if it is a pool worker.
+    #[cfg(feature = "threads")]
+    pub fn pool_worker_index(&self) -> Option<usize> {
+        if self.is_pool_worker { self.pool_worker_index } else { None }
     }
 
     /// Queues managed work to run after a delay.
@@ -1231,12 +1270,20 @@ impl Interpreter {
     pub fn monitor_enter(&mut self, object: Handle) {
         let monitors = self.monitors.clone();
         let mutators = self.mutators.clone();
-        let roots = self.roots();
-        monitors.enter(object, &mut |wait| {
-            let guard = mutators.blocked_with(roots.clone());
-            wait();
-            drop(guard);
-        });
+        {
+            // Roots only if this actually has to wait: an uncontended lock —
+            // nearly every one, and every interlocked step — never needs them,
+            // and gathering them walks every frame.
+            let this: &Self = self;
+            monitors.enter(object, &mut |wait| {
+                let guard = mutators.blocked_with(this.roots());
+                wait();
+                drop(guard);
+            });
+        }
+        // Taking a lock is how another thread's objects reach this one, so
+        // this is where this copy of the registry catches up with theirs.
+        self.loader.catch_up();
     }
 
     /// `Monitor.Wait` — releases the monitor, waits for a pulse, retakes it.
@@ -1294,7 +1341,10 @@ impl Interpreter {
     /// bounded: an interface stub for a native implementation, or
     /// `MakeGenericType`. This is how a thread notices it happened.
     pub fn diverged(&self) -> bool {
-        self.loaded_size != 0 && self.loader.registry.method_count() != self.loaded_size
+        // Logged growth is shared by every copy, so only growth that bypassed
+        // the log — loading an assembly on a worker — makes copies disagree.
+        self.loaded_size != 0
+            && self.loader.registry.method_count() - self.loader.logged_method_count() != self.loaded_size
     }
 
     /// Bytes an instance of `type_id` occupies, for marshalling.
@@ -1379,9 +1429,10 @@ impl Interpreter {
 
     /// Marks this interpreter as one of the pool's own workers.
     #[cfg(feature = "threads")]
-    pub fn mark_as_pool_worker(&mut self, pool: crate::pool::TaskPool) {
+    pub fn mark_as_pool_worker(&mut self, pool: crate::pool::TaskPool, index: usize) {
         self.pool = Some(pool);
         self.is_pool_worker = true;
+        self.pool_worker_index = Some(index);
     }
 
     // -- compilation ---------------------------------------------------------
@@ -1466,6 +1517,20 @@ impl Interpreter {
         self.frame_floor = previous_floor;
         self.root_callback_result(&result);
         result
+    }
+
+    /// Keeps `values` reachable while `f` runs, which may run managed code and
+    /// therefore collect.
+    ///
+    /// For a native holding handles only in Rust locals across a call back
+    /// into managed code — a list of continuations being resumed one by one,
+    /// say, where resuming the first must not sweep the rest.
+    pub fn with_roots<R>(&mut self, values: &[Value], f: impl FnOnce(&mut Self) -> R) -> R {
+        let mark = self.native_roots.len();
+        self.native_roots.extend(values.iter().cloned());
+        let out = f(self);
+        self.native_roots.truncate(mark);
+        out
     }
 
     /// A value managed code hands back to a running native lives only in that

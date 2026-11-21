@@ -4,8 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status: milestones 1-3 and 5 complete, 4 and 6 partly done, and it works
 
-The runtime executes real Roslyn-compiled assemblies. `cargo test --workspace` runs 424 tests;
-the conformance fixture prints `checks=361 failures=0` on RustCLR, byte-identical to `dotnet`,
+The runtime executes real Roslyn-compiled assemblies. `cargo test --workspace` runs 480 tests;
+the conformance fixture prints `checks=546 failures=0` on RustCLR, byte-identical to `dotnet`,
 and `ModernSyntax` prints `checks=35 failures=0`. Generic collections, LINQ and
 `async`/`await` all run, `Span<T>` and `unsafe` pointers work, and reflection works on
 real `System.Type` objects.
@@ -254,7 +254,7 @@ the C# side is one project built by path.
 ```bash
 # Runtime
 cargo build --release                      # produces target/release/rustnet
-cargo test --workspace                     # 424 tests; must stay green
+cargo test --workspace                     # 480 tests; must stay green
 bash tests/embedded.sh                     # 14 crates x 4 bare-metal targets; must stay green
 bash tests/firmware.sh                     # seven board firmwares; must stay green
 cargo test -p rustclr-core                 # one crate
@@ -276,7 +276,7 @@ Before claiming a runtime change works, run a real assembly through both runtime
 
 ```bash
 cd tests/fixtures/Conformance && dotnet build -c Release
-dotnet bin/Release/net10.0/Conformance.dll                    # expect: checks=361 failures=0
+dotnet bin/Release/net10.0/Conformance.dll                    # expect: checks=546 failures=0
 ../../../target/debug/rustnet.exe run bin/Release/net10.0/Conformance.dll
 ```
 

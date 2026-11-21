@@ -286,6 +286,31 @@ fn register_exceptions(interp: &mut Interpreter) {
         "System.ApplicationException",
         "System.SystemException",
     ] {
+        register_exception_ctors(interp, name);
+    }
+}
+
+/// Constructors for the exceptions collections, tasks and the concurrency
+/// types throw.
+///
+/// Registered by the full install, not with the rest: the minimal tier has
+/// none of the code that throws these, and on a board every binding is RAM —
+/// eighteen of them pushed the console subset 1.3 KB past its threshold.
+pub(crate) fn register_concurrency_exceptions(interp: &mut Interpreter) {
+    for name in [
+        "System.Collections.Generic.KeyNotFoundException",
+        "System.TimeoutException",
+        "System.OperationCanceledException",
+        "System.Threading.Tasks.TaskCanceledException",
+        "System.AggregateException",
+        "System.ObjectDisposedException",
+    ] {
+        register_exception_ctors(interp, name);
+    }
+}
+
+fn register_exception_ctors(interp: &mut Interpreter, name: &str) {
+    {
         let ctor0 = Box::leak(format!("{name}::.ctor()").into_boxed_str()) as &str;
         interp.register_native(ctor0, |_i, _a| Ok(None));
         let ctor1 = Box::leak(format!("{name}::.ctor(string)").into_boxed_str()) as &str;

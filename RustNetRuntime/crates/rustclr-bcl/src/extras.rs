@@ -3288,7 +3288,7 @@ fn register_delegates(interp: &mut Interpreter) {
             return Ok(Some(if x.is_null() || delegate_targets(i, &x).is_none() { y } else { x }));
         };
         targets.extend(more);
-        Ok(Some(Value::Obj(i.heap.alloc(ClrDelegate { type_id: ty, targets }))))
+        Ok(Some(Value::Obj(i.alloc_counted(ty, ClrDelegate { type_id: ty, targets }))))
     });
     interp.register_native("System.Delegate::Remove/2", |i, a| {
         let (source, value) = (arg(i, a, 0)?, arg(i, a, 1)?);
@@ -3312,7 +3312,7 @@ fn register_delegates(interp: &mut Interpreter) {
         if kept.len() == targets.len() {
             return Ok(Some(source));
         }
-        Ok(Some(Value::Obj(i.heap.alloc(ClrDelegate { type_id: ty, targets: kept }))))
+        Ok(Some(Value::Obj(i.alloc_counted(ty, ClrDelegate { type_id: ty, targets: kept }))))
     });
     for name in ["System.Delegate::op_Equality/2", "System.MulticastDelegate::op_Equality/2"] {
         interp.register_native(name, |i, a| {
@@ -3332,7 +3332,7 @@ fn register_delegates(interp: &mut Interpreter) {
         let Some((ty, targets)) = delegate_targets(i, &this) else { return Ok(Some(Value::Null)) };
         let array = i.alloc_array(ty, targets.len());
         for (n, t) in targets.into_iter().enumerate() {
-            let single = i.heap.alloc(ClrDelegate { type_id: ty, targets: vec![t] });
+            let single = i.alloc_counted(ty, ClrDelegate { type_id: ty, targets: vec![t] });
             i.heap.with_mut::<ClrArray, _>(array, |arr| {
                 arr.storage.set(n, &Value::Obj(single));
             });
@@ -3467,12 +3467,13 @@ fn register_misc(interp: &mut Interpreter) {
         "Exception", "SystemException", "ApplicationException", "InvalidOperationException", "ArgumentException",
         "ArgumentNullException", "ArgumentOutOfRangeException", "NotSupportedException", "NotImplementedException",
         "FormatException", "NullReferenceException", "IndexOutOfRangeException", "InvalidCastException",
-        "DivideByZeroException", "OverflowException", "ArithmeticException", "KeyNotFoundException",
+        "DivideByZeroException", "OverflowException", "ArithmeticException",
         "TimeoutException", "OperationCanceledException", "UnauthorizedAccessException",
     ] {
         interp.register_native(k(format!("System.{name}::.ctor/2")), exception_with_inner);
     }
     interp.register_native("System.IO.IOException::.ctor/2", exception_with_inner);
+    interp.register_native("System.Collections.Generic.KeyNotFoundException::.ctor/2", exception_with_inner);
     interp.register_native("System.Exception::get_InnerException()", |i, a| {
         let h = arg_handle(i, a, 0)?;
         let mut inner = i.heap.with::<ClrException, _>(h, |e| e.inner).unwrap_or(Handle::NULL);
@@ -4285,7 +4286,7 @@ fn register_framework_gaps(interp: &mut Interpreter) {
     interp.register_native("System.Array::Clone()", |i, a| {
         let this = arg_handle(i, a, 0)?;
         let copy = i.heap.with::<ClrArray, _>(this, |arr| arr.clone()).ok_or_else(ExecutionError::null_reference)?;
-        Ok(Some(Value::Obj(i.heap.alloc(copy))))
+        Ok(Some(Value::Obj(i.alloc_counted_array(copy))))
     });
     fn parse_radix(i: &mut Interpreter, a: &[Value]) -> ExecResult<i64> {
         let s = arg_string(i, a, 0)?;

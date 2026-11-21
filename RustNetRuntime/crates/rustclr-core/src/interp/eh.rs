@@ -45,8 +45,7 @@ impl Interpreter {
             .find_type_by_name(&type_name)
             .unwrap_or_else(|| self.loader.core().exception);
         let stack_trace = self.stack_trace();
-        self.stats.allocations += 1;
-        let handle = self.heap.alloc(ClrException {
+        let handle = self.alloc_counted(type_id, ClrException {
             type_id,
             message: message.clone(),
             inner: Handle::NULL,

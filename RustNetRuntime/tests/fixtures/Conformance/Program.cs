@@ -1500,6 +1500,7 @@ static partial class Program
         ActivatorChecks();
         TextChecks();
         CancellationChecks();
+        ConcurrencyApiChecks();
         DateChecks();
         SortChecks();
         HexChecks();

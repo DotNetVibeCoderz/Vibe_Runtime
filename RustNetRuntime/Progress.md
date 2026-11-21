@@ -19,6 +19,168 @@ PrimeSieve     IDENTICAL   (written by Jack from a prompt)
 SensorGateway  IDENTICAL   (edited by Jack from a prompt)
 ```
 
+## 2026-11-21 — Milestone 8.2: the scheduler, and what was actually slow
+
+Done against its criterion: the three new `benchmarks/` rows improve
+(medians: `spawn` ~1,350 → 552 ms, `pingpong` ~5,300 → 4,263 ms, `fanout`
+~14,700 → 4,605 ms), Conformance is byte-identical, and `--scheduler fifo`
+passes it as a test. **The improvement did not come from the scheduler.**
+`docs/benchmarks.md` has the full sequence.
+
+- **Two collector bugs came first, and they predate 8.2.** They were found
+  because `pingpong` failed in assorted ways: "Field 'waiter' was not found",
+  a `NullReferenceException`, a string that lost its prefix, "never completed".
+  - Turning collection off made them vanish, and collecting every 200 bytes
+    made them reproduce.
+  - **A thread that blocked after a collection had started** was counted as
+    stopped, but its roots went only to `blocked_roots`, which the collector
+    had already copied.
+  - **A second would-be collector, parked behind the first,** published no
+    roots at all.
+  - In both cases whatever the thread held was swept. Both are fixed in
+    `safepoint.rs`, and two tests fail without the fixes.
+  - `fanout`'s ten-plus minutes were the same bug.
+- **`RUSTCLR_GC_STRESS=<bytes>`** is now a real diagnostic, the env-var hack
+  that found those bugs made permanent. It is read once per process and kept
+  out of `Heap`, because the footprint test caught it costing the embedded
+  minimal tier 13 bytes.
+  - Conformance is identical under `=4096` on both schedulers.
+- **Task completion published the status before the result.** A reader that
+  checks the status without a lock saw "done" with no result, and `pingpong`
+  printed 0. The payload is now written first.
+- **The swappable scheduler.** `rustclr_sched::RunQueue` is the seam, with
+  `WorkStealing` (the default) and `GlobalFifo` behind it.
+  - `rustnet run --scheduler fifo|stealing` selects one.
+  - The wake policy wakes one sleeper only when no worker is already searching.
+- **Fewer locks per task.**
+  - `new_task` is one allocation.
+  - `transition` and `add_continuation` each run under one heap lock
+    (`SharedHeap::atomically`), replacing a monitor plus a lock per field.
+  - `pin_all` and `unpin_all` pin a job's handles under one lock.
+  - Locks per task fell from 30 to 19, which on its own bought nothing.
+- **The finding: one heap lock is the bottleneck.**
+  - Forced worker counts on `fanout`: 6.1 s on 1 worker, 7.9 s on 2, 10.6 s
+    on 4, 15.5 s on 8.
+  - The pool now has a **governor**:
+    - `SharedHeap::contended_acquisitions` counts contention, only on the
+      contended path.
+    - Above two contended locks per finished job, the limit on running
+      workers is halved.
+    - The limit is raised again when work is waiting and contention is low,
+      and always when work is waiting and nothing has finished.
+    - A worker that blocks gives its slot back. The first version did not
+      take the slot back on return, and three Conformance overlap checks
+      caught it.
+- **Idle workers spin 15 µs** before sleeping. Measured against 0 µs and
+  50 µs, 15 µs is the best on both `spawn` and `pingpong`.
+- **Found, not fixed:**
+  - Pool workers have no JIT tier, so compiled-on-main arithmetic runs
+    interpreted inside `Parallel.For`: 80 ms sequential, about 2.6 s
+    parallel, the same before 8.2.
+  - `Stopwatch.Elapsed` and `ElapsedTicks` are missing from RustBCL; the
+    benchmarks use `ElapsedMilliseconds`.
+  - The real fix for the heap lock is collector work and is named in
+    `docs/limitations.md`.
+
+Verified:
+- `cargo test --workspace`: 480 passed, 0 failed.
+- `bash tests/embedded.sh`: all targets built.
+- `bash tests/firmware.sh`: all seven firmwares built.
+- Byte-identical to `dotnet`: Conformance (546/0) on both schedulers, with
+  and without GC stress, plus ModernSyntax, CrossAssembly, UserDirectory and
+  HelloWorld.
+
+## 2026-11-21 — Milestone 8.1: the official concurrency surface
+
+The first phase of Milestone 8 (`Plan.md`). It adds .NET's own concurrency
+APIs, so a program written against them runs here unmodified, with **no new
+API of RustNet's own**. `tests/fixtures/Conformance/ConcurrencyApiChecks.cs`
+holds the checks. Each was written against `dotnet` first, and two of the
+expectations were corrected that way.
+
+- New, in C# (`crates/rustclr-bcl/managed/RustBCL.Concurrent`):
+  `ConcurrentQueue/Stack/Bag/Dictionary`, `BlockingCollection`,
+  `SemaphoreSlim`, `ThreadLocal<T>`, and all of `System.Threading.Channels`
+  (bounded and unbounded, the four full modes, completion, `ReadAllAsync`).
+  - `crates/rustclr-bcl/build.rs` compiles the shim with the SDK, or takes
+    `RUSTBCL_MANAGED_DIR`; `include_bytes!` embeds it.
+  - New `Loader::offer_framework_assembly` loads the shim lazily, the first
+    time a program's TypeRefs name one of its types.
+  - A name that is already registered natively is refused, so the shim cannot
+    shadow a native type.
+- New, natively:
+  - `[ThreadStatic]`.
+  - Task gained:
+    - a real `Canceled` state;
+    - `ContinueWith`;
+    - non-blocking `WhenAny`;
+    - `Wait(ms)` that honours its timeout;
+    - `Status` and `Exception`;
+    - AggregateException wrapping for `Wait` and `Result`, while `await`
+      still rethrows the inner exception;
+    - `RunContinuationsAsynchronously`.
+  - TaskCompletionSource gained `TrySetCanceled` and `SetCanceled`, and its
+    `TrySet*` calls are now atomic.
+  - Cancellation gained:
+    - a thread-safe `Cancel`;
+    - `CancelAfter`;
+    - `CreateLinkedTokenSource`;
+    - a `Registration.Dispose` that actually unregisters;
+    - token equality.
+  - The rest of `Interlocked`.
+  - `KeyNotFoundException`, `TimeoutException` and `ObjectDisposedException`
+    are now catchable.
+- Fixed: **overload resolution treated `!n` as a wildcard.**
+  `GetOrAdd(!0, !1)` bound to `GetOrAdd(!0, Func<!0,!1>)`, the first overload
+  declared. `find_method_on_type_from` now tries an exact match first, where a
+  generic parameter matches only itself, and falls back to the lenient match.
+- Fixed: **a static call on `Box<!0>` from inside `Box<T>` ran as
+  `Box<object>`.** Loading had bound the open reference to a placeholder, so
+  `k == null` was true for an `int` 0. A call now closes an open construction
+  against the calling frame before it considers the load-time binding.
+  - Found by `ConcurrentDictionary.CheckKey`.
+  - Reproduced in plain user code.
+- Fixed: **registry copies diverged under threads.** Four threads sharing a
+  `ConcurrentDictionary<int,int>` each constructed `Dictionary<int,int>` lazily
+  and got the same `TypeId` for different types.
+  - Growth now goes through a log shared by every loader copy, in four places:
+    constructions, array types, interned stubs, and virtual generic
+    instantiations.
+  - A thread catches up at a lock, a static read, a pool job, and after
+    `Join`.
+  - See `docs/limitations.md`.
+- Fixed: an interface implemented explicitly in one assembly and called from
+  another missed, when the interface is native. Each assembly synthesises its
+  own stub, so their `MethodId`s differ. A stub is now matched by declaring
+  type, name and arity, and the match is refused if more than one fits.
+- Fixed: a pending `ValueTask` source was refused, because `OnCompleted`
+  returns `void` and the code took "returned nothing" to mean "no such method".
+- Fixed: twelve allocation sites bypassed the profiler's count: exceptions,
+  delegates, struct cells, `Array.Clone` and byte buffers. They now go through
+  `Interpreter::alloc_counted`.
+  - The profiler test now compares against the profiled thread's own
+    allocations, via the new `SharedHeap::allocations_on_this_thread`.
+  - Before, worker threads' allocations had been sitting in the total.
+- Fixed: `Monitor.Enter` gathered GC roots (a walk of every frame) on every
+  call. It now gathers them only when it actually has to wait.
+- Footprint: `MINIMAL_BCL_BYTES` 288,500 → 289,100, with the reason recorded
+  beside the constant. The new exceptions' constructors were kept out of the
+  minimal tier.
+
+**Verified:**
+
+| Check | Result |
+| --- | --- |
+| Conformance | `checks=546 failures=0`, byte-identical to .NET in 8 of 8 runs |
+| ModernSyntax | `checks=35 failures=0` |
+| CrossAssembly | `checks=9 failures=0` |
+| UserDirectory | identical |
+| AdvancedFeatures | identical |
+| HelloWorld | identical |
+| `cargo test --workspace` | 474 passed, 0 failed |
+| `bash tests/embedded.sh` | all targets built |
+| `bash tests/firmware.sh` | all seven built |
+
 ## 2026-11-02 — fixes found by Buitenzorg.UI, and the per-call allocations
 
 Buitenzorg OS runs this runtime as a ring-3 program (`no_std`, `threads`), and

@@ -24,12 +24,17 @@ fn managed_trace(interp: &Interpreter, error: &rustclr_core::ExecutionError) -> 
 }
 
 fn run() -> Option<(String, Interpreter)> {
+    run_with(rustclr_core::SchedulerKind::default())
+}
+
+fn run_with(scheduler: rustclr_core::SchedulerKind) -> Option<(String, Interpreter)> {
     if !std::path::Path::new(FIXTURE).exists() {
         eprintln!("skipping: conformance fixture not built");
         return None;
     }
     let mut interp = Interpreter::with_host(Box::new(CaptureHost::new()));
     rustclr_bcl::install(&mut interp);
+    interp.scheduler = scheduler;
     let assembly = interp.loader.load_from_file(FIXTURE).expect("fixture loads");
 
     match interp.run_entry_point(assembly) {
@@ -51,6 +56,18 @@ fn run() -> Option<(String, Interpreter)> {
 #[test]
 fn every_conformance_check_passes() {
     let Some((output, _)) = run() else { return };
+    assert_all_passed(&output);
+}
+
+/// The scheduler is a swappable module, and swapping it back is a flag, not a
+/// revert — which holds only while the old policy still runs everything.
+#[test]
+fn every_conformance_check_passes_on_the_fifo_scheduler() {
+    let Some((output, _)) = run_with(rustclr_core::SchedulerKind::Fifo) else { return };
+    assert_all_passed(&output);
+}
+
+fn assert_all_passed(output: &str) {
 
     let failures: Vec<&str> = output.lines().filter(|l| l.starts_with("FAIL ")).collect();
     assert!(

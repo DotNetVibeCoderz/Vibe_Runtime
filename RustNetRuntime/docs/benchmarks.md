@@ -32,6 +32,44 @@ process start.
 | `arrays` | 135 | 244 | 1.8× | An `int[]` passed in and walked — **compiled** |
 | `strings` | 102 | 203 | 2.0× | 20k concatenations, `Length`, `IndexOf` |
 
+### Concurrency rows (Milestone 8.2)
+
+Three rows that time the task pool rather than the code generator, and on these
+RustCLR is well behind — said first, so the improvement below is not mistaken
+for parity. Median of five runs, same machine (8 cores).
+
+| Workload | .NET (ms) | RustCLR before 8.2 | RustCLR now | `--scheduler fifo` | What it stresses |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `spawn` | 292 | ~1,350 | **552** (1.9×) | 566 | 100,000 `Task.Run(() => n*3)`, then every `.Result` |
+| `pingpong` | 307 | ~5,300 | **4,263** (13.9×) | 4,318 | 50,000 round trips through two unbounded channels |
+| `fanout` | 1,045 | ~14,700 | **4,605** (4.4×) | 8,129 | 250 tasks each starting 4,000 more, a million in all |
+
+"Before" is the pool as it stood at the start of 8.2, *with* the two
+safe-point fixes this work found applied — without them `pingpong` crashed and
+`fanout` ran for more than ten minutes, so the unfixed pool has no number to
+compare against.
+
+What moved them, in the order it was measured:
+
+1. **Work stealing on its own changed nothing** (fifo / stealing: `spawn`
+   1,524 / 1,546 ms, `fanout` 15.3 / 16.5 s). It is kept because it is the
+   right structure once the next bottleneck is gone, and it is why `fanout`
+   beats fifo below — a worker runs the children it just spawned.
+2. **Fewer heap locks per task** — a task made in one allocation, completion
+   and "add a continuation" each under one lock rather than a monitor plus a
+   lock per field. `spawn` went from 30 lock acquisitions per task to 19; the
+   wall clock did not move.
+3. **What did move it was finding the real bottleneck.** Every field access
+   takes one heap lock. Forcing the worker count showed the shape: `fanout`
+   took 6.1 s on one worker and 15.5 s on eight. A governor now runs fewer
+   workers while they mostly queue for that lock (`fanout` 14.7 → 4.6 s).
+4. **Idle workers spin 15 µs before sleeping**, so a producer handing out tiny
+   tasks does not pay a futex wake per task (`spawn` ~1,100 → 552 ms).
+
+The fix that would close the gap with .NET is a heap that does not take a lock
+per field access, which is collector work rather than scheduler work;
+`docs/limitations.md` says so.
+
 Every row's checksum is compared between the two runtimes before it is timed;
 a mismatch prints `MISMATCH` instead of a number, because a faster wrong answer
 is not a result.

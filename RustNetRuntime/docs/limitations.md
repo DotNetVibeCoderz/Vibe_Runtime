@@ -223,6 +223,104 @@ pool deadlocks in the familiar way — every worker blocked on a task whose job 
 still in the queue behind it — and a task that awaits another task is exactly
 that shape. It is also why the pool never needs to grow under load.
 
+**The scheduler is swappable, and stealing is the default.** Each worker has a
+queue of its own: it pushes and pops the back, newest first, and when that is
+empty takes from a shared injector and then steals the *oldest* job from
+another worker. `rustnet run --scheduler fifo` swaps in the single shared queue
+the pool had before, and Conformance runs under both as a test. A submit wakes a
+sleeping worker only when none is already looking for work, and a worker that
+finds a job while looking wakes the next — so a burst of tasks wakes workers one
+at a time, not all at once.
+
+**More workers do not make heap-heavy tasks faster — one lock is why.** Every
+field a managed method reads or writes, and every allocation, takes the same
+heap lock. Running managed code on more threads therefore mostly adds threads
+queueing for it, and each hand-off between cores costs more than the field
+access it guards. Measured on 8 cores, with the worker count forced:
+
+| workload | 1 worker | 2 | 4 | 8 |
+| --- | ---: | ---: | ---: | ---: |
+| 100,000 `Task.Run` | 819 ms | 872 | 1,144 | 1,315 |
+| fan-out of 1,000,000 tasks | 6,140 ms | 7,860 | 10,615 | 15,518 |
+| channel ping-pong, 50,000 rounds | 5,884 ms | 5,987 | 5,933 | 5,976 |
+
+So the pool **runs fewer workers while they are only queueing**. A governor on
+the timer thread looks every 20 ms at how often the heap lock was found held
+against how many jobs finished; above two contended locks per job it halves the
+number of workers allowed to run, and while contention is low and work is
+waiting it raises it again, to the core count. A worker that blocks inside a job
+gives its slot back, so a limit of one cannot strand the job it is waiting on,
+and a tick that finds work queued and nothing finished raises the limit
+whatever contention says — a job spinning on a flag another job sets is slowed,
+not hung. The three Conformance checks that require two tasks to *genuinely*
+run at once pass, and were what caught the version of this that forgot to take
+the slot back.
+
+Idle workers also spin for 15 µs before sleeping, still counted as looking
+for work, so a loop of `Task.Run` does not pay a sleep and a wake per task. A
+spinning worker stays announced as blocked, so it never holds up a collection.
+
+This is a mitigation, not a fix. The fix is a heap that does not take one lock
+per field, and that is a change to the collector and to how compiled code
+reaches objects, not to the scheduler. Until then the honest summary is: tasks
+run concurrently and correctly, and a program whose tasks do mostly arithmetic
+in compiled code — not field access — is the kind that gets faster with cores.
+
+**Pool workers interpret.** A worker's interpreter has no JIT tier; only the
+main thread's does. Arithmetic that compiles on the main thread runs
+interpreted inside `Parallel.For`: 16 chunks of a million-step loop took 80 ms
+sequentially on the main thread and about 2.6 s through `Parallel.For`, the same
+before and after this scheduler. Giving each worker a tier — or sharing one —
+is its own piece of work.
+
+**`RUSTCLR_GC_STRESS=<bytes>`** makes every heap collect each time that many
+bytes have been allocated. It is a diagnostic: a collection must never change
+what a program prints, and collecting constantly is how a missing root stops
+being rare. It found two holes in the safe-point protocol, both now fixed and
+tested — a thread that blocked *after* a collection began, and a second
+would-be collector parked behind the first, were each counted as stopped with
+their roots published nowhere, and what they held was swept. Conformance is
+byte-identical under `RUSTCLR_GC_STRESS=4096` on both schedulers.
+
+### The concurrency types: real, and written in C#
+
+`System.Collections.Concurrent` (`ConcurrentQueue`, `ConcurrentStack`,
+`ConcurrentBag`, `ConcurrentDictionary`, `BlockingCollection`),
+`System.Threading.Channels`, `SemaphoreSlim` and `ThreadLocal<T>` are
+**ordinary C#**, in `crates/rustclr-bcl/managed/RustBCL.Concurrent`. RustBCL's
+build compiles it with the .NET SDK and embeds the DLL. The loader *offers* it
+and loads it the first time a program's references name one of its types, so
+a program that uses none of them pays nothing for it.
+
+They are C# because they are made of `lock`, `Monitor.Wait`, `Interlocked` and
+`TaskCompletionSource`, which already work. Native versions would have been a
+second implementation of the same semantics to keep in step. Writing them in
+C# also means the conformance checks run them the same way `dotnet` runs its own.
+
+What that costs, stated plainly:
+
+| | |
+| --- | --- |
+| **Lock-based, not lock-free** | Every operation takes one monitor. Results are identical to .NET's; throughput under heavy contention is lower. Milestone 8.4 is where a native fast path replaces one the benchmarks say matters |
+| `ThreadLocal<T>` keeps a value after its thread exits | Values are kept by managed thread id until `Dispose`, so a program that starts many short threads and never disposes it holds every value. .NET cleans these up as threads die |
+| `Task.Status` on a pending task | Always `WaitingForActivation`. `Running` and `WaitingToRun` are not tracked separately; the final states (`RanToCompletion`, `Faulted`, `Canceled`) are exact |
+| A custom `IValueTaskSource` | Its `OnCompleted` is called with a **null** continuation and the waiting task as `state`. RustBCL's own sources and every compiler-generated async iterator accept that; a hand-written source that invokes the continuation without checking it would throw |
+| Building without the .NET SDK | The build warns and continues; these types are then absent, and a program that names one gets an unresolved-type error, as it did before they existed. `RUSTBCL_MANAGED_DIR` points the build at a prebuilt `RustBCL.Concurrent.dll` for machines with no SDK |
+| On a board | Not included in the minimal tier, which has no collections or tasks |
+
+Writing these exposed runtime gaps, and each was fixed rather than worked
+around. They are listed in `Progress.md`. Two of them could have given wrong
+answers in ordinary programs, not just in the new types:
+
+* **Overload resolution treated a generic parameter as a wildcard.**
+  `GetOrAdd(TKey, TValue)` bound to `GetOrAdd(TKey, Func<TKey, TValue>)`
+  because `!1` "matched" `Func<!0, !1>`. Now an exact match, where `!1` matches
+  only `!1`, is tried before the lenient one.
+* **A static method on a generic type, called from inside that type, lost its
+  type arguments.** `Box<T>.Check(k)` called from `Box<T>.Add` ran as
+  `Box<object>`, so `k == null` was **true for an `int` 0**. A call naming an
+  open construction is now closed against the calling frame first.
+
 ### Threads without `std`
 
 The thread machinery above is the `threads` feature of `rustclr-gc`,
@@ -267,12 +365,29 @@ Static storage is the exception, and is genuinely shared behind a lock, because
 `static int Total` must be one slot however many threads reach it.
 
 The correctness condition is precise: **the copies must not diverge.** A loader
-grows in exactly two places after load — an interface-dispatch stub synthesised
-for a native implementation, and `MakeGenericType`. A `MethodId` minted on one
-thread means nothing on another, so a thread that grew its registry is detected
-on `Join` and reported, rather than being allowed to hand back an id that names
-a different method. That check has not fired in practice; it is there because
-the alternative to noticing is a wrong answer.
+grows after load in four places: a generic construction met at run time, an
+array type reflection names, an interface-dispatch stub for a native
+implementation, and a generic method instantiated by a virtual call. A
+`TypeId` minted on one thread means nothing on another.
+
+An earlier version only *detected* that, on `Join`, and the check was said
+never to have fired. It fired as soon as four threads used one
+`ConcurrentDictionary<int, int>`. The dictionary inside it is constructed
+lazily, by whichever thread gets there first, and two threads doing that
+independently handed out one id for two different types.
+
+So growth is now **serialised through a log shared by every copy.** A thread
+that needs to grow takes the log's lock and replays what other threads logged
+since it last looked. Then it applies its own event and logs it. Every copy
+applies the same events in the same order, so the copies stay identical. A
+thread that is only *behind* catches up wherever another thread's objects can
+reach it: taking a lock (which every `Interlocked` operation and every
+concurrent collection does), reading a static, starting a pool job, and
+returning from `Join`. Each of those costs one atomic load when nothing has
+grown, which is nearly always. Reading the registry still takes no lock.
+
+The `Join` check is still there. It now looks for growth that bypassed the log,
+which only loading another assembly on a worker can do.
 
 **What is still serialised:** `Task` and `Parallel.For`. They need a scheduler
 handing work to these threads and a frame stack per task, and neither is built.

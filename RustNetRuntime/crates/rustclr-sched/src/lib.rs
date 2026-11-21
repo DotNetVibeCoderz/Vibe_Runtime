@@ -30,11 +30,13 @@ extern crate alloc;
 #[cfg(feature = "std")]
 pub mod channel;
 pub mod queue;
+pub mod run_queue;
 #[cfg(feature = "std")]
 pub mod task;
 
 #[cfg(feature = "std")]
 pub use channel::{channel, Receiver, RecvError, SendError, Sender};
 pub use queue::LockFreeQueue;
+pub use run_queue::{GlobalFifo, RunQueue, SchedulerKind, WorkStealing};
 #[cfg(feature = "std")]
 pub use task::{JoinHandle, Task, TaskState, ThreadPool};

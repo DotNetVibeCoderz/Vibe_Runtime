@@ -226,7 +226,7 @@ dependencies = [
 
 [[package]]
 name = "rustclr-bcl"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libm",
  "rustclr-core",
@@ -239,7 +239,7 @@ dependencies = [
 
 [[package]]
 name = "rustclr-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rustclr-gc",
  "rustclr-gfx",
@@ -249,7 +249,7 @@ dependencies = [
 
 [[package]]
 name = "rustclr-crypto"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "rustclr-demo-common"
@@ -266,7 +266,7 @@ dependencies = [
 
 [[package]]
 name = "rustclr-device"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rustclr-flashfs",
  "rustclr-hal",
@@ -275,29 +275,29 @@ dependencies = [
 
 [[package]]
 name = "rustclr-flashfs"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rustclr-hal",
 ]
 
 [[package]]
 name = "rustclr-gc"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "rustclr-gfx"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rustclr-hal",
 ]
 
 [[package]]
 name = "rustclr-hal"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "rustclr-hal-stm32"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rustclr-hal",
 ]
@@ -318,11 +318,11 @@ dependencies = [
 
 [[package]]
 name = "rustclr-metadata"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "rustclr-rndp"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "rustversion"

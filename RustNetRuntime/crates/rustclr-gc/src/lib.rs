@@ -77,6 +77,29 @@ pub struct Heap {
     stats: GcStats,
 }
 
+/// `RUSTCLR_GC_STRESS=<bytes>`: collect every time that many bytes have been
+/// allocated, however the policy is tuned.
+///
+/// A diagnostic, read once per process and kept out of [`Heap`] itself: the
+/// embedded footprint tests count every byte a heap costs, and a board has no
+/// environment to read it from. A collection should never
+/// change what a program prints, and collecting often is how a missing root
+/// stops being a once-a-day failure and becomes one that reproduces. It found
+/// two in the safe-point protocol: a thread that blocked after a collection
+/// had started, and a second would-be collector, were both counted as stopped
+/// with their roots published nowhere.
+fn stress_from_environment() -> Option<usize> {
+    #[cfg(feature = "std")]
+    {
+        static STRESS: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        *STRESS.get_or_init(|| std::env::var("RUSTCLR_GC_STRESS").ok().and_then(|v| v.parse().ok()))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        None
+    }
+}
+
 impl Default for Heap {
     fn default() -> Self {
         Self::new()
@@ -163,6 +186,9 @@ impl Heap {
 
     /// Whether the policy wants a collection at the next safe point.
     pub fn should_collect(&self) -> bool {
+        if let Some(every) = stress_from_environment() {
+            return self.bytes_since_collection >= every;
+        }
         self.collector.should_collect(&HeapPressure {
             live_bytes: self.space.live_bytes(),
             live_count: self.space.live_count(),

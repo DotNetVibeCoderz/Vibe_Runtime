@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Part of RustBCL, written in C# rather than Rust.
+
+    These types are defined under their real framework names
+    (System.Collections.Concurrent.ConcurrentQueue`1, System.Threading.Channels.Channel`1,
+    ...). A program compiled against the official reference assemblies names them
+    in TypeRefs, and RustCLR binds a TypeRef by full name - so it binds here,
+    exactly as it binds to a type RustBCL implements natively.
+
+    The rustclr-bcl build script compiles this project and embeds the DLL; the
+    loader pulls it in only when a program names one of its types.
+
+    CS0436: every type here also exists in the reference assemblies. The local
+    definition is the point, so the warning is expected.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>RustBCL.Concurrent</AssemblyName>
+    <RootNamespace>System</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyVersion>0.1.0</AssemblyVersion>
+    <Version>0.1.0</Version>
+    <Authors>Gravicode Studios</Authors>
+    <NoWarn>$(NoWarn);CS0436;CS1591</NoWarn>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+
+</Project>

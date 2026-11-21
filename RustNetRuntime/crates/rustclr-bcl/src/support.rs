@@ -125,7 +125,7 @@ pub fn display(interp: &mut Interpreter, v: &Value) -> String {
                 let object_type = interp.loader.core().object;
                 let mut cell = rustclr_core::ClrObject::new(object_type, 1);
                 cell.fields[0] = v.clone();
-                let cell = interp.heap.alloc(cell);
+                let cell = interp.alloc_clr_object(cell);
                 let this = Value::Ref(rustclr_core::ByRef::Field { object: cell, slot: 0 });
                 if let Ok(Some(Value::Obj(result))) = interp.invoke(method, vec![this]) {
                     if let Some(text) = interp.string_value(result) {

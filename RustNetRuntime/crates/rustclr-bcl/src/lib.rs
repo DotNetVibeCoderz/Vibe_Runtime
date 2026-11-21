@@ -152,6 +152,7 @@ use crate::prelude::*;
 /// Registers every native BCL implementation on an interpreter.
 pub fn install(interp: &mut Interpreter) {
     runtime::register(interp);
+    runtime::register_concurrency_exceptions(interp);
     console::register(interp);
     interpolation::register(interp);
     ranges::register(interp);
@@ -186,6 +187,28 @@ pub fn install(interp: &mut Interpreter) {
     // is how a Maix Go running `WifiCheck` died on `Wifi.Connect`.
     #[cfg(not(feature = "std"))]
     net::register_offline(interp);
+    offer_managed(interp);
+}
+
+/// `RustBCL.Concurrent.dll`: the C# half of RustBCL, embedded by the build
+/// script. See `managed/RustBCL.Concurrent`.
+#[cfg(managed_bcl)]
+pub static CONCURRENT: &[u8] = include_bytes!(env!("RUSTBCL_CONCURRENT_DLL"));
+
+/// Offers the managed framework assemblies to the loader.
+///
+/// Offered, not loaded: the loader brings one in only when an assembly names
+/// a type it defines, so a program that never touches a channel never pays
+/// for the types.
+pub fn offer_managed(interp: &mut Interpreter) {
+    #[cfg(managed_bcl)]
+    if let Err(e) = interp.loader.offer_framework_assembly(CONCURRENT) {
+        // Only reachable if the C# defines a type RustBCL also supplies
+        // natively, which is a build of this crate that cannot be right.
+        panic!("RustBCL.Concurrent cannot be offered: {e}");
+    }
+    #[cfg(not(managed_bcl))]
+    let _ = interp;
 }
 
 /// Registers the bindings a console program needs, and no more.

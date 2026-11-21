@@ -9,7 +9,10 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["std"]
+default = ["std", "managed"]
+# The parts of RustBCL written in C# (`managed/`), compiled by the build script
+# and loaded only when a program names one of their types. Off for a board.
+managed = []
 std = ["dep:rustclr-net", "rustclr-core/std", "rustclr-gc/std", "rustclr-hal/std", "threads", "rustclr-thread/std"]
 # Real managed threads (`Thread`, `Task.Run`, `Parallel`, `Monitor`). Implied by
 # `std`; without it the embedder installs `rustclr_thread::Hooks`.

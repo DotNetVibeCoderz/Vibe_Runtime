@@ -126,4 +126,7 @@ pub use types::{
 pub use value::{ByRef, StructValue, Value, RawPtr};
 
 pub use rustclr_gc as gc;
+/// The task pool's scheduling policy. See `rustclr_sched::run_queue`.
+#[cfg(feature = "threads")]
+pub use rustclr_sched::SchedulerKind;
 pub use rustclr_metadata as metadata;

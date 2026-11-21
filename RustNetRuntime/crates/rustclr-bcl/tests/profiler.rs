@@ -86,7 +86,9 @@ fn every_allocation_on_the_profiled_thread_is_attributed() {
     // by default for the second reason.
     let Some((mut interp, id)) = interpreter() else { return };
     interp.profiler = Some(Profiler::new(&interp.loader.registry, u64::MAX / 4));
+    let before = rustclr_gc::SharedHeap::allocations_on_this_thread();
     interp.run_entry_point(id).expect("the fixture runs");
+    let on_this_thread = rustclr_gc::SharedHeap::allocations_on_this_thread() - before;
 
     let report = interp.profiler.as_ref().unwrap().report(&interp.loader.registry);
     let (count, bytes) = report.total_allocations();
@@ -98,10 +100,12 @@ fn every_allocation_on_the_profiled_thread_is_attributed() {
         heap.total_allocations,
         heap.total_bytes_allocated
     );
-    // The fixture is mostly single-threaded, so the unattributed remainder is
-    // small. A site on the *interpreted* path that stopped being counted would
-    // show up here as a much larger gap — one such site did.
-    let attributed = count as f64 * 100.0 / heap.total_allocations as f64;
+    // Measured against what *this* thread allocated, not the heap's total:
+    // the fixture starts worker threads, which have no profiler, and the
+    // concurrency checks alone allocated 13% of the run on them. A site on the
+    // *interpreted* path that stopped being counted would show up here as a
+    // gap — one such site did.
+    let attributed = count as f64 * 100.0 / on_this_thread as f64;
     assert!(
         attributed > 99.0,
         "only {attributed:.1}% of allocations were attributed;          an interpreted allocation site is bypassing the counted path"

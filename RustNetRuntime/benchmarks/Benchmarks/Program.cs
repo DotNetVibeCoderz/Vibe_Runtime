@@ -33,8 +33,13 @@ public static class Program
             case "kernels": return Report("kernels", Kernels(60000 * scale));
             case "inlined": return Report("inlined", Inlined(400000 * scale));
             case "arrays": return Report("arrays", Arrays(3000 * scale));
+            // The scheduler (Milestone 8.2). Results are order-independent sums,
+            // so the checksum is the same however the work was interleaved.
+            case "spawn": return Report("spawn", Spawn(100000 * scale));
+            case "pingpong": return Report("pingpong", PingPong(50000 * scale));
+            case "fanout": return Report("fanout", FanOut(1000000 * scale));
             default:
-                Console.WriteLine("workloads: noop fib sieve strings matrix sort alloc virtual exceptions fields kernels inlined arrays");
+                Console.WriteLine("workloads: noop fib sieve strings matrix sort alloc virtual exceptions fields kernels inlined arrays spawn pingpong fanout");
                 return 2;
         }
     }
@@ -386,5 +391,90 @@ public static class Program
             else counter.Misses++;
         }
         return counter.Hits + counter.Misses;
+    }
+
+    // ── Scheduler: task spawn rate ──────────────────────────────────────────
+    //
+    // Many tiny tasks, started and then all awaited. What is measured is the
+    // cost of making a task, queueing it, running it and completing it — the
+    // body is one multiply.
+    private static long Spawn(int count)
+    {
+        var tasks = new Task<long>[count];
+        for (int i = 0; i < count; i++)
+        {
+            long n = i;
+            tasks[i] = Task.Run(() => n * 3);
+        }
+        long sum = 0;
+        for (int i = 0; i < count; i++) sum += tasks[i].Result;
+        return sum;
+    }
+
+    // ── Scheduler: a channel ping-pong ──────────────────────────────────────
+    //
+    // Two tasks hand one value back and forth through two channels, so every
+    // message is a wake-up on the other side: the round-trip latency of a
+    // continuation, which a run queue decides.
+    private static long PingPong(int rounds)
+    {
+        var ping = System.Threading.Channels.Channel.CreateUnbounded<long>();
+        var pong = System.Threading.Channels.Channel.CreateUnbounded<long>();
+        var echo = Task.Run(async () =>
+        {
+            for (int i = 0; i < rounds; i++)
+            {
+                long v = await ping.Reader.ReadAsync();
+                await pong.Writer.WriteAsync(v + 1);
+            }
+        });
+        return Drive(ping.Writer, pong.Reader, rounds, echo).Result;
+    }
+
+    private static async Task<long> Drive(
+        System.Threading.Channels.ChannelWriter<long> ping,
+        System.Threading.Channels.ChannelReader<long> pong,
+        int rounds,
+        Task echo)
+    {
+        long value = 0;
+        for (int i = 0; i < rounds; i++)
+        {
+            await ping.WriteAsync(value);
+            value = await pong.ReadAsync();
+        }
+        await echo;
+        return value;
+    }
+
+    // ── Scheduler: fan-out / fan-in ─────────────────────────────────────────
+    //
+    // A million tasks, started from a few hundred parents rather than one loop,
+    // so the queue sees tasks made on workers as well as on the main thread —
+    // which is the case a per-core queue with stealing is for.
+    private static long FanOut(int total)
+    {
+        const int parents = 250;
+        int perParent = total / parents;
+        var outer = new Task<long>[parents];
+        for (int p = 0; p < parents; p++)
+        {
+            int start = p * perParent;
+            outer[p] = Task.Run(() =>
+            {
+                var inner = new Task<long>[perParent];
+                for (int i = 0; i < perParent; i++)
+                {
+                    long n = start + i;
+                    inner[i] = Task.Run(() => n & 0xFF);
+                }
+                long sum = 0;
+                for (int i = 0; i < perParent; i++) sum += inner[i].Result;
+                return sum;
+            });
+        }
+        long total2 = 0;
+        for (int p = 0; p < parents; p++) total2 += outer[p].Result;
+        return total2;
     }
 }

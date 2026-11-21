@@ -1,7 +1,8 @@
 # Plan
 
-The roadmap for RustNetRuntime. Milestones 1-3 and 5 are done; 4 and 6 are
-partly done. What remains is ordered by what unblocks the most real programs.
+The roadmap for RustNetRuntime. Milestones 1-3 and 5 are done; 4, 6 and 7 are
+partly done; 8 is planned. What remains is ordered by
+what unblocks the most real programs.
 
 ---
 
@@ -343,6 +344,123 @@ method and arguments, with a copy of its locals that `endfilter` writes back;
 the verdict returns through the same frame-floor mechanism a native-to-managed
 call uses. A filter that throws declines, per the spec, so the exception in
 flight is never replaced by one from the code asking about it.
+
+---
+
+## Milestone 8 — Concurrency platform, without leaving .NET ☐
+
+**Goal:** take the ideas in the *RustNetRuntime Concurrency Platform* proposal
+(green threads, channels, actors, structured concurrency, a faster scheduler)
+and land them **without costing compatibility in either direction**:
+
+- **A. .NET → RustCLR.** Existing C# runs unmodified. This is what the
+  Conformance fixture already checks.
+- **B. RustCLR → .NET.** A program written against the new APIs still builds
+  with the official SDK and runs on CoreCLR, printing the same bytes.
+
+B is the new constraint, and it is what decides most of the design below. It
+is done in this repository, not in a separate `Extensions` project: the work
+lands in crates and a managed library that already have a place to go, and a
+second project would mean a second copy of the loader and scheduler.
+
+### What the proposal asks for that this milestone declines
+
+| Proposal | Why it is declined | Instead |
+| --- | --- | --- |
+| New syntax: `go`, `select { }`, `actor`, `<-` | Needs a forked Roslyn. Code written with it no longer compiles with the official SDK, and what RustCLR runs would stop being "exactly what Roslyn produced" | Ordinary APIs (`Select.On(...)`). Source generators or analyzers later, if brevity is wanted — they ship with the official compiler |
+| A `System.Concurrency` namespace | `System.*` is Microsoft's; a future .NET can collide with it. Its `Channel<T>` would also shadow `System.Threading.Channels.Channel<T>` | `RustNet.Concurrency` |
+| `Channel<T>.Create()` as a second channel API | Two channel types that do the same thing, one of which only exists here | The real `System.Threading.Channels`, then build on it |
+| Green threads that *replace* OS threads | .NET semantics depend on thread identity: `[ThreadStatic]`, `ThreadLocal<T>`, `Monitor` re-entrancy by owner, `ManagedThreadId`, and a blocking P/Invoke holding a worker. Microsoft ran this experiment in runtime-lab (2023) and chose Runtime Async instead | Make `Task` and `await` cheap inside the scheduler, where no program can observe it. "Green thread" means a cheap way to run a task, not a new threading model |
+| Distributed actors, cluster runtime, an AI-agent runtime | Products, not runtime features, and Akka.NET and Orleans already exist | A stronger compatibility target: **run Akka.NET or Orleans unmodified on RustCLR** |
+| NUMA-aware scheduling | Pays only on multi-socket servers; nothing here measures it | Deferred until a benchmark row needs it |
+| Generational / regional / moving GC | Compiled code relies on the collector **never moving an object**: `Handle`s are opaque words and safe-point frames are described by fixed byte offsets. A moving collector is a rework of the JIT's safe points, not a change confined to `rustclr-gc` | Deferred; if taken up, it is its own milestone |
+
+### The rule that keeps direction B true
+
+The managed libraries today declare natives as `extern` +
+`[MethodImpl(InternalCall)]`. CoreCLR cannot run a method with no IL body, so
+those libraries run **only** on RustCLR. That is right for `RustNet.Hal` and
+wrong for a concurrency library.
+
+**Runs on dotnet, runs faster on RustCLR.** Every method in
+`RustNet.Concurrency` has a real C# body that is correct on CoreCLR. RustCLR
+recognises selected methods by identity at load time and substitutes a Rust
+implementation — the same idea as CoreCLR's `[Intrinsic]`. This is a new
+loader capability, and it must keep the existing one rule: a substitution is
+only ever an *optimisation* of a body that already gives the right answer, so
+a fixture can diff the two runtimes byte for byte with the substitution on and
+off.
+
+### Where the work goes
+
+| Work | Location |
+| --- | --- |
+| Per-core run queues with work stealing, priorities, CPU affinity | `crates/rustclr-sched` — still a swappable module |
+| `System.Threading.Channels`, `System.Collections.Concurrent`, `SemaphoreSlim`, `ThreadLocal<T>`, `[ThreadStatic]` | RustBCL (`crates/rustclr-bcl`) |
+| Intrinsic substitution by method identity | the loader in `crates/rustclr-core` |
+| Actors, mailboxes, `ConcurrencyScope`, pipelines, `Select` | a new `managed/RustNet.Concurrency` — one assembly, like the other seventeen, so a program that does not name it does not carry it |
+| Runtime metrics | the existing profiler and `GC.*` counters; OpenTelemetry export as a separate library |
+| Checks | `tests/fixtures/Conformance` for BCL surface; a new `tests/fixtures/Concurrency` for `RustNet.Concurrency`, run on both runtimes |
+
+### Phases and what "done" means for each
+
+**8.1 — The official surface first.** None of `System.Threading.Channels`,
+`ConcurrentDictionary`, `ConcurrentQueue`, `ConcurrentBag`,
+`BlockingCollection`, `SemaphoreSlim`, `ThreadLocal<T>` or `[ThreadStatic]`
+appears in RustBCL today, and `CancellationTokenSource` is partial. These are
+direction A, and 8.3 is built on them.
+*Done when:* each has Conformance checks — bounded and unbounded channels,
+`ReadAllAsync`, completion, a full `BoundedChannelFullMode` matrix, concurrent
+writers on several threads — that fail without it, and the fixture still
+matches `dotnet` byte for byte.
+**✓ Done 2026-11-21.** 47 new checks (499 → 546) in `ConcurrencyApiChecks.cs`; Conformance
+`checks=546 failures=0`, identical to `dotnet`. The types are C# embedded in
+RustBCL and lock-based; that and the other stated gaps are in
+`docs/limitations.md`. Details and the runtime bugs it surfaced: `Progress.md`.
+
+**8.2 — A faster scheduler nobody can see.** Work stealing across per-core
+queues, cheaper `Task` creation and continuation dispatch.
+*Done when:* new `benchmarks/` rows — task spawn rate, a channel ping-pong, a
+fan-out/fan-in of 1,000,000 tasks — improve against the current pool with no
+Conformance change, and swapping the scheduler module back still passes.
+*Status (2026-11-21): done.* `rustclr_sched::RunQueue` is the seam, with
+`WorkStealing` (default) and `GlobalFifo` (`--scheduler fifo`) behind it, and
+Conformance runs under both as a test. The three rows improved — numbers in
+`docs/benchmarks.md` — but **not because of stealing**: measured, the global
+heap lock that every field access takes is the bottleneck, and the win came
+from a governor that runs fewer workers while they only queue for that lock,
+idle workers that spin 15 µs before sleeping,
+plus fewer locks per task. A heap without one lock per field is the real fix
+and belongs with the collector, not here; `docs/limitations.md` says so.
+
+**8.3 — `RustNet.Concurrency` in plain C#.** `ConcurrencyScope` (lifetime,
+cancellation propagation, `AggregateException` of child failures), `Actor<T>`
+with a `Mailbox<T>` and supervision/restart, `Select` over channels, pipelines.
+Built only on 8.1.
+*Done when:* `tests/fixtures/Concurrency` prints identical output under
+`dotnet` and RustCLR, and the library references nothing that exists only on
+RustCLR.
+
+**8.4 — Native fast paths.** The intrinsic-substitution mechanism, then Rust
+implementations of whichever 8.3 methods a benchmark shows are worth it —
+channel send/receive and mailbox dispatch are the likely ones.
+*Done when:* the Concurrency fixture matches with substitution on and off, a
+substitution whose native disagrees with its IL body is caught by a test, and
+each substitution has a benchmark row showing it pays.
+
+**8.5 — Cheap tasks, if the interpreter allows it.** The interpreter already
+keeps an iterative frame stack, so an interpreted task can be parked without a
+machine stack. Compiled code runs on the machine stack and cannot. This phase
+exists only if 8.2's measurements show task cost is still the bottleneck, and
+it must not change thread identity as any program sees it.
+*Done when:* a benchmark of a million concurrent waiting tasks fits a stated
+memory bound, and every thread-identity check in Conformance still passes.
+
+**8.6 — Real-world libraries.** Run Akka.NET, and if that holds, Orleans'
+in-process silo, unmodified.
+*Done when:* a sample from each runs on RustCLR with output matching `dotnet`,
+and every gap found is either fixed with a Conformance check or named in
+`docs/limitations.md`.
 
 ---
 
