@@ -2829,6 +2829,7 @@ impl Loader {
             ("System.DateTime", &["MinValue", "MaxValue", "UnixEpoch"][..]),
             ("System.DateTimeOffset", &["MinValue", "MaxValue", "UnixEpoch"][..]),
             ("System.Guid", &["Empty"][..]),
+            ("System.Diagnostics.Stopwatch", &["Frequency", "IsHighResolution"][..]),
             ("System.Decimal", &["Zero", "One", "MinusOne", "MaxValue", "MinValue"][..]),
         ] {
             if let Some(type_id) = self.registry.find_type_by_name(ty) {

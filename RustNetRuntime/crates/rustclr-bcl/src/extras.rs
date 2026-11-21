@@ -1144,6 +1144,8 @@ fn fill_value_statics(interp: &mut Interpreter) {
         // A null Guid reads as the empty one everywhere, and installing must
         // not allocate: the profiler charges every allocation to a program.
         ("System.Guid", "Empty", Value::Null),
+        ("System.Diagnostics.Stopwatch", "Frequency", Value::I64(crate::runtime::STOPWATCH_FREQUENCY)),
+        ("System.Diagnostics.Stopwatch", "IsHighResolution", Value::I32(1)),
     ] {
         let Some(type_id) = interp.loader.registry.find_type_by_name(ty) else { continue };
         let field = interp

@@ -119,6 +119,12 @@ impl NativeTier for JitTier {
         "x86-64 baseline (tiered)"
     }
 
+    fn fork(&self) -> Option<Box<dyn NativeTier>> {
+        let mut tier = JitTier::with_threshold(self.threshold);
+        tier.set_inline(self.backend.inline);
+        Some(Box::new(tier))
+    }
+
     fn try_execute(
         &mut self,
         loader: &Loader,

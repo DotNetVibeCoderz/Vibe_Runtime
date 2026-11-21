@@ -232,46 +232,69 @@ sleeping worker only when none is already looking for work, and a worker that
 finds a job while looking wakes the next — so a burst of tasks wakes workers one
 at a time, not all at once.
 
-**More workers do not make heap-heavy tasks faster — one lock is why.** Every
-field a managed method reads or writes, and every allocation, takes the same
-heap lock. Running managed code on more threads therefore mostly adds threads
-queueing for it, and each hand-off between cores costs more than the field
-access it guards. Measured on 8 cores, with the worker count forced:
+**The heap is sharded, so threads mostly do not meet.** With threads, the
+heap is sixteen object spaces, each behind its own lock, and a thread allocates
+into the shard it was given; a handle carries its shard in the low bits of its
+index. Most objects are made and used by one thread — a closure, a boxed value,
+a string being built — and those never touch another thread's lock. Objects
+that are shared, a task another thread completes or a channel's queue, still
+contend, but only on the shard they live in.
+
+It used to be one lock for the whole heap, taken on every field access, and
+more workers mostly meant more threads queueing for it:
 
 | workload | 1 worker | 2 | 4 | 8 |
 | --- | ---: | ---: | ---: | ---: |
 | 100,000 `Task.Run` | 819 ms | 872 | 1,144 | 1,315 |
 | fan-out of 1,000,000 tasks | 6,140 ms | 7,860 | 10,615 | 15,518 |
-| channel ping-pong, 50,000 rounds | 5,884 ms | 5,987 | 5,933 | 5,976 |
 
-So the pool **runs fewer workers while they are only queueing**. A governor on
-the timer thread looks every 20 ms at how often the heap lock was found held
-against how many jobs finished; above two contended locks per job it halves the
-number of workers allowed to run, and while contention is low and work is
-waiting it raises it again, to the core count. A worker that blocks inside a job
-gives its slot back, so a limit of one cannot strand the job it is waiting on,
-and a tick that finds work queued and nothing finished raises the limit
-whatever contention says — a job spinning on a flag another job sets is slowed,
-not hung. The three Conformance checks that require two tasks to *genuinely*
-run at once pass, and were what caught the version of this that forgot to take
-the slot back.
+With shards the fan-out runs in about 2.3 s on eight workers. What crosses
+shards: a **collection** takes every shard in order and marks across all of
+them, since an object in one points at objects in others; an update that must
+see two objects at once names them and takes their shards in ascending order,
+which is what keeps two such updates from deadlocking; and **statistics** are
+counted per shard and summed when asked for. The collector's view of pressure
+is refreshed every 32 KB a shard allocates rather than on every allocation, so
+a collection can start up to that much late per shard — at most half a
+megabyte against a 4 MB trigger. A heap with a slot ceiling stays one shard,
+because a ceiling is one budget; boards have no threads and are unaffected.
+
+`GC.CollectionCount`, `GC.GetTotalAllocatedBytes` and the profiler read the
+summed numbers, so they agree with each other as before.
+
+**A governor still runs fewer workers when contention is pathological.** On
+the timer thread, every 20 ms, it reads what share of heap-lock acquisitions
+had to wait: above 20% it halves the number of workers allowed to run, below
+10% with work waiting it raises it again, to the core count. Measured on the
+sharded heap, a fan-out waits on 4–11% and is never throttled, 100,000
+one-line tasks on 14–16%, and a channel ping-pong about 4%. A worker that
+blocks inside a job gives its slot back, so a limit of one cannot strand the
+job it is waiting on, and a tick that finds work queued and nothing finished
+raises the limit whatever contention says — a job spinning on a flag another
+job sets is slowed, not hung. The three Conformance checks that require two
+tasks to *genuinely* run at once pass, and were what caught a version that
+forgot to take the slot back.
+
+The first governor divided contended locks by *finished jobs*, and that was
+the wrong denominator: a parent spawning four thousand children finishes
+nothing for a while, the ratio read as infinite, and once the heap was sharded
+it throttled the fan-out to one worker for no reason (3.6 s against 2.3 s).
 
 Idle workers also spin for 15 µs before sleeping, still counted as looking
 for work, so a loop of `Task.Run` does not pay a sleep and a wake per task. A
 spinning worker stays announced as blocked, so it never holds up a collection.
 
-This is a mitigation, not a fix. The fix is a heap that does not take one lock
-per field, and that is a change to the collector and to how compiled code
-reaches objects, not to the scheduler. Until then the honest summary is: tasks
-run concurrently and correctly, and a program whose tasks do mostly arithmetic
-in compiled code — not field access — is the kind that gets faster with cores.
+What is still well behind .NET is the cost of the interpreter itself, not the
+lock: a channel ping-pong is a chain of dependent hops, so it is as fast as one
+thread can run them, and that is about 13× .NET.
 
-**Pool workers interpret.** A worker's interpreter has no JIT tier; only the
-main thread's does. Arithmetic that compiles on the main thread runs
-interpreted inside `Parallel.For`: 16 chunks of a million-step loop took 80 ms
-sequentially on the main thread and about 2.6 s through `Parallel.For`, the same
-before and after this scheduler. Giving each worker a tier — or sharing one —
-is its own piece of work.
+**Every thread compiles.** A pool worker or a `Thread.Start` thread gets a JIT
+tier of its own, configured like the main thread's. Before, only the main
+thread compiled, and 16 chunks of a million-step loop took 80 ms sequentially
+but 2.6 s through `Parallel.For`; now they take about 25 ms in parallel. Each
+thread compiles what it runs hot rather than sharing one tier, because a
+compiled method's call table holds addresses inside its own tier, and sharing
+one between threads would put a lock on every compiled call.
 
 **`RUSTCLR_GC_STRESS=<bytes>`** makes every heap collect each time that many
 bytes have been allocated. It is a diagnostic: a collection must never change

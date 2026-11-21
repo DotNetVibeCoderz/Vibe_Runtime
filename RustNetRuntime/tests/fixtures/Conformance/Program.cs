@@ -713,6 +713,34 @@ static partial class Program
     }
 
     /// `Task.Delay` arms a timer and returns; it does not stop its caller.
+    static bool StopwatchUnitsAgree()
+    {
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        Thread.Sleep(30);
+        watch.Stop();
+        TimeSpan elapsed = watch.Elapsed;
+        long ticks = watch.ElapsedTicks;
+        double fromTicks = ticks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        // Not "at least 30 ms": the test harness runs this on a deterministic
+        // clock that a sleep does not move. What must hold anywhere is that
+        // time moved and the two units agree.
+        return System.Diagnostics.Stopwatch.IsHighResolution
+            && elapsed > TimeSpan.Zero
+            && Math.Abs(fromTicks - elapsed.TotalMilliseconds) < 1.0
+            && watch.ElapsedMilliseconds == (long)elapsed.TotalMilliseconds
+            && watch.Elapsed == elapsed; // stopped, so it no longer moves
+    }
+
+    static bool StopwatchTimestamps()
+    {
+        long start = System.Diagnostics.Stopwatch.GetTimestamp();
+        Thread.Sleep(20);
+        long end = System.Diagnostics.Stopwatch.GetTimestamp();
+        TimeSpan between = System.Diagnostics.Stopwatch.GetElapsedTime(start, end);
+        TimeSpan sinceStart = System.Diagnostics.Stopwatch.GetElapsedTime(start);
+        return end > start && between > TimeSpan.Zero && sinceStart >= between;
+    }
+
     static bool DelayOverlaps()
     {
         var watch = System.Diagnostics.Stopwatch.StartNew();
@@ -2148,6 +2176,15 @@ static partial class Program
         Check("blocked workers do not stall the queue", BlockingTasksFinish());
         CheckEq("a task awaiting a task", NestedTask(), 42);
         Check("Task.Delay overlaps its caller", DelayOverlaps());
+
+        // -- Stopwatch below the millisecond ---------------------------------
+        //
+        // `Elapsed` and `ElapsedTicks` were missing because the clock counted
+        // milliseconds. `ElapsedTicks` is in units of `Frequency`, which is not
+        // `TimeSpan` ticks; both are checked against each other.
+
+        Check("Stopwatch.Elapsed and ElapsedTicks agree", StopwatchUnitsAgree());
+        Check("Stopwatch.GetTimestamp and GetElapsedTime", StopwatchTimestamps());
 
         // -- await suspends rather than blocking ------------------------------
         //

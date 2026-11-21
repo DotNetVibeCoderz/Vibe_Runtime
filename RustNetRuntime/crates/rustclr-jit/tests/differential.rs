@@ -796,3 +796,26 @@ fn the_inliner_flattens_more_than_one_level() {
         "the compiled run never entered compiled code, so it compared nothing"
     );
 }
+
+/// A thread the program starts — a pool worker, a `Thread.Start` — compiles
+/// too. Without this, arithmetic that compiled on the main thread ran
+/// interpreted inside `Parallel.For`: 16 chunks of a million-step loop took
+/// 80 ms on the main thread and 2.6 s across eight workers.
+#[test]
+fn a_worker_thread_gets_a_tier_of_its_own() {
+    let mut parent = Interpreter::with_host(Box::new(CaptureHost::new()));
+    let mut tier = JitTier::with_threshold(7);
+    tier.set_inline(false);
+    parent.native_tier = Some(Box::new(tier));
+
+    let worker = parent.worker(Box::new(CaptureHost::new()));
+    let forked = worker.native_tier.as_ref().expect("the worker has a tier");
+    assert_eq!(forked.name(), parent.native_tier.as_ref().unwrap().name());
+    // Its own, not a share of the parent's: nothing compiled yet.
+    assert_eq!(forked.stats(), (0, 0));
+
+    // And an interpreter that was told not to compile starts threads that
+    // do not compile either.
+    let plain = Interpreter::with_host(Box::new(CaptureHost::new()));
+    assert!(plain.worker(Box::new(CaptureHost::new())).native_tier.is_none());
+}

@@ -513,15 +513,18 @@ fn register_time(interp: &mut Interpreter) {
         Ok(Some(Value::I64(arg_i64(i, a, 0)? * 10_000)))
     });
 
-    // A `Stopwatch` is an object with two slots: when the current run began,
-    // and how much time earlier runs added up to. `_start` is -1 while stopped.
+    // A `Stopwatch` is an object with two slots, both in nanoseconds: when the
+    // current run began, and how much time earlier runs added up to. `_start`
+    // is -1 while stopped.
     //
     // It used to be a bare number — the moment it was started — which reads
     // `ElapsedMilliseconds` correctly and cannot express `Restart`, because
     // `this` for a class arrives by value and there is nothing to write back to.
+    // It used to count milliseconds, too, which is why `Elapsed` and
+    // `ElapsedTicks` were missing: a millisecond clock has no ticks to give.
     interp.register_native("System.Diagnostics.Stopwatch::StartNew()", |i, _a| {
         let watch = new_stopwatch(i)?;
-        let now = i.host.monotonic_millis() as i64;
+        let now = now_nanos(i);
         set_field(i, watch, WATCH_START, Value::I64(now));
         Ok(Some(Value::Obj(watch)))
     });
@@ -537,7 +540,18 @@ fn register_time(interp: &mut Interpreter) {
     }
     interp.register_native("System.Diagnostics.Stopwatch::get_ElapsedMilliseconds()", |i, a| {
         let watch = arg(i, a, 0)?.as_handle().unwrap_or(rustclr_gc::Handle::NULL);
-        Ok(Some(Value::I64(elapsed_millis(i, watch))))
+        Ok(Some(Value::I64(elapsed_nanos(i, watch) / 1_000_000)))
+    });
+    // A `TimeSpan` is its count of 100 ns ticks.
+    interp.register_native("System.Diagnostics.Stopwatch::get_Elapsed()", |i, a| {
+        let watch = arg(i, a, 0)?.as_handle().unwrap_or(rustclr_gc::Handle::NULL);
+        Ok(Some(Value::I64(elapsed_nanos(i, watch) / 100)))
+    });
+    // In units of `Frequency`, which is not the same as `TimeSpan` ticks —
+    // the most common Stopwatch bug in .NET code, and kept faithfully.
+    interp.register_native("System.Diagnostics.Stopwatch::get_ElapsedTicks()", |i, a| {
+        let watch = arg(i, a, 0)?.as_handle().unwrap_or(rustclr_gc::Handle::NULL);
+        Ok(Some(Value::I64(nanos_to_timestamp(elapsed_nanos(i, watch)))))
     });
     interp.register_native("System.Diagnostics.Stopwatch::get_IsRunning()", |i, a| {
         let watch = arg(i, a, 0)?.as_handle().unwrap_or(rustclr_gc::Handle::NULL);
@@ -547,7 +561,7 @@ fn register_time(interp: &mut Interpreter) {
     interp.register_native("System.Diagnostics.Stopwatch::Start()", |i, a| {
         let watch = arg(i, a, 0)?.as_handle().unwrap_or(rustclr_gc::Handle::NULL);
         if field(i, watch, WATCH_START).as_i64().unwrap_or(-1) < 0 {
-            let now = i.host.monotonic_millis() as i64;
+            let now = now_nanos(i);
             set_field(i, watch, WATCH_START, Value::I64(now));
         }
         Ok(None)
@@ -556,7 +570,7 @@ fn register_time(interp: &mut Interpreter) {
         let watch = arg(i, a, 0)?.as_handle().unwrap_or(rustclr_gc::Handle::NULL);
         let start = field(i, watch, WATCH_START).as_i64().unwrap_or(-1);
         if start >= 0 {
-            let now = i.host.monotonic_millis() as i64;
+            let now = now_nanos(i);
             let accumulated = field(i, watch, WATCH_ELAPSED).as_i64().unwrap_or(0);
             set_field(i, watch, WATCH_ELAPSED, Value::I64(accumulated + (now - start).max(0)));
             set_field(i, watch, WATCH_START, Value::I64(-1));
@@ -571,10 +585,25 @@ fn register_time(interp: &mut Interpreter) {
     });
     interp.register_native("System.Diagnostics.Stopwatch::Restart()", |i, a| {
         let watch = arg(i, a, 0)?.as_handle().unwrap_or(rustclr_gc::Handle::NULL);
-        let now = i.host.monotonic_millis() as i64;
+        let now = now_nanos(i);
         set_field(i, watch, WATCH_START, Value::I64(now));
         set_field(i, watch, WATCH_ELAPSED, Value::I64(0));
         Ok(None)
+    });
+    // The allocation-free way to time something, and what .NET 7+ code uses.
+    interp.register_native("System.Diagnostics.Stopwatch::GetTimestamp()", |i, _a| {
+        let now = now_nanos(i);
+        Ok(Some(Value::I64(nanos_to_timestamp(now))))
+    });
+    interp.register_native("System.Diagnostics.Stopwatch::GetElapsedTime(long)", |i, a| {
+        let start = arg_i64(i, a, 0)?;
+        let now = nanos_to_timestamp(now_nanos(i));
+        Ok(Some(Value::I64(timestamp_to_timespan_ticks(now.wrapping_sub(start)))))
+    });
+    interp.register_native("System.Diagnostics.Stopwatch::GetElapsedTime(long,long)", |i, a| {
+        let start = arg_i64(i, a, 0)?;
+        let end = arg_i64(i, a, 1)?;
+        Ok(Some(Value::I64(timestamp_to_timespan_ticks(end.wrapping_sub(start)))))
     });
 
     interp.register_native("System.Threading.Thread::Sleep(int)", |i, a| {
@@ -914,13 +943,32 @@ fn new_stopwatch(interp: &mut Interpreter) -> rustclr_core::ExecResult<rustclr_g
     Ok(watch)
 }
 
-/// Time on the clock: what earlier runs added up to, plus the current run.
-fn elapsed_millis(interp: &mut Interpreter, watch: rustclr_gc::Handle) -> i64 {
+/// Ticks per second of `Stopwatch.GetTimestamp`, as .NET reports it: the
+/// performance counter's 10 MHz on Windows, nanoseconds elsewhere. Matching it
+/// is what lets a program that prints `Frequency` print the same thing.
+pub(crate) const STOPWATCH_FREQUENCY: i64 =
+    if cfg!(windows) { 10_000_000 } else { 1_000_000_000 };
+
+fn now_nanos(interp: &mut Interpreter) -> i64 {
+    interp.host.monotonic_nanos() as i64
+}
+
+fn nanos_to_timestamp(nanos: i64) -> i64 {
+    (nanos as i128 * STOPWATCH_FREQUENCY as i128 / 1_000_000_000) as i64
+}
+
+/// `Stopwatch` ticks to `TimeSpan` ticks, which are 100 ns.
+fn timestamp_to_timespan_ticks(ticks: i64) -> i64 {
+    (ticks as i128 * 10_000_000 / STOPWATCH_FREQUENCY as i128) as i64
+}
+
+/// Time on the clock, in nanoseconds: what earlier runs added up to, plus the
+/// current run.
+fn elapsed_nanos(interp: &mut Interpreter, watch: rustclr_gc::Handle) -> i64 {
     let accumulated = field(interp, watch, WATCH_ELAPSED).as_i64().unwrap_or(0);
     let start = field(interp, watch, WATCH_START).as_i64().unwrap_or(-1);
     if start < 0 {
         return accumulated;
     }
-    let now = interp.host.monotonic_millis() as i64;
-    accumulated + (now - start).max(0)
+    accumulated + (now_nanos(interp) - start).max(0)
 }

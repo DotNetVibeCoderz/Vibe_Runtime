@@ -44,23 +44,25 @@
 //!
 //! # How many workers run at once
 //!
-//! Not always all of them. Every field a managed method reads or writes goes
-//! through one heap lock, so workers running heap-heavy code mostly queue for
-//! it, and each hand-off between cores costs more than the field access it
-//! guards. Measured on this machine (8 cores), best of one run:
+//! Usually all of them. Every field a managed method reads or writes takes the
+//! lock of the heap shard the object lives in. Threads mostly touch objects
+//! they made themselves, which live in their own shard, so they mostly do not
+//! meet — but a burst of tiny tasks that all touch shared objects can still
+//! leave workers queueing more than working.
+//!
+//! Before the heap was sharded it was one lock, and this was the common case,
+//! not the exception. Measured on this machine (8 cores), best of one run:
 //!
 //! | workload | 1 worker | 2 | 4 | 8 |
 //! | --- | --- | --- | --- | --- |
 //! | 100,000 `Task.Run` | 819 ms | 872 | 1,144 | 1,315 |
 //! | fan-out of 1,000,000 tasks | 6,140 ms | 7,860 | 10,615 | 15,518 |
 //!
-//! Pinning the pool to one worker would be wrong the other way: compiled
-//! arithmetic in a `Parallel.For` touches the heap rarely, and does get
-//! faster with every core. So the pool measures. A governor on the timer
-//! thread compares, every tick, how often the heap lock was found held
-//! against how many jobs finished, and moves a limit on running workers — down
-//! while they mostly queue for the heap, back up while they do not and work
-//! is waiting. A worker over the limit sleeps instead of taking a job.
+//! So the pool measures. A governor on the timer thread reads, every tick,
+//! what share of heap-lock acquisitions had to wait, and moves a limit on
+//! running workers: halved above 20%, raised again below 10% while work is
+//! waiting. A worker over the limit sleeps instead of taking a job. On the
+//! sharded heap the fan-out waits on 4–11% and is never throttled.
 //!
 //! Two things keep the limit from ever costing correctness. A worker that
 //! *blocks* inside a job gives its slot back (see [`TaskPool::worker_blocking`]),
@@ -442,9 +444,9 @@ impl TaskPool {
 #[derive(Default)]
 struct Governor {
     contended: usize,
+    acquisitions: usize,
     completed: usize,
 }
-
 
 /// How long an idle worker looks for work before it sleeps. Measured: with no
 /// spin, 100,000 `Task.Run` took about 1,100 ms; with 15 µs, about 550 ms; with
@@ -455,20 +457,32 @@ const IDLE_SPIN: rustclr_thread::time::Duration = rustclr_thread::time::Duration
 /// How often the governor looks.
 const GOVERNOR_TICK: rustclr_thread::time::Duration = rustclr_thread::time::Duration::from_millis(20);
 
-/// Contended heap locks per finished job above which more workers are only
-/// queueing for the heap. Measured, not derived: a hundred thousand one-line
-/// tasks on eight workers found the lock held about three times per job, and
-/// a fan-out about eleven; compiled arithmetic split into one chunk per core,
-/// close to none.
-const CONTENDED_PER_JOB_TOO_MANY: usize = 2;
+/// Percent of heap-lock acquisitions that had to wait, above which more
+/// workers are mostly queueing, and below which more may help.
+///
+/// Measured on eight workers over the sharded heap: a fan-out of a million
+/// tasks waited on 4–11% of acquisitions and finished in 2.4 s unthrottled
+/// against 3.6 s throttled to one; 100,000 one-line `Task.Run`s waited on
+/// 14–16%; a channel ping-pong about 4%. The bar sits above all of them, so
+/// the governor acts only when contention is pathological.
+///
+/// It used to be "contended locks per *finished job*", which was the wrong
+/// denominator: a job that runs long — a parent spawning four thousand
+/// children — finishes nothing for a while, the ratio read as infinite, and
+/// the pool throttled itself to one worker through the whole fan-out.
+const WAITING_PERCENT_TOO_MANY: usize = 20;
+const WAITING_PERCENT_ROOM: usize = 10;
 
 /// One tick: moves the limit on running workers. See the module note.
 fn govern(inner: &Inner, last: &mut Governor) {
     let contended = inner.heap.contended_acquisitions();
+    let acquisitions = inner.heap.acquisitions();
     let completed = inner.completed.load(Ordering::Relaxed);
-    let dc = contended.wrapping_sub(last.contended);
-    let dj = completed.wrapping_sub(last.completed);
+    let waited = contended.wrapping_sub(last.contended);
+    let taken = acquisitions.wrapping_sub(last.acquisitions);
+    let finished = completed.wrapping_sub(last.completed);
     last.contended = contended;
+    last.acquisitions = acquisitions;
     last.completed = completed;
 
     let limit = inner.limit.load(Ordering::SeqCst);
@@ -479,18 +493,23 @@ fn govern(inner: &Inner, last: &mut Governor) {
         let _guard = inner.lock.lock().expect("the task pool is poisoned");
         inner.work_available.notify_one();
     };
+    // Too few acquisitions to say anything: leave the limit where it is.
+    let measured = taken >= 1_000;
 
-    if backlog > 0 && dj == 0 && limit < workers {
+    if backlog > 0 && finished == 0 && limit < workers {
         // Work waiting and nothing finishing: whatever the reason, one more
         // worker. This is the rule that turns a would-be hang into a delay.
         raise(limit + 1);
-    } else if dj > 0 && dc > dj * CONTENDED_PER_JOB_TOO_MANY && limit > 1 {
+    } else if measured && waited * 100 > taken * WAITING_PERCENT_TOO_MANY && limit > 1 {
         // Halved, not decremented — the rule TCP uses for the same problem.
         // A burst of tiny tasks is often over in a fraction of a second, and
         // stepping eight workers down one tick at a time spent most of it
         // with too many running.
         inner.limit.store((limit / 2).max(1), Ordering::SeqCst);
-    } else if backlog > 0 && dc * 4 <= dj && limit < inner.size.min(workers) {
+    } else if backlog > 0
+        && (!measured || waited * 100 <= taken * WAITING_PERCENT_ROOM)
+        && limit < inner.size.min(workers)
+    {
         raise(limit + 1);
     }
 }

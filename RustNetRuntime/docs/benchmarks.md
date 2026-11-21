@@ -38,11 +38,14 @@ Three rows that time the task pool rather than the code generator, and on these
 RustCLR is well behind — said first, so the improvement below is not mistaken
 for parity. Median of five runs, same machine (8 cores).
 
-| Workload | .NET (ms) | RustCLR before 8.2 | RustCLR now | `--scheduler fifo` | What it stresses |
+| Workload | .NET (ms) | RustCLR before 8.2 | after 8.2 | **now** | What it stresses |
 | --- | ---: | ---: | ---: | ---: | --- |
-| `spawn` | 292 | ~1,350 | **552** (1.9×) | 566 | 100,000 `Task.Run(() => n*3)`, then every `.Result` |
-| `pingpong` | 307 | ~5,300 | **4,263** (13.9×) | 4,318 | 50,000 round trips through two unbounded channels |
-| `fanout` | 1,045 | ~14,700 | **4,605** (4.4×) | 8,129 | 250 tasks each starting 4,000 more, a million in all |
+| `spawn` | 222–292 | ~1,350 | 552 | **567** (2.6×) | 100,000 `Task.Run(() => n*3)`, then every `.Result` |
+| `pingpong` | 250–307 | ~5,300 | 4,263 | **4,035** (16×) | 50,000 round trips through two unbounded channels |
+| `fanout` | 902–1,045 | ~14,700 | 4,605 | **2,360** (2.6×) | 250 tasks each starting 4,000 more, a million in all |
+
+"Now" is best of three from `run.sh`, after the heap was sharded (see below);
+.NET's own time varies by run, so its range is given.
 
 "Before" is the pool as it stood at the start of 8.2, *with* the two
 safe-point fixes this work found applied — without them `pingpong` crashed and
@@ -66,9 +69,16 @@ What moved them, in the order it was measured:
 4. **Idle workers spin 15 µs before sleeping**, so a producer handing out tiny
    tasks does not pay a futex wake per task (`spawn` ~1,100 → 552 ms).
 
-The fix that would close the gap with .NET is a heap that does not take a lock
-per field access, which is collector work rather than scheduler work;
-`docs/limitations.md` says so.
+5. **The heap was sharded** — sixteen object spaces, each with its own lock,
+   and a thread allocates into its own — so objects one thread made never
+   meet another thread's lock (`fanout` 4.6 → 2.4 s). The governor's measure
+   changed with it: it had divided contended locks by *finished jobs*, read a
+   fan-out's long-running parents as infinite contention, and throttled the
+   whole run to one worker. It now reads the share of acquisitions that had
+   to wait, and a fan-out (4–11%) is never throttled.
+
+`pingpong` is a chain of dependent hops, so no amount of parallelism helps it:
+it runs as fast as one thread can interpret each hop, and that is the gap.
 
 Every row's checksum is compared between the two runtimes before it is timed;
 a mismatch prints `MISMATCH` instead of a number, because a faster wrong answer

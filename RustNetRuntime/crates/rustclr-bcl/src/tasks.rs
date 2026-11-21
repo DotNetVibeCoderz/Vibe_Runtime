@@ -432,28 +432,43 @@ fn transition(interp: &mut Interpreter, task: Handle, status: i32, payload: Valu
     // Under one heap lock, which is what `add_continuation` takes too: the two
     // cannot interleave, so a continuation is either added before this takes
     // the list or sees the task final and runs itself.
-    let taken = interp.with_roots(&rooted, |interp| interp.heap.atomically(|heap| {
-        let object = heap.get_as_mut::<ClrObject>(task)?;
-        if object.fields.get(STATUS).and_then(|v| v.as_i32()).unwrap_or(PENDING) != PENDING {
-            return None;
+    let taken = interp.with_roots(&rooted, |interp| loop {
+        // The task and its list may live in different shards of the heap, so
+        // both are named up front and locked together. The list is read
+        // before the lock and checked again under it: if `add_continuation`
+        // installed one in between, this goes round again.
+        let expected = field_handle(interp, task, CONTINUATIONS);
+        let outcome = interp.heap.atomically(&[task, expected], |heap| {
+            let object = heap.get_as_mut::<ClrObject>(task)?;
+            if object.fields.get(STATUS).and_then(|v| v.as_i32()).unwrap_or(PENDING) != PENDING {
+                return Some(None);
+            }
+            let list = object.fields[CONTINUATIONS].as_handle().unwrap_or(Handle::NULL);
+            if list != expected {
+                return None;
+            }
+            // The payload first, the status last. A reader checks the status
+            // without this lock — `IsCompleted`, `settle` — and then reads the
+            // result, so a status published before its result let `.Result`
+            // see a finished task holding nothing: a ping-pong benchmark
+            // printed 0.
+            let slot = if status == COMPLETED { RESULT } else { EXCEPTION };
+            object.fields[slot] = payload.clone();
+            object.fields[STATUS] = Value::I32(status);
+            object.fields[CONTINUATIONS] = Value::Null;
+            let waiting = if list.is_null() {
+                Vec::new()
+            } else {
+                heap.get_as::<rustclr_core::ClrArray>(list)
+                    .map(|a| (0..a.len()).filter_map(|n| a.storage.get(n)).collect())
+                    .unwrap_or_default()
+            };
+            Some(Some(waiting))
+        });
+        if let Some(done) = outcome {
+            break done;
         }
-        // The payload first, the status last. A reader checks the status
-        // without this lock — `IsCompleted`, `settle` — and then reads the
-        // result, so a status published before its result let `.Result` see a
-        // finished task holding nothing: a ping-pong benchmark printed 0.
-        let slot = if status == COMPLETED { RESULT } else { EXCEPTION };
-        object.fields[slot] = payload;
-        object.fields[STATUS] = Value::I32(status);
-        let list = core::mem::replace(&mut object.fields[CONTINUATIONS], Value::Null);
-        let waiting = match list.as_handle().filter(|h| !h.is_null()) {
-            Some(list) => heap
-                .get_as::<rustclr_core::ClrArray>(list)
-                .map(|a| (0..a.len()).filter_map(|n| a.storage.get(n)).collect())
-                .unwrap_or_default(),
-            None => Vec::new(),
-        };
-        Some(waiting)
-    }));
+    });
     match taken {
         // Resuming runs managed code, which may await again — so it happens
         // after the lock is released, never under it.
@@ -547,30 +562,42 @@ fn add_continuation(interp: &mut Interpreter, task: Handle, entry: Value) -> boo
         Handle::NULL
     };
     let rooted = [Value::Obj(task), entry.clone(), Value::Obj(fresh)];
-    interp.with_roots(&rooted, |interp| interp.heap.atomically(|heap| {
-        let Some(object) = heap.get_as_mut::<ClrObject>(task) else { return true };
-        if object.fields.get(STATUS).and_then(|v| v.as_i32()).unwrap_or(PENDING) != PENDING {
-            return true;
-        }
-        let list = match object.fields[CONTINUATIONS].as_handle().filter(|h| !h.is_null()) {
-            Some(list) => list,
-            None if !fresh.is_null() => {
+    interp.with_roots(&rooted, |interp| loop {
+        // Named up front because each may live in its own shard; see
+        // `transition` for why the list is read twice.
+        let expected = field_handle(interp, task, CONTINUATIONS);
+        let outcome = interp.heap.atomically(&[task, expected, fresh], |heap| {
+            let Some(object) = heap.get_as_mut::<ClrObject>(task) else { return Some(true) };
+            if object.fields.get(STATUS).and_then(|v| v.as_i32()).unwrap_or(PENDING) != PENDING {
+                return Some(true);
+            }
+            let current = object.fields[CONTINUATIONS].as_handle().unwrap_or(Handle::NULL);
+            if current != expected {
+                return None;
+            }
+            let list = if !current.is_null() {
+                current
+            } else if !fresh.is_null() {
                 object.fields[CONTINUATIONS] = Value::Obj(fresh);
                 fresh
-            }
-            // Pending, with no list, and none made: the list was taken by a
-            // completion that then — impossibly — left the task pending.
-            // Refusing to lose the entry, the caller runs it.
-            None => return true,
-        };
-        match heap.get_as_mut::<rustclr_core::ClrArray>(list).and_then(|a| a.storage.values_mut()) {
-            Some(values) => {
-                values.push(entry);
-                false
-            }
-            None => true,
+            } else {
+                // Pending, with no list, and none made: the list was taken by
+                // a completion that then — impossibly — left the task pending.
+                // Refusing to lose the entry, the caller runs it.
+                return Some(true);
+            };
+            Some(match heap.get_as_mut::<rustclr_core::ClrArray>(list).and_then(|a| a.storage.values_mut()) {
+                Some(values) => {
+                    values.push(entry.clone());
+                    false
+                }
+                None => true,
+            })
+        });
+        if let Some(done) = outcome {
+            break done;
         }
-    }))
+    })
 }
 
 /// Resumes everything that was waiting on `task`.

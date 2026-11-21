@@ -25,6 +25,16 @@ pub struct ObjectSpace {
     live_count: usize,
     /// Hard ceiling on slots, for a fixed heap. `None` means grow on demand.
     limit: Option<usize>,
+    /// Which shard of a sharded heap this is, and log2 of how many there are.
+    ///
+    /// A handle's index carries its shard in the low `shift` bits, so finding
+    /// the space that owns a handle is a mask, and a handle presented to the
+    /// wrong space fails validation rather than naming a stranger's slot.
+    /// Both zero for an unsharded space, where encoding is the identity.
+    #[cfg(feature = "threads")]
+    shard: u32,
+    #[cfg(feature = "threads")]
+    shift: u32,
 }
 
 impl Default for ObjectSpace {
@@ -41,19 +51,59 @@ impl ObjectSpace {
             live_bytes: 0,
             live_count: 0,
             limit: None,
+            #[cfg(feature = "threads")]
+            shard: 0,
+            #[cfg(feature = "threads")]
+            shift: 0,
         }
+    }
+
+    /// Shard `shard` of `1 << shift`.
+    #[cfg(feature = "threads")]
+    pub(crate) fn shard(shard: u32, shift: u32) -> Self {
+        debug_assert!(shard < (1 << shift));
+        let mut space = Self::new();
+        space.shard = shard;
+        space.shift = shift;
+        space
+    }
+
+    /// A slot number as the handle spells it.
+    #[inline]
+    fn encode(&self, local: u32) -> u32 {
+        #[cfg(feature = "threads")]
+        {
+            (local << self.shift) | self.shard
+        }
+        #[cfg(not(feature = "threads"))]
+        {
+            local
+        }
+    }
+
+    /// The slot a handle names in *this* space, or `None` if it is another
+    /// shard's.
+    #[inline]
+    fn local(&self, handle: Handle) -> Option<usize> {
+        let index = handle.index();
+        #[cfg(feature = "threads")]
+        if self.shift != 0 {
+            let mask = (1usize << self.shift) - 1;
+            if index & mask != self.shard as usize {
+                return None;
+            }
+            return Some(index >> self.shift);
+        }
+        Some(index)
     }
 
     /// Pre-reserves capacity, useful on embedded targets where the heap size is
     /// fixed up front.
     pub fn with_capacity(slots: usize) -> Self {
-        Self {
-            slots: Vec::with_capacity(slots),
-            free_list: Vec::with_capacity(slots / 4),
-            live_bytes: 0,
-            live_count: 0,
-            limit: None,
-        }
+        let mut space = Self::new();
+        space.slots = Vec::with_capacity(slots);
+        space.free_list = Vec::with_capacity(slots / 4);
+        space
     }
 
     /// Pre-reserves capacity *and* refuses to exceed it.
@@ -126,7 +176,8 @@ impl ObjectSpace {
             slot.marked = false;
             slot.pins = 0;
             slot.bytes = bytes;
-            return Handle::new(index, slot.generation);
+            let generation = slot.generation;
+            return Handle::new(self.encode(index), generation);
         }
 
         let index = self.slots.len() as u32;
@@ -138,7 +189,7 @@ impl ObjectSpace {
             pins: 0,
             bytes,
         });
-        Handle::new(index, generation)
+        Handle::new(self.encode(index), generation)
     }
 
     #[inline]
@@ -146,7 +197,7 @@ impl ObjectSpace {
         if handle.is_null() {
             return None;
         }
-        let slot = self.slots.get(handle.index())?;
+        let slot = self.slots.get(self.local(handle)?)?;
         (slot.generation.get() == handle.generation() && slot.object.is_some()).then_some(slot)
     }
 
@@ -156,7 +207,8 @@ impl ObjectSpace {
             return None;
         }
         let want_generation = handle.generation();
-        let slot = self.slots.get_mut(handle.index())?;
+        let local = self.local(handle)?;
+        let slot = self.slots.get_mut(local)?;
         (slot.generation.get() == want_generation && slot.object.is_some()).then_some(slot)
     }
 
@@ -245,7 +297,7 @@ impl ObjectSpace {
             .iter()
             .enumerate()
             .filter(|(_, s)| s.pins > 0 && s.object.is_some())
-            .map(|(i, s)| Handle::new(i as u32, s.generation))
+            .map(|(i, s)| Handle::new(self.encode(i as u32), s.generation))
             .collect()
     }
 
@@ -273,8 +325,23 @@ impl ObjectSpace {
             .iter()
             .enumerate()
             .filter(|(_, s)| s.object.is_some())
-            .map(|(i, s)| Handle::new(i as u32, s.generation))
+            .map(|(i, s)| Handle::new(self.encode(i as u32), s.generation))
     }
+}
+
+/// The space among `spaces` that owns `handle`.
+///
+/// `spaces` is either one unsharded space or every shard of a heap, in shard
+/// order — the two shapes a collector is handed — so the shard is the low bits
+/// of the index and finding it is a mask.
+#[inline]
+pub(crate) fn route<'a>(spaces: &'a mut [&mut ObjectSpace], handle: Handle) -> Option<&'a mut ObjectSpace> {
+    if handle.is_null() {
+        return None;
+    }
+    let n = spaces.len();
+    let i = if n == 1 { 0 } else { handle.index() & (n - 1) };
+    spaces.get_mut(i).map(|s| &mut **s)
 }
 
 impl core::fmt::Debug for ObjectSpace {

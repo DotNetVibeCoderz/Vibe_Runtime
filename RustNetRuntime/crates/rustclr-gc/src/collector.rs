@@ -6,7 +6,7 @@
 
 use crate::handle::Handle;
 use crate::object::Tracer;
-use crate::space::ObjectSpace;
+use crate::space::{route, ObjectSpace};
 use alloc::vec::Vec;
 
 /// Supplies the roots of the object graph: interpreter stacks, static fields,
@@ -82,7 +82,11 @@ pub trait Collector: Send + Sync {
     fn should_collect(&self, pressure: &HeapPressure) -> bool;
 
     /// Reclaims unreachable objects.
-    fn collect(&mut self, space: &mut ObjectSpace, roots: &dyn RootSet) -> CollectionReport;
+    ///
+    /// `spaces` is the whole heap: one space, or every shard of a sharded one
+    /// in shard order. Objects in one shard point at objects in another, so a
+    /// collector has to see them all at once.
+    fn collect(&mut self, spaces: &mut [&mut ObjectSpace], roots: &dyn RootSet) -> CollectionReport;
 }
 
 /// Classic tracing mark-and-sweep.
@@ -149,18 +153,23 @@ impl Collector for MarkSweep {
             && pressure.bytes_since_last_collection >= self.allocation_trigger
     }
 
-    fn collect(&mut self, space: &mut ObjectSpace, roots: &dyn RootSet) -> CollectionReport {
-        space.clear_marks();
+    fn collect(&mut self, spaces: &mut [&mut ObjectSpace], roots: &dyn RootSet) -> CollectionReport {
+        for space in spaces.iter_mut() {
+            space.clear_marks();
+        }
 
         // --- mark ------------------------------------------------------------
         let mut worklist = Vec::new();
         roots.collect_roots(&mut worklist);
         let roots_scanned = worklist.len();
         // Pinned objects are roots too: native code may hold them.
-        worklist.extend(space.pinned_handles());
+        for space in spaces.iter() {
+            worklist.extend(space.pinned_handles());
+        }
 
         let mut tracer = Tracer::default();
         while let Some(handle) = worklist.pop() {
+            let Some(space) = route(spaces, handle) else { continue };
             if !space.mark(handle) {
                 continue; // null, stale, or already marked
             }
@@ -169,18 +178,24 @@ impl Collector for MarkSweep {
         }
 
         // --- sweep -----------------------------------------------------------
-        let (objects_freed, bytes_freed) = space.sweep();
+        let (mut objects_freed, mut bytes_freed) = (0, 0);
+        for space in spaces.iter_mut() {
+            let (objects, bytes) = space.sweep();
+            objects_freed += objects;
+            bytes_freed += bytes;
+        }
+        let (live_count, live_bytes) = totals(spaces);
 
         // Widen the trigger so a program with a large live set does not spend
         // all its time collecting.
         let next = (self.allocation_trigger as f32 * self.growth_factor) as usize;
-        self.allocation_trigger = next.max(space.live_bytes()).min(usize::MAX / 2);
+        self.allocation_trigger = next.max(live_bytes).min(usize::MAX / 2);
 
         CollectionReport {
             objects_freed,
             bytes_freed,
-            objects_surviving: space.live_count(),
-            bytes_surviving: space.live_bytes(),
+            objects_surviving: live_count,
+            bytes_surviving: live_bytes,
             roots_scanned,
         }
     }
@@ -203,11 +218,17 @@ impl Collector for NeverCollect {
         false
     }
 
-    fn collect(&mut self, space: &mut ObjectSpace, _roots: &dyn RootSet) -> CollectionReport {
+    fn collect(&mut self, spaces: &mut [&mut ObjectSpace], _roots: &dyn RootSet) -> CollectionReport {
+        let (live_count, live_bytes) = totals(spaces);
         CollectionReport {
-            objects_surviving: space.live_count(),
-            bytes_surviving: space.live_bytes(),
+            objects_surviving: live_count,
+            bytes_surviving: live_bytes,
             ..Default::default()
         }
     }
+}
+
+/// Live objects and bytes, across every space.
+fn totals(spaces: &[&mut ObjectSpace]) -> (usize, usize) {
+    spaces.iter().fold((0, 0), |(count, bytes), s| (count + s.live_count(), bytes + s.live_bytes()))
 }

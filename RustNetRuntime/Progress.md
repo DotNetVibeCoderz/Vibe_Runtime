@@ -19,6 +19,55 @@ PrimeSieve     IDENTICAL   (written by Jack from a prompt)
 SensorGateway  IDENTICAL   (edited by Jack from a prompt)
 ```
 
+## 2026-11-21 — The three gaps 8.2 found, closed
+
+- **The heap is sharded.** With threads, `SharedHeap` is sixteen
+  `ObjectSpace`s, each with its own lock. A thread allocates into a shard of
+  its own, and a handle's index carries its shard in the low bits.
+  - `fanout` went 4,605 → 2,360 ms.
+  - Collection takes the policy lock, then every shard in order, and the
+    `Collector` trait now takes `&mut [&mut ObjectSpace]`, because objects
+    point across shards.
+  - `atomically` names the handles it touches and locks their shards in
+    ascending order. `transition` and `add_continuation` read the
+    continuation list, lock, re-check, and go round again if it changed.
+  - Statistics are kept per shard. The policy hears about allocation every
+    32 KB per shard, so `should_collect` is an atomic load rather than a
+    lock — before, it took the heap lock at every `ret`.
+  - A heap with a slot ceiling, or one handed over non-empty, stays one shard.
+  - Tests: a reference from one shard keeps an object in another alive;
+    a stale handle stays stale across shards.
+- **The governor measured the wrong thing.** Contended locks per *finished
+  job* read a fan-out's long-running parents as infinite contention, and once
+  the heap was sharded that throttled the run to one worker (3.6 s against
+  2.3 s). It now reads the share of acquisitions that waited, from per-shard
+  counters that sit on each lock's own cache line: halve above 20%, raise
+  below 10%. Measured shares: fan-out 4–11%, spawn 14–16%, ping-pong ~4%.
+- **Every thread compiles.** `NativeTier::fork` gives each pool worker and
+  `Thread.Start` thread a JIT tier of its own, configured like the main
+  thread's. `Parallel.For` over compiled arithmetic went from about 2.6 s to
+  25 ms: it had been interpreting. A test checks that a worker gets a tier,
+  and gets its own.
+- **`Stopwatch` counts nanoseconds.** It gained `Elapsed`, `ElapsedTicks`,
+  `Frequency`, `IsHighResolution`, `GetTimestamp` and both
+  `GetElapsedTime` overloads; `Frequency` is .NET's 10 MHz on Windows. There
+  are two new Conformance checks (546 → 548). Their first version asserted a
+  real 30 ms had passed, and failed under the test harness's deterministic
+  clock, so they now check that the units agree and that time moves.
+- **Footprint.** `MINIMAL_BCL_BYTES` is now 289,400 (measured 289,354), for
+  the new `Stopwatch` bindings. The footprint test measures with
+  `SharedHeap::unsharded`, the one-shard heap a board has, because a board
+  has no threads.
+
+Verified:
+- `cargo test --workspace`: 484 passed, 0 failed.
+- `bash tests/embedded.sh` and `bash tests/firmware.sh` pass.
+- Conformance is 548/0, identical to `dotnet`, on both schedulers, with and
+  without `RUSTCLR_GC_STRESS=4096`.
+- ModernSyntax, CrossAssembly, UserDirectory and HelloWorld are identical;
+  Device passes 73/0.
+- `run.sh` matches every checksum, with no single-threaded row slower.
+
 ## 2026-11-21 — Milestone 8.2: the scheduler, and what was actually slow
 
 Done against its criterion: the three new `benchmarks/` rows improve
@@ -73,14 +122,9 @@ passes it as a test. **The improvement did not come from the scheduler.**
       caught it.
 - **Idle workers spin 15 µs** before sleeping. Measured against 0 µs and
   50 µs, 15 µs is the best on both `spawn` and `pingpong`.
-- **Found, not fixed:**
-  - Pool workers have no JIT tier, so compiled-on-main arithmetic runs
-    interpreted inside `Parallel.For`: 80 ms sequential, about 2.6 s
-    parallel, the same before 8.2.
-  - `Stopwatch.Elapsed` and `ElapsedTicks` are missing from RustBCL; the
-    benchmarks use `ElapsedMilliseconds`.
-  - The real fix for the heap lock is collector work and is named in
-    `docs/limitations.md`.
+- **Found, and fixed in the entry above:** pool workers had no JIT tier,
+  `Stopwatch.Elapsed` and `ElapsedTicks` were missing, and the heap was one
+  lock.
 
 Verified:
 - `cargo test --workspace`: 480 passed, 0 failed.

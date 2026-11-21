@@ -172,6 +172,19 @@ pub trait NativeTier: Send {
 
     /// Methods compiled and bytes emitted, for `--stats`.
     fn stats(&self) -> (usize, usize);
+
+    /// A tier for another thread, configured like this one and sharing
+    /// nothing with it.
+    ///
+    /// Each thread compiles for itself: a compiled method's call table holds
+    /// addresses inside its own tier, and sharing one tier between threads
+    /// would put a lock on every compiled call. What a thread costs is its own
+    /// copy of the code it runs hot, which is small next to the copy of the
+    /// loader it already carries. `None` — the default — leaves the thread
+    /// interpreting, which is always correct and only slower.
+    fn fork(&self) -> Option<Box<dyn NativeTier>> {
+        None
+    }
 }
 
 /// A natively implemented method.
@@ -1070,6 +1083,11 @@ impl Interpreter {
         // membership `with_host` took in the throwaway registry it made.
         worker._registration = worker.mutators.register();
         worker.limits = self.limits.clone();
+        // Without this every pool worker and every `Thread.Start` thread
+        // interpreted: arithmetic that compiled on the main thread ran ~30×
+        // slower inside `Parallel.For`. Absent if the parent is inside a
+        // compiled call at this instant, in which case the thread interprets.
+        worker.native_tier = self.native_tier.as_ref().and_then(|tier| tier.fork());
 
         // One set of monitors, or `lock` would exclude nothing.
         worker.monitors = self.monitors.clone();

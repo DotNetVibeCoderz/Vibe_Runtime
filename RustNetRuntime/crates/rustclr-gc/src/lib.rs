@@ -88,7 +88,7 @@ pub struct Heap {
 /// two in the safe-point protocol: a thread that blocked after a collection
 /// had started, and a second would-be collector, were both counted as stopped
 /// with their roots published nowhere.
-fn stress_from_environment() -> Option<usize> {
+pub(crate) fn stress_from_environment() -> Option<usize> {
     #[cfg(feature = "std")]
     {
         static STRESS: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
@@ -199,7 +199,7 @@ impl Heap {
 
     /// Runs a collection with the given roots.
     pub fn collect(&mut self, roots: &dyn RootSet) -> CollectionReport {
-        let report = self.collector.collect(&mut self.space, roots);
+        let report = self.collector.collect(&mut [&mut self.space], roots);
         self.bytes_since_collection = 0;
         self.stats.collections += 1;
         self.stats.total_objects_freed += report.objects_freed as u64;
@@ -280,6 +280,12 @@ impl Heap {
 
     pub fn space(&self) -> &ObjectSpace {
         &self.space
+    }
+
+    /// Takes a heap apart, for [`SharedHeap`] to reassemble as shards.
+    #[cfg(feature = "threads")]
+    pub(crate) fn into_parts(self) -> (ObjectSpace, Box<dyn Collector>, GcStats) {
+        (self.space, self.collector, self.stats)
     }
 }
 

@@ -108,6 +108,10 @@ fn measure(install: fn(&mut rustclr_core::Interpreter)) -> usize {
     peak_of(|| {
         let mut interp =
             rustclr_core::Interpreter::with_host(Box::new(rustclr_core::CaptureHost::new()));
+        // A board's heap, which is one shard: boards have no threads, and the
+        // host's sixteen empty shards are not something a board pays for.
+        // Replaced before anything is allocated, as the firmware does.
+        interp.heap = rustclr_core::gc::SharedHeap::unsharded(rustclr_core::gc::Heap::new());
         install(&mut interp);
         // Kept alive to the end of the closure so the peak covers all of it.
         std::hint::black_box(&interp);

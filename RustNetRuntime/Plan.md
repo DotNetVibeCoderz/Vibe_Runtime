@@ -430,8 +430,9 @@ Conformance runs under both as a test. The three rows improved — numbers in
 heap lock that every field access takes is the bottleneck, and the win came
 from a governor that runs fewer workers while they only queue for that lock,
 idle workers that spin 15 µs before sleeping,
-plus fewer locks per task. A heap without one lock per field is the real fix
-and belongs with the collector, not here; `docs/limitations.md` says so.
+plus fewer locks per task. The heap lock it found was then fixed as its own
+step: the heap is sharded, sixteen locks with a thread allocating into its
+own, and `fanout` went 4.6 → 2.4 s. Pool workers also compile now.
 
 **8.3 — `RustNet.Concurrency` in plain C#.** `ConcurrencyScope` (lifetime,
 cancellation propagation, `AggregateException` of child failures), `Actor<T>`
